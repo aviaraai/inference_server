@@ -1,21 +1,67 @@
-from typing import Any
+"""
+pipeline/muzzle.py — Muzzle embedding pipeline.
+
+Handles single-image and batch inference through GodhaarModel.
+"""
+
+from typing import Any, Union
 
 import torch
-from preprocess import preprocess
+import numpy as np
+from PIL import Image
+
+from pipeline.preprocess import preprocess, preprocess_batch
 
 
-def pipeline(image, model):
-    image_bytes = image.file.read()
+def embed_single(image_bytes: bytes, model: Any, device: torch.device) -> torch.Tensor:
+    """Embed a single muzzle image.
 
-    tensor = preprocess(image_bytes)
+    Parameters
+    ----------
+    image_bytes : bytes
+        Raw image file content.
+    model : GodhaarModel
+        Loaded model in eval mode.
+    device : torch.device
 
-    embedding = run_inference(tensor, model)
+    Returns
+    -------
+    torch.Tensor of shape (1, 256), unit-norm, float32.
+    """
+    tensor = preprocess(image_bytes).to(device)  # (1, 3, 518, 518)
 
-    return embedding
-
-
-def run_inference(input_tensor: torch.Tensor, model: Any):
     with torch.inference_mode():
-        output_tensor = model(input_tensor)
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            embedding = model(tensor)  # (1, 256)
 
-    return output_tensor
+    return embedding.float().cpu()
+
+
+def embed_batch(
+    images: list[bytes],
+    model: Any,
+    device: torch.device,
+) -> torch.Tensor:
+    """Embed a batch of muzzle images in a single forward pass.
+
+    Parameters
+    ----------
+    images : list[bytes]
+        List of raw image file contents.
+    model : GodhaarModel
+    device : torch.device
+
+    Returns
+    -------
+    torch.Tensor of shape (B, 256), unit-norm, float32.
+    """
+    if len(images) == 0:
+        return torch.empty(0, 256)
+
+    batch_tensor = preprocess_batch(images).to(device)  # (B, 3, 518, 518)
+
+    with torch.inference_mode():
+        with torch.amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+            embeddings = model(batch_tensor)  # (B, 256)
+
+    return embeddings.float().cpu()

@@ -11,11 +11,15 @@ services:
     ipc: host
 
     ports:
-      - "9004:9004"
+      - "9004:8000"
 
     volumes:
       - ./appstorage:/appstorage
       - .:/app
+      # Wildlife color module (rule-based classifier)
+      - ../Wildlife/color:/wildlife/color
+      # YOLO weights (avoid re-downloading on every cold start)
+      - ../yolov8s.pt:/app/yolov8s.pt:ro
 
     environment:
       PYTHONPATH: /app
@@ -23,6 +27,16 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
 
+      # Model checkpoint (best_top1.pt from training)
       MODEL_PATH: /appstorage/Models/embedding_model/model.pt
+
+      # FAISS index (created by build_production_faiss.py or online registration)
+      FAISS_INDEX_PATH: /appstorage/indexes/faiss.index
+
+      # SQLite ID store
+      ID_STORE_PATH: /appstorage/indexes/id_store.db
+
+      # YOLO model (mounted from host)
+      YOLO_MODEL_PATH: /app/yolov8s.pt
 
     restart: unless-stopped
