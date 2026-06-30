@@ -1,0 +1,28 @@
+name: inference-server
+
+services:
+  inference-server:
+    image: inference-server:dev
+    container_name: inference-server.dev
+
+    init: true
+
+    gpus: all
+    ipc: host
+
+    ports:
+      - "9004:9004"
+
+    volumes:
+      - ./appstorage:/appstorage
+      - .:/app
+
+    environment:
+      PYTHONPATH: /app
+
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+      MODEL_PATH: /appstorage/Models/embedding_model/model.pt
+
+    restart: unless-stopped
