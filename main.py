@@ -236,10 +236,12 @@ def _run_registration_pipeline(
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
     embeddings = embed_batch(jpg_bytes, model, device)
 
-    # ── Color extraction from front images ───────────────────────────────
-    front_img_1 = _decode_image(front_bytes[0])
-    body_color = color_extractor.extract_body(front_img_1)
-    muzzle_color = color_extractor.extract_muzzle(cropped_images[0])
+    # ── Color extraction — best confidence across all images ────────────
+    body_colors = [color_extractor.extract_body(_decode_image(fb)) for fb in front_bytes]
+    body_color = max(body_colors, key=lambda c: c["confidence"])
+
+    muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
+    muzzle_color = max(muzzle_colors, key=lambda c: c["confidence"])
 
     return embeddings.numpy(), body_color, muzzle_color
 
@@ -247,7 +249,7 @@ def _run_registration_pipeline(
 @app.post("/search", response_model=SearchResponse)
 async def search(
     muzzle: UploadFile = File(...),
-    front: UploadFile = File(...),
+    front: Optional[UploadFile] = File(None),
     top_k: int = Form(10),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
@@ -259,10 +261,8 @@ async def search(
     log.info(f"[{request_id}] /search top_k={top_k}")
 
     # ── Real async I/O: read uploads concurrently ──────────────────────────
-    muzzle_bytes, front_bytes = await asyncio.gather(
-        muzzle.read(),
-        front.read(),
-    )
+    muzzle_bytes = await muzzle.read()
+    front_bytes = await front.read() if front else None
 
     # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
     t_embed_start = time.monotonic()
