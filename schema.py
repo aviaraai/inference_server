@@ -7,10 +7,11 @@ These models define the response shape only.
 
 from typing import Optional
 
+from fastapi import UploadFile
 from pydantic import BaseModel, Field
 
-
 # ── Shared ────────────────────────────────────────────────────────────────────
+
 
 class VersionInfo(BaseModel):
     model: str = Field(..., description="GodhaarModel version identifier")
@@ -29,33 +30,37 @@ class ExtractedColors(BaseModel):
     muzzle: ColorResult
 
 
-class LatencyMs(BaseModel):
-    total: int = Field(..., description="Total request latency in ms")
-    crop: Optional[int] = Field(None, description="YOLO crop time in ms")
-    embed: Optional[int] = Field(None, description="GodhaarModel inference time in ms")
-    color: Optional[int] = Field(None, description="Color extraction time in ms")
-    faiss: Optional[int] = Field(None, description="FAISS search time in ms")
-
-
 # ── Register ──────────────────────────────────────────────────────────────────
+
+
+class RegisterRequest(BaseModel):
+    muzzle_1: UploadFile
+    muzzle_2: UploadFile
+    muzzle_3: UploadFile
+    front_1: UploadFile
+    front_2: UploadFile
+
 
 class RegisterResponse(BaseModel):
     status: str = Field("success", description="Registration status")
-    cattle_id: str
-    embedding_ids: list[int] = Field(..., description="FAISS integer IDs for the stored embeddings")
+    embedding_ids: list[int] = Field(
+        ..., description="FAISS integer IDs for the stored embeddings"
+    )
     extracted_colors: ExtractedColors
     versions: VersionInfo
     registered_at: str = Field(..., description="ISO 8601 UTC timestamp")
-    latency_ms: LatencyMs
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
+
 
 class MatchCandidate(BaseModel):
     rank: int
     cattle_id: str
     score: float = Field(..., description="Cosine similarity score")
-    gap: Optional[float] = Field(None, description="Score gap to next candidate (ML metric)")
+    gap: Optional[float] = Field(
+        None, description="Score gap to next candidate (ML metric)"
+    )
 
 
 class SearchResponse(BaseModel):
@@ -63,16 +68,15 @@ class SearchResponse(BaseModel):
     query_colors: ExtractedColors
     top_matches: list[MatchCandidate]
     versions: VersionInfo
-    latency_ms: LatencyMs
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
+
 
 class HealthResponse(BaseModel):
     status: str = Field("ok")
     model_loaded: bool
     faiss_size: int = Field(..., description="Total vectors in FAISS index")
-    id_store_size: int = Field(..., description="Total entries in ID store")
     gpu_available: bool
     model_version: str
     color_extractor_available: bool

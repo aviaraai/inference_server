@@ -10,12 +10,14 @@ Enums match exactly what the current Wildlife classifiers output.
 """
 
 import logging
+import os
+import sys
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Optional
 
-import cv2
 import numpy as np
+from color.body_color import classify_body_color
+from color.muzzle_color import classify_muzzle_color
 
 log = logging.getLogger("godhaar.color")
 
@@ -23,24 +25,26 @@ log = logging.getLogger("godhaar.color")
 # ── Color Enums ───────────────────────────────────────────────────────────────
 # These match the labels in Wildlife/color/color_constants.py.
 
+
 class BodyColor(str, Enum):
     UNKNOWN = "UNKNOWN"
-    BLACK   = "BLACK"
-    WHITE   = "WHITE"
-    BROWN   = "BROWN"
-    GREY    = "GREY"
+    BLACK = "BLACK"
+    WHITE = "WHITE"
+    BROWN = "BROWN"
+    GREY = "GREY"
     SPOTTED = "SPOTTED"
-    MIXED   = "MIXED"
+    MIXED = "MIXED"
 
 
 class MuzzleColor(str, Enum):
     UNKNOWN = "UNKNOWN"
-    BLACK   = "BLACK"
-    PINK    = "PINK"
-    MIXED   = "MIXED"
+    BLACK = "BLACK"
+    PINK = "PINK"
+    MIXED = "MIXED"
 
 
 # ── Interface ─────────────────────────────────────────────────────────────────
+
 
 class ColorExtractor(ABC):
     """Abstract interface for extracting cattle colors from images.
@@ -73,6 +77,7 @@ class ColorExtractor(ABC):
 
 # ── Rule-Based Implementation ────────────────────────────────────────────────
 
+
 class RuleBasedColorExtractor(ColorExtractor):
     """Uses the existing Wildlife/color/ LAB-histogram classifiers.
 
@@ -88,28 +93,27 @@ class RuleBasedColorExtractor(ColorExtractor):
         try:
             # Try importing from the Wildlife color package.
             # In Docker, this is volume-mounted to /wildlife/color.
-            import sys
-            import os
 
             # Check common mount locations
             for search_path in [
-                "/wildlife",                                           # Docker mount
-                os.path.join(os.path.dirname(__file__), "..", "..", "Wildlife"),  # Local dev
+                "/wildlife",  # Docker mount
+                os.path.join(
+                    os.path.dirname(__file__), "..", "..", "Wildlife"
+                ),  # Local dev
             ]:
                 abs_path = os.path.abspath(search_path)
                 if os.path.isdir(abs_path) and abs_path not in sys.path:
                     sys.path.insert(0, abs_path)
-
-            from color.body_color import classify_body_color
-            from color.muzzle_color import classify_muzzle_color
 
             self._body_fn = classify_body_color
             self._muzzle_fn = classify_muzzle_color
             self._available = True
             log.info("RuleBasedColorExtractor: Wildlife color module loaded.")
         except Exception as e:
-            log.warning(f"RuleBasedColorExtractor: Wildlife color module not available ({e}). "
-                        "All colors will be UNKNOWN.")
+            log.warning(
+                f"RuleBasedColorExtractor: Wildlife color module not available ({e}). "
+                "All colors will be UNKNOWN."
+            )
 
     @property
     def available(self) -> bool:
@@ -117,7 +121,11 @@ class RuleBasedColorExtractor(ColorExtractor):
 
     def extract_body(self, img_bgr: np.ndarray) -> dict:
         if not self._available or img_bgr is None:
-            return {"label": BodyColor.UNKNOWN.value, "confidence": 0.0, "method": "UNAVAILABLE"}
+            return {
+                "label": BodyColor.UNKNOWN.value,
+                "confidence": 0.0,
+                "method": "UNAVAILABLE",
+            }
 
         try:
             result = self._body_fn(img_bgr)
@@ -134,11 +142,19 @@ class RuleBasedColorExtractor(ColorExtractor):
             }
         except Exception as e:
             log.warning(f"Body color extraction failed: {e}")
-            return {"label": BodyColor.UNKNOWN.value, "confidence": 0.0, "method": "ERROR"}
+            return {
+                "label": BodyColor.UNKNOWN.value,
+                "confidence": 0.0,
+                "method": "ERROR",
+            }
 
     def extract_muzzle(self, img_bgr: np.ndarray) -> dict:
         if not self._available or img_bgr is None:
-            return {"label": MuzzleColor.UNKNOWN.value, "confidence": 0.0, "method": "UNAVAILABLE"}
+            return {
+                "label": MuzzleColor.UNKNOWN.value,
+                "confidence": 0.0,
+                "method": "UNAVAILABLE",
+            }
 
         try:
             result = self._muzzle_fn(img_bgr)
@@ -154,4 +170,8 @@ class RuleBasedColorExtractor(ColorExtractor):
             }
         except Exception as e:
             log.warning(f"Muzzle color extraction failed: {e}")
-            return {"label": MuzzleColor.UNKNOWN.value, "confidence": 0.0, "method": "ERROR"}
+            return {
+                "label": MuzzleColor.UNKNOWN.value,
+                "confidence": 0.0,
+                "method": "ERROR",
+            }

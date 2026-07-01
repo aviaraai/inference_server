@@ -8,16 +8,15 @@ validates single-animal constraint, and returns a padded crop.
 import logging
 from typing import Optional
 
-import cv2
 import numpy as np
 
 from godhaar.config import (
-    YOLO_MODEL_NAME,
-    YOLO_COW_CLASS_ID,
-    YOLO_CONF,
-    MIN_BBOX_AREA_PCT,
-    MAX_CATTLE_PER_IMAGE,
     CROP_PADDING_PX,
+    MAX_CATTLE_PER_IMAGE,
+    MIN_BBOX_AREA_PCT,
+    YOLO_CONF,
+    YOLO_COW_CLASS_ID,
+    YOLO_MODEL_NAME,
 )
 
 log = logging.getLogger("godhaar.yolo_crop")
@@ -55,7 +54,9 @@ def warmup_yolo() -> None:
     log.info("YOLO warmup complete.")
 
 
-def crop_cattle(img: np.ndarray, no_crop: bool = False) -> tuple[Optional[np.ndarray], str, float]:
+def crop_cattle(
+    img: np.ndarray, no_crop: bool = False
+) -> tuple[Optional[np.ndarray], str, float]:
     """Detect and crop the cattle from a BGR image.
 
     Parameters

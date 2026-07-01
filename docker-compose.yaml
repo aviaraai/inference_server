@@ -11,7 +11,7 @@ services:
     ipc: host
 
     ports:
-      - "9004:8000"
+      - "9004:9004"
 
     volumes:
       - ./appstorage:/appstorage
@@ -32,9 +32,6 @@ services:
 
       # FAISS index (created by build_production_faiss.py or online registration)
       FAISS_INDEX_PATH: /appstorage/indexes/faiss.index
-
-      # SQLite ID store
-      ID_STORE_PATH: /appstorage/indexes/id_store.db
 
       # YOLO model (mounted from host)
       YOLO_MODEL_PATH: /app/yolov8s.pt
