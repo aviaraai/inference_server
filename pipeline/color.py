@@ -16,8 +16,6 @@ from abc import ABC, abstractmethod
 from enum import Enum
 
 import numpy as np
-from color.body_color import classify_body_color
-from color.muzzle_color import classify_muzzle_color
 
 log = logging.getLogger("godhaar.color")
 
@@ -104,6 +102,9 @@ class RuleBasedColorExtractor(ColorExtractor):
                 abs_path = os.path.abspath(search_path)
                 if os.path.isdir(abs_path) and abs_path not in sys.path:
                     sys.path.insert(0, abs_path)
+
+            from color.body_color import classify_body_color
+            from color.muzzle_color import classify_muzzle_color
 
             self._body_fn = classify_body_color
             self._muzzle_fn = classify_muzzle_color
