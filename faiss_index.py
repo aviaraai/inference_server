@@ -196,4 +196,5 @@ class FaissIndex:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     def __len__(self) -> int:
-        return self.index.ntotal
+        with self._lock:
+            return self.index.ntotal
