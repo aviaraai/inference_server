@@ -55,12 +55,8 @@ class RegisterResponse(BaseModel):
 
 
 class MatchCandidate(BaseModel):
-    rank: int
-    cattle_id: str
+    faiss_id: int = Field(..., description="FAISS integer ID for this embedding")
     score: float = Field(..., description="Cosine similarity score")
-    gap: Optional[float] = Field(
-        None, description="Score gap to next candidate (ML metric)"
-    )
 
 
 class SearchResponse(BaseModel):
