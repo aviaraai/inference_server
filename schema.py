@@ -7,7 +7,6 @@ These models define the response shape only.
 
 from typing import Optional
 
-from fastapi import UploadFile
 from pydantic import BaseModel, Field
 
 # ── Shared ────────────────────────────────────────────────────────────────────
@@ -31,16 +30,6 @@ class ExtractedColors(BaseModel):
 
 
 # ── Register ──────────────────────────────────────────────────────────────────
-
-
-class RegisterRequest(BaseModel):
-    muzzle_1: UploadFile
-    muzzle_2: UploadFile
-    muzzle_3: UploadFile
-    front_1: UploadFile
-    front_2: UploadFile
-
-
 class RegisterResponse(BaseModel):
     status: str = Field("success", description="Registration status")
     embedding_ids: list[int] = Field(
@@ -57,6 +46,8 @@ class RegisterResponse(BaseModel):
 class MatchCandidate(BaseModel):
     faiss_id: int = Field(..., description="FAISS integer ID for this embedding")
     score: float = Field(..., description="Cosine similarity score")
+    rank: int = Field(..., description="1-indexed rank among returned candidates")
+    gap: float = Field(..., description="Score delta to the next candidate (0.0 for last)")
 
 
 class SearchResponse(BaseModel):

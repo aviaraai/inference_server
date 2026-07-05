@@ -3,7 +3,7 @@ main.py — Godhaar Inference Server.
 
 A pure ML microservice exposing:
   POST /register  — embed + store cattle in FAISS
-  POST /search    — embed + search FAISS + return ML scores
+  POST /search    — embed + rank provided candidates + return ML scores
   GET  /health    — liveness check
 
 Business logic (MATCH/REVIEW/NOT_REGISTERED, GPS, policy rules) lives
@@ -44,7 +44,6 @@ from schema import (
     ExtractedColors,
     HealthResponse,
     MatchCandidate,
-    RegisterRequest,
     RegisterResponse,
     SearchResponse,
     VersionInfo,
@@ -133,34 +132,41 @@ app = FastAPI(
 
 @app.post("/register", response_model=RegisterResponse)
 async def register(
-    register: RegisterRequest,
+    muzzle_images: list[UploadFile] = File(...),
+    front_images: list[UploadFile] = File(...),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
     color_extractor: Any = Depends(get_color_extractor),
 ):
     """
-    Register endpoint accepts image inputs and returns the faiss indices used to store the embeddings
+    Register a cattle animal.
+
+    Expects exactly 3 muzzle images and 2 front images as repeated
+    multipart fields named ``muzzle_images`` and ``front_images``.
+    Returns the FAISS IDs assigned to each stored embedding so the
+    API server can persist them alongside the cattle record.
     """
+    if len(muzzle_images) != 3:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Expected 3 muzzle images, got {len(muzzle_images)}",
+        )
+    if len(front_images) != 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Expected 2 front images, got {len(front_images)}",
+        )
 
     t_start = time.monotonic()
 
-    # Read all image files with no blocking
+    # Read all image files concurrently — pure async I/O, no thread needed.
     muzzle_bytes, front_bytes = await asyncio.gather(
-        asyncio.gather(
-            register.muzzle_1.read(),
-            register.muzzle_2.read(),
-            register.muzzle_3.read(),
-        ),
-        asyncio.gather(
-            register.front_1.read(),
-            register.front_2.read(),
-        ),
+        asyncio.gather(*[img.read() for img in muzzle_images]),
+        asyncio.gather(*[img.read() for img in front_images]),
     )
 
     # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
-    # One seam, not five — nothing inside _run_registration_pipeline needs
-    # its own asyncio.to_thread wrapper.
     embeddings_np, body_color, muzzle_color = await asyncio.to_thread(
         _run_registration_pipeline,
         muzzle_bytes,
@@ -250,15 +256,28 @@ def _run_registration_pipeline(
 async def search(
     muzzle: UploadFile = File(...),
     front: Optional[UploadFile] = File(None),
-    top_k: int = Form(10),
+    top_k: int = Form(5),
+    candidate_ids: list[int] = Form(...),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
     color_extractor: Any = Depends(get_color_extractor),
 ):
+    """
+    Search endpoint: receives candidate FAISS IDs from the API server,
+    embeds the query muzzle, then ranks only those candidates via
+    restricted_search (reconstruct → dot product → sort).
+
+    No index-wide FAISS search is performed. The API server decides
+    which candidates to send based on GPS / Supabase filtering.
+    """
     request_id = uuid.uuid4().hex
     t_start = time.monotonic()
-    log.info(f"[{request_id}] /search top_k={top_k}")
+
+    if not candidate_ids:
+        raise HTTPException(status_code=422, detail="candidate_ids must contain at least one FAISS ID")
+
+    log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)}")
 
     # ── Real async I/O: read uploads concurrently ──────────────────────────
     muzzle_bytes = await muzzle.read()
@@ -276,9 +295,9 @@ async def search(
     )
     t_embed = _ms_since(t_embed_start)
 
-    # ── FAISS search ─────────────────────────────────────────────────────
+    # ── Restricted search: rank only the provided candidates ─────────────
     t_faiss_start = time.monotonic()
-    matches = await faiss_index.search(emb_np, top_k=top_k)
+    matches = await faiss_index.restricted_search(emb_np, candidate_ids=candidate_ids, top_k=top_k)
     t_faiss = _ms_since(t_faiss_start)
 
     t_total = _ms_since(t_start)
@@ -297,7 +316,7 @@ async def search(
         ),
         top_matches=[
             MatchCandidate(**m) for m in matches
-        ],  # {"faiss_id": int, "score": float}
+        ],
         versions=VersionInfo(
             model=MODEL_VERSION,
             faiss=faiss_index.faiss_version_label,

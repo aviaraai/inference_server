@@ -33,6 +33,11 @@ class FaissIndex:
     to a thread via asyncio.to_thread, so the event loop is never blocked.
     """
 
+    # Maximum number of per-ID reconstruct() calls permitted when the native
+    # reconstruct_batch() is unavailable (old FAISS build). Above this limit
+    # we raise rather than silently issue hundreds/thousands of C++ calls.
+    _RECONSTRUCT_FALLBACK_LIMIT: int = 64
+
     def __init__(self, embedding_dim: int = EMB_DIM) -> None:
         self.embedding_dim = embedding_dim
         self.index = faiss.IndexIDMap2(faiss.IndexFlatIP(embedding_dim))
@@ -43,6 +48,12 @@ class FaissIndex:
     # ── Embedding preparation (pure, no shared state — no lock needed) ──────
 
     def _prepare_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
+        """Cast, reshape, validate, and L2-normalize an embedding array.
+
+        This is the single normalization point for ALL vectors entering the
+        index. Vectors stored via add_batch() are normalized here and remain
+        unit-norm permanently — they are never re-normalized on read.
+        """
         vectors = np.asarray(embeddings, dtype=np.float32)
         if vectors.ndim == 1:
             vectors = vectors.reshape(1, -1)
@@ -91,11 +102,132 @@ class FaissIndex:
     # concurrency for correctness; if profiling shows read contention is a
     # bottleneck, upgrade to a reader-writer lock rather than dropping this.
 
+    async def reconstruct_batch(
+        self,
+        ids: list[int],
+    ) -> np.ndarray:
+        """Reconstruct stored vectors for the given FAISS IDs.
+
+        Returns an (N, D) float32 matrix. Uses FAISS native
+        ``reconstruct_batch`` when available, otherwise falls back to
+        per-ID ``reconstruct``.
+        """
+        return await asyncio.to_thread(self._reconstruct_batch_sync, ids)
+
+    def _reconstruct_batch_sync(self, ids: list[int]) -> np.ndarray:
+        """Lock-holding entry point — used by the public async method."""
+        with self._lock:
+            return self._reconstruct_batch_inner(ids)
+
+    def _reconstruct_batch_inner(self, ids: list[int]) -> np.ndarray:
+        """Lock-free core — caller MUST already hold self._lock.
+
+        Strategy
+        --------
+        1. Use FAISS native ``reconstruct_batch`` when available — one C++ call,
+           fast for any N.
+        2. If the method doesn't exist (old FAISS build), fall back to per-ID
+           ``reconstruct`` only when N is small (≤ _RECONSTRUCT_FALLBACK_LIMIT).
+        3. If native batch raises at runtime, or N exceeds the fallback limit,
+           re-raise immediately rather than silently degrading to thousands of
+           individual calls.
+        """
+        id_arr = np.array(ids, dtype=np.int64)
+
+        if hasattr(self.index, "reconstruct_batch"):
+            # Native path — let any exception propagate; do NOT catch & loop.
+            return self.index.reconstruct_batch(id_arr)
+
+        # reconstruct_batch unavailable (old FAISS build).
+        # Only tolerate per-ID loop for small batches.
+        if len(ids) > self._RECONSTRUCT_FALLBACK_LIMIT:
+            raise RuntimeError(
+                f"FAISS native reconstruct_batch is unavailable and the candidate "
+                f"batch ({len(ids)} ids) exceeds the per-ID fallback limit "
+                f"({self._RECONSTRUCT_FALLBACK_LIMIT}). Upgrade faiss-cpu/faiss-gpu."
+            )
+
+        log.warning(
+            "FAISS reconstruct_batch unavailable — using per-ID fallback "
+            f"for {len(ids)} candidates. Upgrade faiss to remove this path."
+        )
+        return np.vstack([self.index.reconstruct(int(i)) for i in ids])
+
+    async def restricted_search(
+        self,
+        query_embedding: np.ndarray,
+        candidate_ids: list[int],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """Rank only the given candidates against a query embedding.
+
+        Normalization contract
+        ----------------------
+        Candidate vectors are already unit-norm — they were normalized once at
+        registration via _prepare_embeddings() and stored that way permanently.
+        Only the query is normalized here. Re-normalizing candidates on every
+        search would be wasted CPU.
+
+        Flow: reconstruct candidates (unit-norm) → normalize query →
+        query @ candidates.T → sort → return top-k.
+        No FAISS search() call is made.
+        """
+        return await asyncio.to_thread(
+            self._restricted_search_sync,
+            query_embedding,
+            candidate_ids,
+            top_k,
+        )
+
+    def _restricted_search_sync(
+        self,
+        query_embedding: np.ndarray,
+        candidate_ids: list[int],
+        top_k: int,
+    ) -> list[dict]:
+        if not candidate_ids:
+            return []
+
+        # Normalize query
+        query = self._prepare_embeddings(query_embedding)  # (1, D)
+
+        with self._lock:
+            # Reconstruct candidate vectors — already unit-norm from registration.
+            candidate_matrix = self._reconstruct_batch_inner(candidate_ids)  # (N, D)
+
+        # Dot-product similarity: (1, D) @ (D, N) → (1, N)
+        # Both sides are unit-norm, so dot product == cosine similarity.
+        scores = np.dot(query, candidate_matrix.T)[0]
+
+        # Sort descending, take top-k
+        top_k = min(top_k, len(scores))
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        sorted_scores = scores[top_indices]
+
+        results = []
+        for idx, i in enumerate(top_indices):
+            current = sorted_scores[idx]
+            next_score = (
+                sorted_scores[idx + 1]
+                if idx + 1 < len(sorted_scores)
+                else current
+            )
+            results.append({
+                "faiss_id": int(candidate_ids[i]),
+                "score": float(current),
+                "rank": idx + 1,
+                "gap": float(current - next_score),
+            })
+        return results
+
     async def search(
         self,
         embedding: np.ndarray,
         top_k: int = 10,
     ) -> list[dict]:
+        """Full index-wide FAISS search. Used only when no candidate list is
+        provided (e.g. internal tooling, health checks). The /search endpoint
+        uses restricted_search() instead."""
         return await asyncio.to_thread(
             self._search_sync,
             embedding,
