@@ -137,7 +137,7 @@ app = FastAPI(
 async def register(
     muzzle_images: list[UploadFile] = File(...),
     front_images: list[UploadFile] = File(...),
-    candidates: str | None = Form(None),
+    candidate_json: str = Form(..., alias="candidates"),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
@@ -147,9 +147,10 @@ async def register(
     Register a cattle animal.
 
     Expects exactly 3 muzzle images and 2 front images.
-    Optionally accepts ``candidates`` — a JSON string of nearby cattle
+    Requires ``candidates`` — a JSON string of nearby cattle
     (pre-filtered by GPS) with their stored colors:
         [{"faiss_id": 123, "body_color": "BLACK", "muzzle_color": "PINK"}, ...]
+    Send "[]" if no nearby cattle exist (first registration in the area).
 
     Duplicate detection
     -------------------
@@ -177,16 +178,14 @@ async def register(
             detail=f"Expected 2 front images, got {len(front_images)}",
         )
 
-    # Parse candidates JSON if provided
-    candidate_list: list[CandidateInfo] = []
-    if candidates:
-        try:
-            candidate_list = [CandidateInfo(**c) for c in json.loads(candidates)]
-        except Exception as e:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid candidates format: {e}",
-            )
+    # Parse candidates JSON — always required, send "[]" if no nearby cattle
+    try:
+        candidate_list: list[CandidateInfo] = [CandidateInfo(**c) for c in json.loads(candidate_json)]
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid candidates format: {e}",
+        )
 
     t_start = time.monotonic()
 
