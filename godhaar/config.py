@@ -26,6 +26,11 @@ BLUR_THRESHOLD     = 20.0                       # Laplacian variance minimum
 MIN_EXPOSURE       = 30.0                       # mean pixel intensity floor
 MAX_EXPOSURE       = 225.0                      # mean pixel intensity ceiling
 
+# ── Duplicate Detection ──────────────────────────────────────────────────────
+DUPLICATE_THRESHOLD = 0.95                      # cosine similarity above which
+                                                # embeddings are considered the
+                                                # same muzzle (duplicate)
+
 IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp"}
 
 # ── Versioning ────────────────────────────────────────────────────────────────

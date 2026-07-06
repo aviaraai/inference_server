@@ -58,7 +58,7 @@ class ColorExtractor(ABC):
 
         Returns
         -------
-        {"label": str, "confidence": float, "method": str}
+        {"label": str, "confidence": float}
         """
         ...
 
@@ -68,14 +68,12 @@ class ColorExtractor(ABC):
 
         Returns
         -------
-        {"label": str, "confidence": float, "method": str}
+        {"label": str, "confidence": float}
         """
         ...
 
 
-# ── Rule-Based Implementation ────────────────────────────────────────────────
-
-
+# Rule-Based Implementation
 class RuleBasedColorExtractor(ColorExtractor):
     """Uses the existing Wildlife/color/ LAB-histogram classifiers.
 
@@ -125,7 +123,6 @@ class RuleBasedColorExtractor(ColorExtractor):
             return {
                 "label": BodyColor.UNKNOWN.value,
                 "confidence": 0.0,
-                "method": "UNAVAILABLE",
             }
 
         try:
@@ -139,14 +136,12 @@ class RuleBasedColorExtractor(ColorExtractor):
             return {
                 "label": label,
                 "confidence": float(result.get("confidence", 0.0)),
-                "method": result.get("method", "LAB_HISTOGRAM_V1"),
             }
         except Exception as e:
             log.warning(f"Body color extraction failed: {e}")
             return {
                 "label": BodyColor.UNKNOWN.value,
                 "confidence": 0.0,
-                "method": "ERROR",
             }
 
     def extract_muzzle(self, img_bgr: np.ndarray) -> dict:
@@ -154,7 +149,6 @@ class RuleBasedColorExtractor(ColorExtractor):
             return {
                 "label": MuzzleColor.UNKNOWN.value,
                 "confidence": 0.0,
-                "method": "UNAVAILABLE",
             }
 
         try:
@@ -167,12 +161,10 @@ class RuleBasedColorExtractor(ColorExtractor):
             return {
                 "label": label,
                 "confidence": float(result.get("confidence", 0.0)),
-                "method": result.get("method", "LAB_HISTOGRAM_V1"),
             }
         except Exception as e:
             log.warning(f"Muzzle color extraction failed: {e}")
             return {
                 "label": MuzzleColor.UNKNOWN.value,
                 "confidence": 0.0,
-                "method": "ERROR",
             }

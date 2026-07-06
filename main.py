@@ -12,13 +12,15 @@ color classifications, and gap calculations.
 """
 
 import asyncio
+import json
+from collections import Counter
 import logging
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 import cv2
 import numpy as np
@@ -32,7 +34,7 @@ from dependency import (
     get_model,
 )
 from faiss_index import FaissIndex
-from godhaar.config import EMB_DIM, MODEL_VERSION
+from godhaar.config import DUPLICATE_THRESHOLD, EMB_DIM, MODEL_VERSION
 from godhaar.model import GodhaarModel
 from helpers import _decode_image, _ms_since
 from pipeline.color import RuleBasedColorExtractor
@@ -40,6 +42,7 @@ from pipeline.muzzle import embed_batch
 from pipeline.quality import quality_check, quality_check_cv2
 from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
 from schema import (
+    CandidateInfo,
     ColorResult,
     ExtractedColors,
     HealthResponse,
@@ -130,10 +133,11 @@ app = FastAPI(
 )
 
 
-@app.post("/register", response_model=RegisterResponse)
+@app.post("/register", response_model=RegisterResponse, status_code=201)
 async def register(
     muzzle_images: list[UploadFile] = File(...),
     front_images: list[UploadFile] = File(...),
+    candidates: str | None = Form(None),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
@@ -142,10 +146,25 @@ async def register(
     """
     Register a cattle animal.
 
-    Expects exactly 3 muzzle images and 2 front images as repeated
-    multipart fields named ``muzzle_images`` and ``front_images``.
-    Returns the FAISS IDs assigned to each stored embedding so the
-    API server can persist them alongside the cattle record.
+    Expects exactly 3 muzzle images and 2 front images.
+    Optionally accepts ``candidates`` — a JSON string of nearby cattle
+    (pre-filtered by GPS) with their stored colors:
+        [{"faiss_id": 123, "body_color": "BLACK", "muzzle_color": "PINK"}, ...]
+
+    Duplicate detection
+    -------------------
+    A candidate is a duplicate if BOTH conditions are true:
+      1. Embedding cosine similarity ≥ DUPLICATE_THRESHOLD (0.95)
+      2. Body color AND muzzle color match the newly extracted colors
+
+    If duplicate → HTTP 409, nothing stored in FAISS.
+
+    HTTP status codes
+    -----------------
+    201 — registered successfully
+    409 — duplicate muzzle detected, not stored
+    422 — bad input (wrong image count, quality failure, no detection)
+    500 — FAISS or internal system failure
     """
     if len(muzzle_images) != 3:
         raise HTTPException(
@@ -157,6 +176,17 @@ async def register(
             status_code=422,
             detail=f"Expected 2 front images, got {len(front_images)}",
         )
+
+    # Parse candidates JSON if provided
+    candidate_list: list[CandidateInfo] = []
+    if candidates:
+        try:
+            candidate_list = [CandidateInfo(**c) for c in json.loads(candidates)]
+        except Exception as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid candidates format: {e}",
+            )
 
     t_start = time.monotonic()
 
@@ -176,11 +206,61 @@ async def register(
         color_extractor,
     )
 
-    # ── FAISS write stays awaited on its own: it has real async locking ───
-    faiss_ids = await faiss_index.add_batch(embeddings_np)
+    new_body  = body_color["label"]    # e.g. "BLACK"
+    new_muzzle = muzzle_color["label"] # e.g. "PINK"
+
+    # ── Duplicate check: embedding similarity + color match ───────────────
+    potential_matches: list[MatchCandidate] = []
+
+    if candidate_list:
+        candidate_ids = [c.faiss_id for c in candidate_list]
+        candidate_colors = {c.faiss_id: c for c in candidate_list}
+
+        try:
+            avg_embedding = embeddings_np.mean(axis=0)  # (256,)
+            matches = await faiss_index.restricted_search(
+                avg_embedding, candidate_ids=candidate_ids, top_k=5
+            )
+            potential_matches = [MatchCandidate(**m) for m in matches]
+        except Exception as e:
+            log.error(f"FAISS duplicate check failed: {e}")
+            raise HTTPException(status_code=500, detail=f"faiss_error: {e}")
+
+        for match in potential_matches:
+            if match.score < DUPLICATE_THRESHOLD:
+                break  # sorted descending — no point checking further
+
+            stored = candidate_colors[match.faiss_id]
+            color_match = (
+                stored.body_color == new_body
+                and stored.muzzle_color == new_muzzle
+            )
+
+            if color_match:
+                log.info(
+                    f"/register 409 duplicate | "
+                    f"score={match.score:.4f} | "
+                    f"body={new_body} muzzle={new_muzzle} | "
+                    f"matched_faiss_id={match.faiss_id}"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "duplicate_muzzle",
+                        "top_score": match.score,
+                        "matched_faiss_id": match.faiss_id,
+                    },
+                )
+
+    # ── Store in FAISS ────────────────────────────────────────────────────
+    try:
+        faiss_ids = await faiss_index.add_batch(embeddings_np)
+    except Exception as e:
+        log.error(f"FAISS write failed: {e}")
+        raise HTTPException(status_code=500, detail=f"faiss_error: {e}")
 
     t_total = _ms_since(t_start)
-    log.info(f"/register done | faiss_ids={faiss_ids} | {t_total}ms")
+    log.info(f"/register 201 | faiss_ids={faiss_ids} | {t_total}ms")
 
     return RegisterResponse(
         status="success",
@@ -189,6 +269,7 @@ async def register(
             body=ColorResult(**body_color),
             muzzle=ColorResult(**muzzle_color),
         ),
+        potential_matches=potential_matches,
         versions=VersionInfo(
             model=MODEL_VERSION,
             faiss=faiss_index.faiss_version_label,
@@ -242,12 +323,49 @@ def _run_registration_pipeline(
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
     embeddings = embed_batch(jpg_bytes, model, device)
 
-    # ── Color extraction — best confidence across all images ────────────
+    # ── Color extraction with consistency check ──────────────────────────
+    #
+    # Body (2 front images): BOTH must agree on the same label.
+    #   Disagree → 422, ask user to retake.
+    #
+    # Muzzle (3 crops): majority (≥2/3) must agree on the same label.
+    #   Majority found → accept majority label (avg confidence of agreeing images).
+    #   All 3 different → 422, ask user to retake.
+
     body_colors = [color_extractor.extract_body(_decode_image(fb)) for fb in front_bytes]
+    body_labels = [c["label"] for c in body_colors]
+
+    if body_labels[0] != body_labels[1]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"body_color_inconsistent: front images disagree "
+                f"({body_labels[0]} vs {body_labels[1]}), retake photos"
+            ),
+        )
+    # Both agree — pick highest confidence reading
     body_color = max(body_colors, key=lambda c: c["confidence"])
 
     muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
-    muzzle_color = max(muzzle_colors, key=lambda c: c["confidence"])
+    muzzle_labels = [c["label"] for c in muzzle_colors]
+
+    # Count votes per label
+    vote_counts = Counter(muzzle_labels)
+    majority_label, majority_count = vote_counts.most_common(1)[0]
+
+    if majority_count < 2:
+        # All 3 different — no majority
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"muzzle_color_inconsistent: no majority among crops "
+                f"({', '.join(muzzle_labels)}), retake photos"
+            ),
+        )
+    # Majority found — use avg confidence of agreeing images
+    agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
+    avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
+    muzzle_color = {"label": majority_label, "confidence": avg_conf}
 
     return embeddings.numpy(), body_color, muzzle_color
 
@@ -255,7 +373,7 @@ def _run_registration_pipeline(
 @app.post("/search", response_model=SearchResponse)
 async def search(
     muzzle: UploadFile = File(...),
-    front: Optional[UploadFile] = File(None),
+    front: UploadFile = File(...),
     top_k: int = Form(5),
     candidate_ids: list[int] = Form(...),
     model: Any = Depends(get_model),
@@ -280,8 +398,10 @@ async def search(
     log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)}")
 
     # ── Real async I/O: read uploads concurrently ──────────────────────────
-    muzzle_bytes = await muzzle.read()
-    front_bytes = await front.read() if front else None
+    muzzle_bytes, front_bytes = await asyncio.gather(
+        muzzle.read(),
+        front.read()
+    )
 
     # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
     t_embed_start = time.monotonic()
@@ -327,7 +447,7 @@ async def search(
 
 def _run_search_pipeline(
     muzzle_bytes: bytes,
-    front_bytes: Optional[bytes],
+    front_bytes: bytes,
     model: Any,
     device: torch.device,
     color_extractor: Any,
@@ -354,11 +474,8 @@ def _run_search_pipeline(
     emb_np = embedding.squeeze(0).numpy()  # (256,)
 
     muzzle_color = color_extractor.extract_muzzle(crop)
-    if front_bytes:
-        front_img = _decode_image(front_bytes)
-        body_color = color_extractor.extract_body(front_img)
-    else:
-        body_color = {"label": "UNKNOWN", "confidence": 0.0, "method": "NO_FRONT_IMAGE"}
+    front_img = _decode_image(front_bytes)
+    body_color = color_extractor.extract_body(front_img)
 
     return emb_np, muzzle_color, body_color
 
