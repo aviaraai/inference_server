@@ -90,12 +90,11 @@ class RuleBasedColorExtractor(ColorExtractor):
             # Try importing from the Wildlife color package.
             # In Docker, this is volume-mounted to /wildlife/color.
 
-            # Check common mount locations
+            # Check common locations for the Wildlife color package.
+            # The color module is bundled at wildlife/color/ in the repo.
             for search_path in [
-                "/wildlife",  # Docker mount
-                os.path.join(
-                    os.path.dirname(__file__), "..", "..", "Wildlife"
-                ),  # Local dev
+                os.path.join(os.path.dirname(__file__), "..", "wildlife"),  # bundled in repo
+                "/app/wildlife",  # Docker (COPY . . puts it here)
             ]:
                 abs_path = os.path.abspath(search_path)
                 if os.path.isdir(abs_path) and abs_path not in sys.path:

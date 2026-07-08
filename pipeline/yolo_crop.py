@@ -83,21 +83,37 @@ def crop_cattle(
 
     h, w = img.shape[:2]
     img_area = h * w
+    log.info(f"crop_cattle: input image {w}x{h} ({img_area} px)")
 
     results = _yolo_model(img, verbose=False)[0]
     boxes = []
 
+    # ── DEBUG: log ALL raw YOLO detections before filtering ──
+    raw_count = len(results.boxes)
+    log.info(f"crop_cattle: YOLO returned {raw_count} raw detections")
     for box in results.boxes:
         cls = int(box.cls[0])
         conf = float(box.conf[0])
-        if cls != YOLO_COW_CLASS_ID or conf < YOLO_CONF:
-            continue
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         area = max(0, x2 - x1) * max(0, y2 - y1)
-        if area / img_area >= MIN_BBOX_AREA_PCT:
+        area_pct = area / img_area if img_area > 0 else 0
+        # Log why each detection passes or fails
+        if cls != YOLO_COW_CLASS_ID:
+            reason = f"SKIP class={cls} (need {YOLO_COW_CLASS_ID})"
+        elif conf < YOLO_CONF:
+            reason = f"SKIP conf={conf:.3f} < {YOLO_CONF}"
+        elif area_pct < MIN_BBOX_AREA_PCT:
+            reason = f"SKIP area={area_pct:.4f} < {MIN_BBOX_AREA_PCT}"
+        else:
+            reason = "ACCEPTED"
             boxes.append((conf, x1, y1, x2, y2))
+        log.info(
+            f"  det: class={cls} conf={conf:.3f} bbox=({x1},{y1},{x2},{y2}) "
+            f"area_pct={area_pct:.4f} → {reason}"
+        )
 
     if len(boxes) == 0:
+        log.warning(f"crop_cattle: NO valid boxes after filtering ({raw_count} raw)")
         return None, "RECAPTURE_NO_DETECTION", 0.0
 
     if len(boxes) > MAX_CATTLE_PER_IMAGE:
