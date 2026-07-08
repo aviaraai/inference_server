@@ -9,8 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-# Model weights (large binary files)
-*.pt
-
 # Local storage
 appstorage/
