@@ -19,7 +19,11 @@ YOLO_COW_CLASS_ID  = 19                         # COCO "cow" (primary)
 # horse by YOLOv8 because the body shape context is missing. Accept any of
 # these large-animal classes so the crop pipeline still fires.
 YOLO_CATTLE_CLASS_IDS = {17, 18, 19, 20, 21}   # horse, sheep, cow, elephant, bear
-YOLO_CONF          = 0.30                       # minimum detection confidence
+YOLO_CONF          = 0.30                       # pipeline filter: accept detections ≥ this
+YOLO_INTERNAL_CONF = 0.10                       # passed to YOLO inference — must be BELOW
+                                                # YOLO_CONF so we see (and log) all candidates
+                                                # before filtering. YOLO default (0.25) silently
+                                                # drops dark-cattle detections we need to see.
 MIN_BBOX_AREA_PCT  = 0.05                       # bbox must be ≥5% of image area
 MAX_CATTLE_PER_IMAGE = 1                        # reject multi-cattle images
 CROP_PADDING_PX    = 10                         # pixels to pad around detection box

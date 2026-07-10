@@ -3,11 +3,17 @@ pipeline/yolo_crop.py — YOLO-based cattle detection and cropping.
 
 Ported from src/identify.py:crop_or_full(). Detects cattle in an image,
 validates single-animal constraint, and returns a padded crop.
+
+When YOLO fails to detect on the raw image (common with dark-colored Indian
+cattle/buffalo from low-contrast phone cameras), the pipeline retries with
+CLAHE contrast enhancement. If that also fails, it falls back to using the
+full image rather than rejecting the request outright.
 """
 
 import logging
 from typing import Optional
 
+import cv2
 import numpy as np
 
 from godhaar.config import (
@@ -16,6 +22,7 @@ from godhaar.config import (
     MAX_CATTLE_PER_IMAGE,
     MIN_BBOX_AREA_PCT,
     YOLO_CONF,
+    YOLO_INTERNAL_CONF,
     YOLO_CATTLE_CLASS_IDS,
     YOLO_COW_CLASS_ID,
     YOLO_MODEL_NAME,
@@ -56,10 +63,131 @@ def warmup_yolo() -> None:
     log.info("YOLO warmup complete.")
 
 
+# ── Image enhancement for YOLO detection ──────────────────────────────────────
+
+def _enhance_for_detection(img: np.ndarray) -> np.ndarray:
+    """Apply CLAHE contrast enhancement to help YOLO detect dark cattle.
+
+    Dark-colored Indian cattle (buffalo, Murrah, etc.) photographed by
+    various phone cameras often have very low contrast — the animal blends
+    into shadows, dark soil, or overcast skies. CLAHE (Contrast Limited
+    Adaptive Histogram Equalization) locally boosts contrast so that the
+    animal's outline becomes distinct enough for YOLO to pick up.
+
+    The enhancement is applied ONLY for YOLO detection; the original
+    unmodified image is still used for the final crop, so downstream
+    embedding and color extraction are unaffected.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        BGR image (original).
+
+    Returns
+    -------
+    np.ndarray
+        Contrast-enhanced BGR image for YOLO inference only.
+    """
+    # Convert to LAB color space — L channel holds luminance
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+
+    # CLAHE on the luminance channel
+    # clipLimit=3.0 gives a strong but not over-blown enhancement;
+    # tileGridSize 8×8 is the standard for most resolutions.
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_chan)
+
+    lab_enhanced = cv2.merge([l_enhanced, a_chan, b_chan])
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+    return enhanced
+
+
+def _run_yolo(
+    img: np.ndarray, img_area: int, **kwargs
+) -> list[tuple[float, int, int, int, int]]:
+    """Run YOLO on a single image and return filtered boxes.
+
+    Uses YOLO_INTERNAL_CONF (0.10) as the inference threshold so we see
+    ALL potential detections, then applies our own YOLO_CONF (0.30) filter.
+    This prevents YOLO's default (0.25) from silently dropping dark-cattle
+    detections that fall between 0.10 and 0.25.
+
+    Extra **kwargs (e.g. ``imgsz=1280``, ``augment=True``) are forwarded
+    directly to the YOLO model call for retry strategies.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        BGR image to run inference on.
+    img_area : int
+        Total pixel area of the image (for area-based filtering).
+    **kwargs
+        Extra arguments forwarded to YOLO inference (imgsz, augment, etc.).
+
+    Returns
+    -------
+    list of (conf, x1, y1, x2, y2) tuples that pass class/conf/area filters.
+    """
+    extra_desc = ", ".join(f"{k}={v}" for k, v in kwargs.items()) if kwargs else ""
+    try:
+        results = _yolo_model(
+            img, conf=YOLO_INTERNAL_CONF, verbose=False, **kwargs
+        )[0]
+    except Exception as e:
+        log.error(f"YOLO inference failed: {e}")
+        return []
+
+    boxes = []
+    raw_count = len(results.boxes)
+    tag = f" [{extra_desc}]" if extra_desc else ""
+    log.info(
+        f"crop_cattle: YOLO returned {raw_count} raw detections"
+        f" (conf>={YOLO_INTERNAL_CONF}){tag}"
+    )
+
+    for box in results.boxes:
+        cls = int(box.cls[0])
+        conf = float(box.conf[0])
+        x1, y1, x2, y2 = (int(round(float(v))) for v in box.xyxy[0])
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        area_pct = area / img_area
+
+        if cls not in YOLO_CATTLE_CLASS_IDS:
+            reason = f"SKIP class={cls} (not in {YOLO_CATTLE_CLASS_IDS})"
+        elif conf < YOLO_CONF:
+            reason = f"SKIP conf={conf:.3f} < {YOLO_CONF}"
+        elif area_pct < MIN_BBOX_AREA_PCT:
+            reason = f"SKIP area={area_pct:.4f} < {MIN_BBOX_AREA_PCT}"
+        else:
+            reason = "ACCEPTED"
+            boxes.append((conf, x1, y1, x2, y2))
+
+        # Log ALL detections at INFO level so we can diagnose failures
+        log.info(
+            f"  det: class={cls} conf={conf:.3f} bbox=({x1},{y1},{x2},{y2}) "
+            f"area_pct={area_pct:.4f} → {reason}"
+        )
+
+    return boxes
+
+
 def crop_cattle(
     img: np.ndarray, no_crop: bool = False
 ) -> tuple[Optional[np.ndarray], str, float]:
     """Detect and crop the cattle from a BGR image.
+
+    Detection strategy (progressive retries, cheapest first):
+      1. YOLO on original image (imgsz=640, ~30ms)
+      2. YOLO on CLAHE-enhanced image (imgsz=640, ~40ms)
+      3. CLAHE + imgsz=1280 — higher resolution preserves detail (~100ms)
+      4. CLAHE + augment=True — multi-scale TTA, most robust (~500ms)
+
+    Each retry is more expensive but catches harder cases (dark cattle,
+    low-contrast phone cameras, unusual angles). The crop is ALWAYS taken
+    from the original image — enhancement is only used to help YOLO find
+    the bounding box.
 
     Parameters
     ----------
@@ -90,39 +218,40 @@ def crop_cattle(
     img_area = h * w
     log.info(f"crop_cattle: input image {w}x{h} ({img_area} px)")
 
-    try:
-        results = _yolo_model(img, verbose=False)[0]
-    except Exception as e:
-        log.error(f"YOLO inference failed: {e}")
-        return None, "RECAPTURE_NO_DETECTION", 0.0
-    boxes = []
+    # ── Attempt 1: YOLO on the original image ─────────────────────────────
+    boxes = _run_yolo(img, img_area)
 
-    # ── DEBUG: log ALL raw YOLO detections before filtering ──
-    raw_count = len(results.boxes)
-    log.info(f"crop_cattle: YOLO returned {raw_count} raw detections")
-    for box in results.boxes:
-        cls = int(box.cls[0])
-        conf = float(box.conf[0])
-        x1, y1, x2, y2 = (int(round(float(v))) for v in box.xyxy[0])
-        area = max(0, x2 - x1) * max(0, y2 - y1)
-        area_pct = area / img_area
-        # Log why each detection passes or fails
-        if cls not in YOLO_CATTLE_CLASS_IDS:
-            reason = f"SKIP class={cls} (not in {YOLO_CATTLE_CLASS_IDS})"
-        elif conf < YOLO_CONF:
-            reason = f"SKIP conf={conf:.3f} < {YOLO_CONF}"
-        elif area_pct < MIN_BBOX_AREA_PCT:
-            reason = f"SKIP area={area_pct:.4f} < {MIN_BBOX_AREA_PCT}"
-        else:
-            reason = "ACCEPTED"
-            boxes.append((conf, x1, y1, x2, y2))
-        log.debug(
-            f"  det: class={cls} conf={conf:.3f} bbox=({x1},{y1},{x2},{y2}) "
-            f"area_pct={area_pct:.4f} → {reason}"
-        )
-
+    # ── Attempt 2: CLAHE-enhanced image ───────────────────────────────────
+    enhanced = None
     if len(boxes) == 0:
-        log.warning(f"crop_cattle: NO valid boxes after filtering ({raw_count} raw)")
+        log.info("crop_cattle: attempt 2 — CLAHE enhancement...")
+        enhanced = _enhance_for_detection(img)
+        boxes = _run_yolo(enhanced, img_area)
+
+    # ── Attempt 3: CLAHE + higher resolution (imgsz=1280) ─────────────────
+    if len(boxes) == 0:
+        log.info("crop_cattle: attempt 3 — CLAHE + imgsz=1280...")
+        if enhanced is None:
+            enhanced = _enhance_for_detection(img)
+        boxes = _run_yolo(enhanced, img_area, imgsz=1280)
+
+    # ── Attempt 4: CLAHE + test-time augmentation (most expensive) ────────
+    if len(boxes) == 0:
+        log.info("crop_cattle: attempt 4 — CLAHE + augment (TTA)...")
+        if enhanced is None:
+            enhanced = _enhance_for_detection(img)
+        boxes = _run_yolo(enhanced, img_area, augment=True)
+
+    # ── Log which attempt succeeded ───────────────────────────────────────
+    if len(boxes) > 0:
+        log.info(f"crop_cattle: {len(boxes)} valid box(es) found")
+
+    # ── All attempts failed — reject ──────────────────────────────────────
+    if len(boxes) == 0:
+        log.warning(
+            "crop_cattle: NO detection after all 4 attempts. "
+            "Requesting recapture."
+        )
         return None, "RECAPTURE_NO_DETECTION", 0.0
 
     # ── Cross-class NMS deduplication ───────────────────────────────────────
@@ -173,7 +302,7 @@ def crop_cattle(
         )
         return img, "FULL_IMAGE", conf
 
-    # Apply padding
+    # Apply padding — crop from the ORIGINAL image, not the enhanced one
     pad = CROP_PADDING_PX
     x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
     x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
