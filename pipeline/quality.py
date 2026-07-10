@@ -3,6 +3,11 @@ pipeline/quality.py — Image quality gate for the inference server.
 
 Ported from src/identify.py:quality_check(). Runs on both /register and
 /search images to prevent bad embeddings from entering the FAISS index.
+
+Blur is measured on the central 50% crop of the image, not the full frame.
+This avoids penalizing close-up shots where the background is intentionally
+blurred (depth-of-field / bokeh), while still catching genuinely blurry
+subjects.
 """
 
 import cv2
@@ -14,6 +19,24 @@ from godhaar.config import (
     MIN_EXPOSURE,
     MAX_EXPOSURE,
 )
+
+# Fraction of the image (centered) used for blur measurement.
+_BLUR_CENTER_FRAC = 0.50
+
+
+def _center_region(gray: np.ndarray) -> np.ndarray:
+    """Return the central crop of a grayscale image for blur measurement.
+
+    Uses the central `_BLUR_CENTER_FRAC` of each axis so that out-of-focus
+    backgrounds (bokeh) don't pull the Laplacian variance below the threshold.
+    """
+    h, w = gray.shape[:2]
+    dy = int(h * (1 - _BLUR_CENTER_FRAC) / 2)
+    dx = int(w * (1 - _BLUR_CENTER_FRAC) / 2)
+    # Guard against degenerate images where crop would be empty
+    dy = max(dy, 0)
+    dx = max(dx, 0)
+    return gray[dy: h - dy or h, dx: w - dx or w]
 
 
 def quality_check(image_bytes: bytes) -> tuple[str, str]:
@@ -41,7 +64,7 @@ def quality_check(image_bytes: bytes) -> tuple[str, str]:
     short = min(w, h)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    blur = float(cv2.Laplacian(_center_region(gray), cv2.CV_64F).var())
     exp = float(gray.mean())
 
     if short < MIN_SHORT_SIDE:
@@ -73,7 +96,7 @@ def quality_check_cv2(img: np.ndarray) -> tuple[str, str]:
     short = min(w, h)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    blur = float(cv2.Laplacian(_center_region(gray), cv2.CV_64F).var())
     exp = float(gray.mean())
 
     if short < MIN_SHORT_SIDE:

@@ -14,11 +14,19 @@ EMB_DIM  = 256                                  # GodhaarModel output contract
 
 # ── YOLO Crop ─────────────────────────────────────────────────────────────────
 YOLO_MODEL_NAME    = "yolov8s.pt"
-YOLO_COW_CLASS_ID  = 19                         # COCO "cow"
+YOLO_COW_CLASS_ID  = 19                         # COCO "cow" (primary)
+# Extended set: close-up buffalo shots are often misclassified as bear/sheep/
+# horse by YOLOv8 because the body shape context is missing. Accept any of
+# these large-animal classes so the crop pipeline still fires.
+YOLO_CATTLE_CLASS_IDS = {17, 18, 19, 20, 21}   # horse, sheep, cow, elephant, bear
 YOLO_CONF          = 0.30                       # minimum detection confidence
 MIN_BBOX_AREA_PCT  = 0.05                       # bbox must be ≥5% of image area
 MAX_CATTLE_PER_IMAGE = 1                        # reject multi-cattle images
 CROP_PADDING_PX    = 10                         # pixels to pad around detection box
+CLOSE_UP_AREA_PCT  = 0.55                       # if best box fills >55% of frame
+                                                # → treat as close-up, use full img
+DOMINANT_AREA_RATIO = 3.0                       # if top box is >=3x larger than next,
+                                                # drop smaller boxes (background blur)
 
 # ── Quality Gate ──────────────────────────────────────────────────────────────
 MIN_SHORT_SIDE     = 96                         # minimum short edge in pixels
