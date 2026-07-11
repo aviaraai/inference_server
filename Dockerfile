@@ -45,6 +45,6 @@ COPY . .
 ENV PYTHONPATH=/app
 
 
-EXPOSE 9006
+EXPOSE 9050
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9006", "--workers", "1"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9050", "--workers", "1"]

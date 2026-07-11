@@ -457,15 +457,19 @@ def _run_search_pipeline(
     """
     q_status, q_reason = quality_check(muzzle_bytes)
     if q_status != "GOOD":
+        log.error(f"Quality status: {q_status}")
+        log.error(f"Quality reason: {q_reason}")
         raise HTTPException(status_code=422, detail=q_reason)
 
     img_bgr = _decode_image(muzzle_bytes)
     crop, det_status, _det_conf = crop_cattle(img_bgr)
     if crop is None:
+        log.error(f"Crop: {crop} | Det Status: {det_status} | Det conf: {_det_conf}")
         raise HTTPException(status_code=422, detail=det_status)
 
     crop_status, crop_reason = quality_check_cv2(crop)
     if crop_status != "GOOD":
+        log.error(f"Crop Status: {crop_status} | Crop reason: {crop_reason}")
         raise HTTPException(status_code=422, detail=f"muzzle_crop: {crop_reason}")
 
     crop_bytes = cv2.imencode(".jpg", crop)[1].tobytes()

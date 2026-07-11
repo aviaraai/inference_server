@@ -1,24 +1,26 @@
-name: inference-server
+name: godhaar-inference-server
 
 services:
   inference-server:
+    networks:
+      - godhaar-net.dev
     build:
       context: .
       dockerfile: Dockerfile
 
-    image: inference-server:dev
-    container_name: inference-server.dev
+    image: godhaar-inference-server:dev
+    container_name: godhaar-inference-server.dev
 
     init: true
 
     gpus: all
     ipc: host
 
-    ports:
-      - "9001:9006"
+    expose:
+      - "9050"
 
     volumes:
-      - ./appstorage:/appstorage
+      - /appstorage:/appstorage
       - ./godhaar:/app/godhaar
       - ./pipeline:/app/pipeline
       - ./main.py:/app/main.py
@@ -35,6 +37,10 @@ services:
 
       MODEL_PATH: /appstorage/Models/embedding_model/model.pt
       FAISS_INDEX_PATH: /appstorage/indexes/faiss.index
-      YOLO_MODEL_PATH: /app/yolov8s.pt
+      YOLO_MODEL_PATH: /appstorage/Models/detection_crop/yolov8s.pt
 
     restart: unless-stopped
+
+networks:
+  godhaar-net.dev:
+    external: true
