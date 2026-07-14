@@ -17,6 +17,7 @@ from godhaar.config import (
     MIN_SHORT_SIDE,
     BLUR_THRESHOLD,
     MIN_EXPOSURE,
+    MIN_EXPOSURE_STD,
     MAX_EXPOSURE,
 )
 
@@ -71,8 +72,20 @@ def quality_check(image_bytes: bytes) -> tuple[str, str]:
         return "RECAPTURE", f"bad_quality short={short}"
     if blur < BLUR_THRESHOLD:
         return "RECAPTURE", f"bad_quality blur={blur:.2f}"
-    if exp < MIN_EXPOSURE or exp > MAX_EXPOSURE:
+    if exp > MAX_EXPOSURE:
         return "RECAPTURE", f"bad_quality exposure={exp:.2f}"
+    if exp < MIN_EXPOSURE:
+        # Low mean brightness alone doesn't distinguish a naturally dark
+        # subject (black/dark-brown cattle, common in Indian breeds) from a
+        # genuinely underexposed photo. A real underexposed shot is dark AND
+        # flat; a well-lit dark animal still has real local contrast. Only
+        # reject when both conditions hold.
+        contrast = float(gray.std())
+        if contrast < MIN_EXPOSURE_STD:
+            return (
+                "RECAPTURE",
+                f"bad_quality exposure={exp:.2f} contrast={contrast:.2f}",
+            )
 
     return "GOOD", "ok"
 
@@ -103,7 +116,19 @@ def quality_check_cv2(img: np.ndarray) -> tuple[str, str]:
         return "RECAPTURE", f"bad_quality short={short}"
     if blur < BLUR_THRESHOLD:
         return "RECAPTURE", f"bad_quality blur={blur:.2f}"
-    if exp < MIN_EXPOSURE or exp > MAX_EXPOSURE:
+    if exp > MAX_EXPOSURE:
         return "RECAPTURE", f"bad_quality exposure={exp:.2f}"
+    if exp < MIN_EXPOSURE:
+        # Low mean brightness alone doesn't distinguish a naturally dark
+        # subject (black/dark-brown cattle, common in Indian breeds) from a
+        # genuinely underexposed photo. A real underexposed shot is dark AND
+        # flat; a well-lit dark animal still has real local contrast. Only
+        # reject when both conditions hold.
+        contrast = float(gray.std())
+        if contrast < MIN_EXPOSURE_STD:
+            return (
+                "RECAPTURE",
+                f"bad_quality exposure={exp:.2f} contrast={contrast:.2f}",
+            )
 
     return "GOOD", "ok"

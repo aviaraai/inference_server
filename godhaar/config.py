@@ -37,11 +37,24 @@ MIN_SHORT_SIDE     = 96                         # minimum short edge in pixels
 BLUR_THRESHOLD     = 20.0                       # Laplacian variance minimum
 MIN_EXPOSURE       = 30.0                       # mean pixel intensity floor
 MAX_EXPOSURE       = 225.0                      # mean pixel intensity ceiling
+# Dark-coated cattle/buffalo (common in Indian breeds) push whole-frame mean
+# intensity below MIN_EXPOSURE even in a well-lit, detailed photo — the mean
+# alone can't tell a naturally dark subject from a genuinely underexposed one.
+# A real underexposed shot is dark AND flat (crushed toward black, low local
+# contrast); a well-lit dark animal is dark but still has real contrast. Only
+# reject on low exposure when contrast is ALSO below this floor.
+MIN_EXPOSURE_STD   = 15.0                       # pixel-intensity std-dev floor,
+                                                 # paired with MIN_EXPOSURE
 
 # ── Duplicate Detection ──────────────────────────────────────────────────────
-DUPLICATE_THRESHOLD = 0.95                      # cosine similarity above which
+DUPLICATE_THRESHOLD = 0.80                      # cosine similarity above which
                                                 # embeddings are considered the
-                                                # same muzzle (duplicate)
+                                                # same muzzle (duplicate).
+                                                # Lowered from 0.95 → 0.80 to catch
+                                                # re-registrations under different
+                                                # lighting/angle while still giving
+                                                # enough margin to avoid false positives
+                                                # on genuinely different cattle.
 
 IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp"}
 
