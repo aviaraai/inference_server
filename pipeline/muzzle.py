@@ -1,21 +1,43 @@
+"""
+pipeline/muzzle.py — Muzzle embedding pipeline.
+
+Handles single-image and batch inference through GodhaarModel.
+"""
+
 from typing import Any
 
 import torch
-from preprocess import preprocess
+
+from pipeline.preprocess import preprocess_batch
 
 
-def pipeline(image, model):
-    image_bytes = image.file.read()
+def embed_batch(
+    images: list[bytes],
+    model: Any,
+    device: torch.device,
+) -> torch.Tensor:
+    """Embed a batch of muzzle images in a single forward pass.
 
-    tensor = preprocess(image_bytes)
+    Parameters
+    ----------
+    images : list[bytes]
+        List of raw image file contents.
+    model : GodhaarModel
+    device : torch.device
 
-    embedding = run_inference(tensor, model)
+    Returns
+    -------
+    torch.Tensor of shape (B, 256), unit-norm, float32.
+    """
+    if len(images) == 0:
+        return torch.empty(0, 256)
 
-    return embedding
+    batch_tensor = preprocess_batch(images).to(device)  # (B, 3, 518, 518)
 
-
-def run_inference(input_tensor: torch.Tensor, model: Any):
     with torch.inference_mode():
-        output_tensor = model(input_tensor)
+        with torch.amp.autocast(
+            device_type=device.type, enabled=(device.type == "cuda")
+        ):
+            embeddings = model(batch_tensor)  # (B, 256)
 
-    return output_tensor
+    return embeddings.float().cpu()

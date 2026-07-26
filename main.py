@@ -1,110 +1,502 @@
+"""
+main.py — Godhaar Inference Server.
+
+A pure ML microservice exposing:
+  POST /register  — embed + store cattle in FAISS
+  POST /search    — embed + rank provided candidates + return ML scores
+  GET  /health    — liveness check
+
+Business logic (MATCH/REVIEW/NOT_REGISTERED, GPS, policy rules) lives
+in the API server, NOT here. This server only returns raw ML scores,
+color classifications, and gap calculations.
+"""
+
+import asyncio
+import json
+from collections import Counter
+import logging
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
+import cv2
+import numpy as np
 import torch
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 
-from dependency import get_faiss_index, get_model
+from dependency import (
+    get_color_extractor,
+    get_device,
+    get_faiss_index,
+    get_model,
+)
 from faiss_index import FaissIndex
-from pipeline.front import pipeline as front_pipeline
-from pipeline.muzzle import pipeline as muzzle_pipeline
-from schema import Register, Search
+from godhaar.config import DUPLICATE_THRESHOLD, EMB_DIM, MODEL_VERSION
+from godhaar.model import GodhaarModel
+from helpers import _decode_image, _ms_since
+from pipeline.color import RuleBasedColorExtractor
+from pipeline.muzzle import embed_batch
+from pipeline.quality import quality_check, quality_check_cv2
+from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
+from schema import (
+    CandidateInfo,
+    ColorResult,
+    ExtractedColors,
+    HealthResponse,
+    MatchCandidate,
+    RegisterResponse,
+    SearchResponse,
+    VersionInfo,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("godhaar.server")
 
 
-# Modern FastAPI lifespan manager for startup and shutdown events
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Retrieve model path from environment variable or use a default
-    model_path = os.getenv("MODEL_PATH", "model.pt")
+    """Load all ML resources at startup, clean up on shutdown."""
 
-    # For seamless local development and testing, create a dummy model if it doesn't exist
-    if not os.path.exists(model_path):
-        print(f"Model file '{model_path}' not found. Generating a dummy model...")
-        dummy_model = torch.nn.Linear(10, 2)
-        torch.save(dummy_model, model_path)
-        print(f"Dummy model successfully saved to '{model_path}'")
+    start = time.monotonic()
 
-    try:
-        # Load the PyTorch (.pt) model into memory
-        # 'map_location=torch.device("cpu")' ensures it loads fine on any system without GPU
-        # 'weights_only=False' is set to allow loading full modules safely from a trusted source
-        model = torch.load(
-            model_path, map_location=torch.device("cpu"), weights_only=False
-        )
+    # 1. Resolve device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    app.state.device = device
+    log.info(f"Device: {device}")
+    if device.type == "cuda":
+        log.info(f"GPU: {torch.cuda.get_device_name(0)}")
 
-        # Set to evaluation mode if it's a torch.nn.Module
-        if isinstance(model, torch.nn.Module):
-            model.eval()
+    # 2. Load GodhaarModel
+    model_path = os.getenv("MODEL_PATH")
+    if not model_path or not os.path.exists(model_path):
+        log.error(f"Model checkpoint not found: {model_path}")
+        raise RuntimeError(f"Model checkpoint not found: {model_path}")
 
-        app.state.model = model
-        # Embedding dimension set to 256 as per your latest message.
-        # TODO: Modify if required
-        app.state.faiss_index = FaissIndex(embedding_dim=256)
-        print(
-            f"Successfully loaded PyTorch model from '{model_path}' and stored it in application state."
-        )
-    except Exception as e:
-        app.state.model = None
-        print(f"Error loading PyTorch model from '{model_path}': {e}")
-        raise RuntimeError(f"Could not load ML model: {e}")
+    log.info(f"Loading GodhaarModel from {model_path}...")
+    model, ckpt = GodhaarModel.load_checkpoint(model_path, device=device)
+    model.eval()
+    app.state.model = model
+    log.info(f"GodhaarModel loaded (epoch={ckpt.get('epoch', '?')})")
+
+    # 3. Load FAISS index (hybrid: load existing, allow online additions)
+    faiss_index_path = os.getenv("FAISS_INDEX_PATH")
+    if not faiss_index_path:
+        log.error(f"FAISS index not found: {faiss_index_path}")
+        raise RuntimeError(f"FAISS index not found: {faiss_index_path}")
+    faiss_index = FaissIndex(embedding_dim=EMB_DIM)
+    faiss_index.load(faiss_index_path)
+    app.state.faiss_index = faiss_index
+    log.info(f"FAISS index: {len(faiss_index)} vectors")
+
+    # 4. Load Color Extractor
+    color_extractor = RuleBasedColorExtractor()
+    app.state.color_extractor = color_extractor
+
+    # 5. Load YOLO
+    yolo_path = os.getenv("YOLO_MODEL_PATH", None)
+    load_yolo(yolo_path)
+
+    # 6. Warmup — run dummy inference through both models
+    log.info("Running warmup inference...")
+    dummy = torch.randn(1, 3, 518, 518, device=device)
+    with torch.inference_mode():
+        model(dummy)
+    warmup_yolo()
+    log.info("Warmup complete.")
+
+    elapsed = time.monotonic() - start
+    log.info(
+        f"Server ready in {elapsed:.1f}s — FAISS={len(faiss_index)} vectors, model={MODEL_VERSION}"
+    )
 
     yield
 
-    # Clean up resources on shutdown
+    # Shutdown
+    log.info("Shutting down — saving FAISS index...")
+    await faiss_index.save(faiss_index_path)
     app.state.model = None
-    print("Application shutdown: Model cleared from memory.")
+    log.info("Server shutdown complete.")
 
 
-# Initialize FastAPI application with the lifespan context manager
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Godhaar Inference Server",
+    version="1.0.0",
+    description="Pure ML microservice for cattle muzzle re-identification.",
+    lifespan=lifespan,
+)
 
 
-@app.post("register")
-def register(
-    register: Register,
-    faiss_index: FaissIndex = Depends(get_faiss_index),
+@app.post("/register", response_model=RegisterResponse, status_code=201)
+async def register(
+    muzzle_images: list[UploadFile] = File(...),
+    front_images: list[UploadFile] = File(...),
+    candidate_json: str = Form(..., alias="candidates"),
     model: Any = Depends(get_model),
+    device: Any = Depends(get_device),
+    faiss_index: FaissIndex = Depends(get_faiss_index),
+    color_extractor: Any = Depends(get_color_extractor),
 ):
-    try:
-        # Begins inference on all muzzle images serially
-        # These tasks are done serially, not parallely to not increase load on the server
-        embeddings = [
-            muzzle_pipeline(register.muzzle_1, model),
-            muzzle_pipeline(register.muzzle_2, model),
-            muzzle_pipeline(register.muzzle_3, model),
-        ]
+    """
+    Register a cattle animal.
 
-        rules = [front_pipeline(register.front_1), front_pipeline(register.front_2)]
+    Expects exactly 3 muzzle images and 2 front images.
+    Requires ``candidates`` — a JSON string of nearby cattle
+    (pre-filtered by GPS) with their stored colors:
+        [{"faiss_id": 123, "body_color": "BLACK", "muzzle_color": "PINK"}, ...]
+    Send "[]" if no nearby cattle exist (first registration in the area).
 
-        ids = []
+    Duplicate detection
+    -------------------
+    A candidate is a duplicate if BOTH conditions are true:
+      1. Embedding cosine similarity ≥ DUPLICATE_THRESHOLD (0.95)
+      2. Body color AND muzzle color match the newly extracted colors
 
-        for embedding in embeddings:
-            embedding = embedding.squeeze(0).cpu().numpy()
+    If duplicate → HTTP 409, nothing stored in FAISS.
 
-            ids.append(faiss_index.add(embedding))
-
-        return {"status": "success", "embedding_ids": ids, "rules": rules}
-    except Exception as e:
+    HTTP status codes
+    -----------------
+    201 — registered successfully
+    409 — duplicate muzzle detected, not stored
+    422 — bad input (wrong image count, quality failure, no detection)
+    500 — FAISS or internal system failure
+    """
+    if len(muzzle_images) != 3:
         raise HTTPException(
-            status_code=500,
-            detail=f"Inference error occurred: {e}",
+            status_code=422,
+            detail=f"Expected 3 muzzle images, got {len(muzzle_images)}",
+        )
+    if len(front_images) != 2:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Expected 2 front images, got {len(front_images)}",
         )
 
-
-@app.post("/search")
-def predict(
-    search: Search,
-    faiss_index: FaissIndex = Depends(get_faiss_index),
-    model: Any = Depends(get_model),
-):
+    # Parse candidates JSON — always required, send "[]" if no nearby cattle
     try:
-        embedding = muzzle_pipeline(search.muzzle, model).squeeze(0).cpu().numpy()
-        id = faiss_index.add(embedding)
-        rule = front_pipeline(search.front)
-        return {"status": "success", "id": id, "rule": rule}
+        candidate_list: list[CandidateInfo] = [CandidateInfo(**c) for c in json.loads(candidate_json)]
     except Exception as e:
         raise HTTPException(
-            status_code=500,
-            detail=f"Inference error occurred: {e}",
+            status_code=422,
+            detail=f"Invalid candidates format: {e}",
         )
+
+    t_start = time.monotonic()
+
+    # Read all image files concurrently — pure async I/O, no thread needed.
+    muzzle_bytes, front_bytes = await asyncio.gather(
+        asyncio.gather(*[img.read() for img in muzzle_images]),
+        asyncio.gather(*[img.read() for img in front_images]),
+    )
+
+    # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
+    embeddings_np, body_color, muzzle_color = await asyncio.to_thread(
+        _run_registration_pipeline,
+        muzzle_bytes,
+        front_bytes,
+        model,
+        device,
+        color_extractor,
+    )
+
+    new_body  = body_color["label"]    # e.g. "BLACK"
+    new_muzzle = muzzle_color["label"] # e.g. "PINK"
+
+    # ── Duplicate check: embedding similarity + color match ───────────────
+    potential_matches: list[MatchCandidate] = []
+
+    if candidate_list:
+        candidate_ids = [c.faiss_id for c in candidate_list]
+        candidate_colors = {c.faiss_id: c for c in candidate_list}
+
+        try:
+            avg_embedding = embeddings_np.mean(axis=0)  # (256,)
+            matches = await faiss_index.restricted_search(
+                avg_embedding, candidate_ids=candidate_ids, top_k=5
+            )
+            potential_matches = [MatchCandidate(**m) for m in matches]
+        except Exception as e:
+            log.error(f"FAISS duplicate check failed: {e}")
+            raise HTTPException(status_code=500, detail=f"faiss_error: {e}")
+
+        for match in potential_matches:
+            if match.score < DUPLICATE_THRESHOLD:
+                break  # sorted descending — no point checking further
+
+            stored = candidate_colors[match.faiss_id]
+            color_match = (
+                stored.body_color == new_body
+                and stored.muzzle_color == new_muzzle
+            )
+
+            if color_match:
+                log.info(
+                    f"/register 409 duplicate | "
+                    f"score={match.score:.4f} | "
+                    f"body={new_body} muzzle={new_muzzle} | "
+                    f"matched_faiss_id={match.faiss_id}"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "duplicate_muzzle",
+                        "top_score": match.score,
+                        "matched_faiss_id": match.faiss_id,
+                    },
+                )
+
+    # ── Store in FAISS ────────────────────────────────────────────────────
+    try:
+        faiss_ids = await faiss_index.add_batch(embeddings_np)
+    except Exception as e:
+        log.error(f"FAISS write failed: {e}")
+        raise HTTPException(status_code=500, detail=f"faiss_error: {e}")
+
+    t_total = _ms_since(t_start)
+    log.info(f"/register 201 | faiss_ids={faiss_ids} | {t_total}ms")
+
+    return RegisterResponse(
+        status="success",
+        embedding_ids=faiss_ids,
+        extracted_colors=ExtractedColors(
+            body=ColorResult(**body_color),
+            muzzle=ColorResult(**muzzle_color),
+        ),
+        potential_matches=potential_matches,
+        versions=VersionInfo(
+            model=MODEL_VERSION,
+            faiss=faiss_index.faiss_version_label,
+            embedding="v1",
+        ),
+        registered_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _run_registration_pipeline(
+    muzzle_bytes: tuple[bytes, ...],
+    front_bytes: tuple[bytes, ...],
+    model: Any,
+    device: torch.device,
+    color_extractor: Any,
+) -> tuple[np.ndarray, dict, dict]:
+    """
+    Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
+    embedding, and color extraction. Executed entirely inside a single
+    worker thread via asyncio.to_thread — nothing in here should ever
+    need to be async itself.
+
+    Raises HTTPException on any validation/quality failure; it's safe to
+    raise HTTPException from inside a thread because asyncio.to_thread
+    re-raises it on the awaiting coroutine, where FastAPI's normal
+    exception handling picks it up.
+    """
+    # ── Quality gate on raw muzzle images ──────────────────────────────
+    for i, mb in enumerate(muzzle_bytes, 1):
+        status, reason = quality_check(mb)
+        if status != "GOOD":
+            raise HTTPException(status_code=422, detail=f"muzzle_{i}: {reason}")
+
+    # ── YOLO crop + quality check on crops ──────────────────────────────
+    cropped_images = []
+    for i, mb in enumerate(muzzle_bytes, 1):
+        img_bgr = _decode_image(mb)
+        crop, det_status, _det_conf = crop_cattle(img_bgr)
+        if crop is None:
+            raise HTTPException(status_code=422, detail=f"muzzle_{i}: {det_status}")
+
+        crop_status, crop_reason = quality_check_cv2(crop)
+        if crop_status != "GOOD":
+            raise HTTPException(
+                status_code=422, detail=f"muzzle_{i}_crop: {crop_reason}"
+            )
+
+        cropped_images.append(crop)
+
+    # ── Embed (batched forward pass) ─────────────────────────────────────
+    jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
+    embeddings = embed_batch(jpg_bytes, model, device)
+
+    # ── Color extraction with consistency check ──────────────────────────
+    #
+    # Body (2 front images): BOTH must agree on the same label.
+    #   Disagree → 422, ask user to retake.
+    #
+    # Muzzle (3 crops): majority (≥2/3) must agree on the same label.
+    #   Majority found → accept majority label (avg confidence of agreeing images).
+    #   All 3 different → 422, ask user to retake.
+
+    body_colors = [color_extractor.extract_body(_decode_image(fb)) for fb in front_bytes]
+    body_labels = [c["label"] for c in body_colors]
+
+    if body_labels[0] != body_labels[1]:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"body_color_inconsistent: front images disagree "
+                f"({body_labels[0]} vs {body_labels[1]}), retake photos"
+            ),
+        )
+    # Both agree — pick highest confidence reading
+    body_color = max(body_colors, key=lambda c: c["confidence"])
+
+    muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
+    muzzle_labels = [c["label"] for c in muzzle_colors]
+
+    # Count votes per label
+    vote_counts = Counter(muzzle_labels)
+    majority_label, majority_count = vote_counts.most_common(1)[0]
+
+    if majority_count < 2:
+        # All 3 different — no majority
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"muzzle_color_inconsistent: no majority among crops "
+                f"({', '.join(muzzle_labels)}), retake photos"
+            ),
+        )
+    # Majority found — use avg confidence of agreeing images
+    agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
+    avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
+    muzzle_color = {"label": majority_label, "confidence": avg_conf}
+
+    return embeddings.numpy(), body_color, muzzle_color
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search(
+    muzzle: UploadFile = File(...),
+    front: UploadFile = File(...),
+    top_k: int = Form(5),
+    candidate_ids: list[int] = Form(...),
+    model: Any = Depends(get_model),
+    device: Any = Depends(get_device),
+    faiss_index: FaissIndex = Depends(get_faiss_index),
+    color_extractor: Any = Depends(get_color_extractor),
+):
+    """
+    Search endpoint: receives candidate FAISS IDs from the API server,
+    embeds the query muzzle, then ranks only those candidates via
+    restricted_search (reconstruct → dot product → sort).
+
+    No index-wide FAISS search is performed. The API server decides
+    which candidates to send based on GPS / Supabase filtering.
+    """
+    request_id = uuid.uuid4().hex
+    t_start = time.monotonic()
+
+    if not candidate_ids:
+        raise HTTPException(status_code=422, detail="candidate_ids must contain at least one FAISS ID")
+
+    log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)}")
+
+    # ── Real async I/O: read uploads concurrently ──────────────────────────
+    muzzle_bytes, front_bytes = await asyncio.gather(
+        muzzle.read(),
+        front.read()
+    )
+
+    # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
+    t_embed_start = time.monotonic()
+    emb_np, muzzle_color, body_color = await asyncio.to_thread(
+        _run_search_pipeline,
+        muzzle_bytes,
+        front_bytes,
+        model,
+        device,
+        color_extractor,
+    )
+    t_embed = _ms_since(t_embed_start)
+
+    # ── Restricted search: rank only the provided candidates ─────────────
+    t_faiss_start = time.monotonic()
+    matches = await faiss_index.restricted_search(emb_np, candidate_ids=candidate_ids, top_k=top_k)
+    t_faiss = _ms_since(t_faiss_start)
+
+    t_total = _ms_since(t_start)
+    log.info(
+        f"[{request_id}] /search done | matches={len(matches)} | "
+        f"{t_total}ms (embed={t_embed} faiss={t_faiss}) | "
+        f"top1_faiss_id={matches[0]['faiss_id'] if matches else 'none'} "
+        f"score={matches[0]['score'] if matches else 0}"
+    )
+
+    return SearchResponse(
+        request_id=request_id,
+        query_colors=ExtractedColors(
+            body=ColorResult(**body_color),
+            muzzle=ColorResult(**muzzle_color),
+        ),
+        top_matches=[
+            MatchCandidate(**m) for m in matches
+        ],
+        versions=VersionInfo(
+            model=MODEL_VERSION,
+            faiss=faiss_index.faiss_version_label,
+            embedding=None,
+        ),
+    )
+
+
+def _run_search_pipeline(
+    muzzle_bytes: bytes,
+    front_bytes: bytes,
+    model: Any,
+    device: torch.device,
+    color_extractor: Any,
+) -> tuple[np.ndarray, dict, dict]:
+    """
+    Synchronous CPU/GPU pipeline for /search: quality gate, crop, embed,
+    color extraction. Runs entirely inside asyncio.to_thread.
+    """
+    q_status, q_reason = quality_check(muzzle_bytes)
+    if q_status != "GOOD":
+        log.error(f"Quality status: {q_status}")
+        log.error(f"Quality reason: {q_reason}")
+        raise HTTPException(status_code=422, detail=q_reason)
+
+    img_bgr = _decode_image(muzzle_bytes)
+    crop, det_status, _det_conf = crop_cattle(img_bgr)
+    if crop is None:
+        log.error(f"Crop: {crop} | Det Status: {det_status} | Det conf: {_det_conf}")
+        raise HTTPException(status_code=422, detail=det_status)
+
+    crop_status, crop_reason = quality_check_cv2(crop)
+    if crop_status != "GOOD":
+        log.error(f"Crop Status: {crop_status} | Crop reason: {crop_reason}")
+        raise HTTPException(status_code=422, detail=f"muzzle_crop: {crop_reason}")
+
+    crop_bytes = cv2.imencode(".jpg", crop)[1].tobytes()
+    embedding = embed_batch([crop_bytes], model, device)  # (1, 256)
+    emb_np = embedding.squeeze(0).numpy()  # (256,)
+
+    muzzle_color = color_extractor.extract_muzzle(crop)
+    front_img = _decode_image(front_bytes)
+    body_color = color_extractor.extract_body(front_img)
+
+    return emb_np, muzzle_color, body_color
+
+
+# ── GET /health ───────────────────────────────────────────────────────────────
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health(
+    model: Any = Depends(get_model),
+    faiss_index: FaissIndex = Depends(get_faiss_index),
+    color_extractor: Any = Depends(get_color_extractor),
+):
+    return HealthResponse(
+        status="ok",
+        model_loaded=model is not None,
+        faiss_size=len(faiss_index),
+        gpu_available=torch.cuda.is_available(),
+        model_version=MODEL_VERSION,
+        color_extractor_available=color_extractor.available,
+    )
