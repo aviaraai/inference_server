@@ -17,7 +17,6 @@ import cv2
 import numpy as np
 
 from godhaar.config import (
-    CLOSE_UP_AREA_PCT,
     CROP_PADDING_PX,
     MAX_CATTLE_PER_IMAGE,
     MIN_BBOX_AREA_PCT,
@@ -292,17 +291,24 @@ def crop_cattle(
     boxes.sort(reverse=True)
     conf, x1, y1, x2, y2 = boxes[0]
 
-    # Close-up fallback: if the best box fills most of the frame the animal is
-    # too close for a meaningful crop — return the full image instead.
-    area_pct = (x2 - x1) * (y2 - y1) / img_area
-    if area_pct >= CLOSE_UP_AREA_PCT:
-        log.info(
-            f"crop_cattle: close-up detected (area_pct={area_pct:.3f} >= "
-            f"{CLOSE_UP_AREA_PCT}), returning full image."
-        )
-        return img, "FULL_IMAGE", conf
-
-    # Apply padding — crop from the ORIGINAL image, not the enhanced one
+    # Always crop tightly to the detected box, padded a few pixels — crop from
+    # the ORIGINAL image, not the enhanced one.
+    #
+    # This used to special-case "close-up" detections (best box covering most
+    # of the frame) by returning the full, uncropped photo instead of a bbox
+    # crop, on the theory that the animal was "too close for a meaningful
+    # crop." That was backwards for this pipeline: crop_cattle()'s only
+    # production callers are the MUZZLE embedding path (main.py register/
+    # search) — there is no whole-body detection use case here that needed an
+    # uncropped fallback. The capture UI tells officers to fill the frame
+    # with the muzzle, so a correctly-taken photo routinely triggered this
+    # branch — meaning most muzzle photos were embedded as the full raw scene
+    # (background, ground, other cattle) instead of a subject-filling crop.
+    # preprocess.py then stretches whatever comes out of here to a fixed
+    # 518x518 (non-aspect-preserving), so the full-frame case diluted the
+    # muzzle even further. GodhaarModel was trained on tight, subject-filling
+    # crops — always producing one here, regardless of how large the
+    # detection is, is what it actually expects.
     pad = CROP_PADDING_PX
     x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
     x2, y2 = min(w, x2 + pad), min(h, y2 + pad)

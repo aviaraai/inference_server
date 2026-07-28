@@ -27,8 +27,6 @@ YOLO_INTERNAL_CONF = 0.10                       # passed to YOLO inference — m
 MIN_BBOX_AREA_PCT  = 0.05                       # bbox must be ≥5% of image area
 MAX_CATTLE_PER_IMAGE = 1                        # reject multi-cattle images
 CROP_PADDING_PX    = 10                         # pixels to pad around detection box
-CLOSE_UP_AREA_PCT  = 0.55                       # if best box fills >55% of frame
-                                                # → treat as close-up, use full img
 DOMINANT_AREA_RATIO = 3.0                       # if top box is >=3x larger than next,
                                                 # drop smaller boxes (background blur)
 
