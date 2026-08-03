@@ -27,6 +27,8 @@ import numpy as np
 import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 
+from cctv.database import init_db as init_cctv_db
+from cctv.routes import router as cctv_router
 from dependency import (
     get_color_extractor,
     get_device,
@@ -130,6 +132,10 @@ async def lifespan(app: FastAPI):
     warmup_muzzle_detector()
     log.info("Warmup complete.")
 
+    # 7. Init CCTV model's session DB (third model — video analytics)
+    init_cctv_db()
+    log.info("CCTV model ready — session DB initialised.")
+
     elapsed = time.monotonic() - start
     log.info(
         f"Server ready in {elapsed:.1f}s — FAISS={len(faiss_index)} vectors, model={MODEL_VERSION}"
@@ -150,6 +156,10 @@ app = FastAPI(
     description="Pure ML microservice for cattle muzzle re-identification.",
     lifespan=lifespan,
 )
+
+# Third model, alongside detection (pipeline/) and identification (godhaar/):
+# video-based cattle counting/tracking/analytics. Self-contained under /cctv.
+app.include_router(cctv_router)
 
 
 @app.post("/register", response_model=RegisterResponse, status_code=201)

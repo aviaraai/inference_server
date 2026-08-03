@@ -11,3 +11,10 @@ wheels/
 
 # Local storage
 appstorage/
+
+# CCTV model runtime artifacts (job outputs, uploads, session DB)
+cctv/runs/
+cctv/uploads/
+cctv/cctv.db
+cctv/cctv.db-wal
+cctv/cctv.db-shm

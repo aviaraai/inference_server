@@ -5,6 +5,52 @@ muzzles. It is called only by the API server (never the app directly), returns
 raw similarity scores, and knows nothing about farmers/ownership. Endpoints:
 `POST /register` (201), `POST /search`, `GET /health`. Port 9050.
 
+There is now a **third model**, `cctv/` — video-based cattle counting/
+tracking/analytics, mounted under `/cctv` in `main.py`. It is fully
+self-contained (own config, SQLite session DB, in-memory background job
+queue) and independent of the register/search decision chain — no GPS,
+no farmer context, no FAISS. See the README's "Video Analytics (CCTV
+Model)" section for the endpoint list. Ported from a standalone prototype
+(`D:\Group Projects\cattle_ai_project`) that had already been built and
+verified against real sample video before the port.
+
+### Tracker YAML compatibility: `cmc_method` → `gmc_method` (ultralytics renamed the key)
+
+Porting the CCTV model's BoT-SORT tracker configs
+(`cctv/trackers/botsort_cattle_fast.yaml` / `botsort_cattle.yaml`) verbatim
+from the source prototype caused every `/cctv/analyze` job to fail
+mid-processing with `'IterableSimpleNamespace' object has no attribute
+'gmc_method'`. The prototype was built against `ultralytics>=8.3` (loose);
+this repo pins `ultralytics==8.4.83`. Between those versions ultralytics
+renamed BoT-SORT's camera-motion-compensation key from `cmc_method` to
+`gmc_method` (confirmed by reading the installed package's own
+`ultralytics/cfg/trackers/botsort.yaml`) — the old key is now silently
+ignored by YAML parsing (not a KeyError) and the code that reads
+`args.gmc_method` finds nothing, so the failure only surfaces once BoT-SORT
+actually runs, not at config-load time. Fixed by renaming the key in both
+YAMLs and adding `model: auto` (the installed default's value, needed once
+`with_reid: true` is set for the accurate preset). **Verified end-to-end
+after the fix**: ran a real sample video through `/cctv/analyze` on this
+machine's GPU — 16 unique cattle tracked, full analytics (density grid,
+per-cow speed/activity, isolation) computed, session persisted to SQLite,
+annotated video downloadable via `/cctv/jobs/{id}/video`.
+
+**Lesson: never trust a bundled tracker/model YAML to survive a version
+bump untouched — diff it against the currently-installed library's own
+default config before assuming it will load.** This is the same class of
+mistake as pinning a numeric threshold across two codebases without
+checking they mean the same thing (see the Telangana app's CLAUDE.md for
+other examples of this pattern) — here it was a config *key name*, not a
+value, but the failure mode (silently wrong until the code path actually
+runs) is identical.
+
+Also fixed while porting: the prototype's `cattle_ai/analytics.py` called
+`cv2.applyColorMap`/`cv2.line` in `_render_heatmap`/`draw_trajectories`
+without ever importing `cv2` — a `NameError` waiting to happen on the very
+first `compute()` call with `enable_analytics=True` (which is the default).
+Never triggered in the prototype because whatever testing it got apparently
+didn't exercise that path end-to-end. Added the import in `cctv/analytics.py`.
+
 ## The pipeline embeds the whole animal, NOT an isolated muzzle
 
 This is the single most important thing to understand about matching quality.

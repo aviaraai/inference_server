@@ -1,0 +1,21 @@
+# BoT-SORT — fast preset (no ReID, optimised for speed)
+tracker_type: botsort
+
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.3
+track_buffer: 90
+match_thresh: 0.8
+
+# appearance / ReID
+with_reid: false
+model: auto
+
+# global motion compensation (renamed from cmc_method in newer ultralytics)
+gmc_method: none
+
+# Kalman filter
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+
+fuse_score: true
