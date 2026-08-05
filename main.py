@@ -49,7 +49,6 @@ from schema import (
     ExtractedColors,
     HealthResponse,
     MatchCandidate,
-    MorphologyResult,
     RegisterResponse,
     SearchResponse,
     VersionInfo,
@@ -277,7 +276,7 @@ async def register(
             body=ColorResult(**body_color),
             muzzle=ColorResult(**muzzle_color),
         ),
-        morphology=MorphologyResult(**morphology),
+        horn_shape=morphology["horn_shape"],
         potential_matches=potential_matches,
         versions=VersionInfo(
             model=MODEL_VERSION,
@@ -417,12 +416,12 @@ async def search(
     the caller has), embeds the query muzzle, then ranks only those
     candidates via restricted_search (reconstruct → dot product → sort).
 
-    Each stored candidate's color/morphology is echoed back on its
+    Each stored candidate's color/horn_shape is echoed back on its
     corresponding entry in `top_matches`, alongside the query's own
-    freshly-extracted `morphology`/`query_colors` at the top level — so
+    freshly-extracted `horn_shape`/`query_colors` at the top level — so
     both sides are available to compare without a second lookup. No
     comparison/similarity math is computed here; this endpoint returns
-    data only, same as /register does for morphology (see CLAUDE.md).
+    data only, same as /register does for horn_shape (see CLAUDE.md).
 
     No index-wide FAISS search is performed. The API server decides
     which candidates to send based on GPS / Supabase filtering.
@@ -486,13 +485,12 @@ async def search(
             body=ColorResult(**body_color),
             muzzle=ColorResult(**muzzle_color),
         ),
-        morphology=MorphologyResult(**morphology),
+        horn_shape=morphology["horn_shape"],
         top_matches=[
             MatchCandidate(
                 **m,
                 body_color=candidate_lookup[m["faiss_id"]].body_color,
                 muzzle_color=candidate_lookup[m["faiss_id"]].muzzle_color,
-                has_horns=candidate_lookup[m["faiss_id"]].has_horns,
                 horn_shape=candidate_lookup[m["faiss_id"]].horn_shape,
             )
             for m in matches

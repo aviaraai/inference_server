@@ -27,48 +27,15 @@ class ExtractedColors(BaseModel):
     muzzle: ColorResult
 
 
-class MorphologyResult(BaseModel):
-    has_horns: Optional[bool] = Field(
-        None,
-        description=(
-            "True/False if a reading was produced, else None. False means "
-            "'no horn confirmed visible in this photo' — NOT 'confirmed "
-            "hornless' (a genuinely polled animal and a backward/occluded "
-            "horn look identical to this heuristic). See pipeline/morphology.py."
-        ),
-    )
-    horn_shape: Optional[str] = Field(
-        None,
-        description=(
-            "One of pipeline.morphology.HornShape (STRAIGHT, CURVED, UNKNOWN) "
-            "when has_horns=True. Null whenever has_horns is False or None — "
-            "there is no separate 'NONE' shape value, since has_horns=False "
-            "already says there's no horn; repeating that as a shape would "
-            "just be the same fact twice."
-        ),
-    )
-    confidence: float = Field(
-        ...,
-        description=(
-            "Heuristic confidence 0.0-0.6 (capped). v1 rule-based estimate, not "
-            "validated against labeled data — see pipeline/morphology.py."
-        ),
-    )
-    status: str = Field(
-        ...,
-        description=(
-            "OK, INVALID_IMAGE, NO_ANIMAL_DETECTED, NO_CLEAR_SILHOUETTE, "
-            "INCONSISTENT (register only — the 2 front photos disagreed), or "
-            "PARTIAL (register only — some but not all front photos produced "
-            "a reading). Only OK/PARTIAL carry a real reading; anything else "
-            "means has_horns/horn_shape are null and MUST NOT be read as "
-            "data. See pipeline/morphology.py."
-        ),
-    )
-    reason: str = Field(
-        "",
-        description="Human-readable detail for `status` when it isn't OK (empty string otherwise).",
-    )
+HORN_SHAPE_DESCRIPTION = (
+    "One of pipeline.morphology.HornShape (STRAIGHT, CURVED, UNKNOWN), or "
+    "None if no horn is confirmed visible in the photo(s). None does NOT "
+    "mean 'confirmed hornless' — a genuinely polled animal and a "
+    "backward/occluded horn look identical to this heuristic, and any "
+    "non-reading status (bad image, no animal detected, no clear "
+    "silhouette, or — register only — the 2 front photos disagreeing) "
+    "also collapses to None here. See pipeline/morphology.py."
+)
 
 
 # ── Candidate input (register duplicate-check AND search) ─────────────────────
@@ -76,22 +43,13 @@ class MorphologyResult(BaseModel):
 class CandidateInfo(BaseModel):
     """A nearby cattle candidate sent by the API server, for duplicate
     checking (/register) or for echoing stored data back on each match
-    (/search). Morphology fields are optional so a caller that doesn't
-    have them yet (nothing persists horn/ear data today) can omit them —
-    they default to "unknown," not a fabricated 0.
+    (/search). `horn_shape` is optional so a caller that doesn't have it
+    yet can omit it — it defaults to None, not a fabricated value.
     """
     faiss_id: int = Field(..., description="FAISS integer ID of the stored embedding")
     body_color: str = Field(..., description="Stored body color label (e.g. BLACK)")
     muzzle_color: str = Field(..., description="Stored muzzle color label (e.g. PINK)")
-    has_horns: Optional[bool] = Field(
-        None, description="This candidate's stored horn presence, if known — see pipeline/morphology.py."
-    )
-    horn_shape: Optional[str] = Field(
-        None, description="This candidate's stored horn shape (pipeline.morphology.HornShape), if known."
-    )
-    morphology_confidence: Optional[float] = Field(
-        None, description="Confidence of this candidate's stored morphology reading, if known."
-    )
+    horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
 
 
 # ── Match ─────────────────────────────────────────────────────────────────────
@@ -107,11 +65,8 @@ class MatchCandidate(BaseModel):
     muzzle_color: Optional[str] = Field(
         None, description="This candidate's stored muzzle color, echoed back from the request's candidates list, if provided."
     )
-    has_horns: Optional[bool] = Field(
-        None, description="This candidate's stored horn presence, echoed back so it can be compared against the query's own `morphology` field."
-    )
     horn_shape: Optional[str] = Field(
-        None, description="This candidate's stored horn shape, echoed back so it can be compared against the query's own `morphology` field."
+        None, description="This candidate's stored horn shape, echoed back so it can be compared against the query's own `horn_shape` field. " + HORN_SHAPE_DESCRIPTION
     )
 
 
@@ -122,7 +77,7 @@ class RegisterResponse(BaseModel):
         ..., description="FAISS integer IDs for the stored embeddings"
     )
     extracted_colors: ExtractedColors
-    morphology: MorphologyResult
+    horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
     potential_matches: list[MatchCandidate] = Field(
         default_factory=list,
         description="Top matches against candidate_ids (empty if no candidates provided)",
@@ -136,7 +91,7 @@ class RegisterResponse(BaseModel):
 class SearchResponse(BaseModel):
     request_id: str = Field(..., description="UUID for request tracing")
     query_colors: ExtractedColors
-    morphology: MorphologyResult
+    horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
     top_matches: list[MatchCandidate]
     versions: VersionInfo
 
