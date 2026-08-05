@@ -161,6 +161,17 @@ def process_video(
     src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    # cv2.isOpened() can return True for a file it cannot actually decode
+    # (e.g. a non-video file with a .mp4 extension) — CAP_PROP_FRAME_COUNT
+    # then comes back as -1 (or an out-of-range float that overflows on
+    # int() cast), which used to sail through as a "successful" job with
+    # garbage stats instead of a clear rejection.
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError(
+            f"Unusable video file — cannot decode frames: {video_path}"
+        )
+
     # output video writer
     out_video_path = out_dir / "annotated.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -180,6 +191,7 @@ def process_video(
     frames_with_cattle = 0
     processed_count = 0
     all_raw_ids: set[int] = set()
+    frames_visible: dict[int, int] = {}   # stable_id -> count of frames it appeared in
 
     t_start = time.perf_counter()
     frame_idx = -1
@@ -245,6 +257,9 @@ def process_video(
         bboxes = [bb for _, bb in stable_detections]
         raw_ids_frame = [rid for rid, _ in raw_detections]
 
+        for sid in stable_ids:
+            frames_visible[sid] = frames_visible.get(sid, 0) + 1
+
         cattle_count = len(stable_detections)
         total_detections += cattle_count
         if cattle_count > max_in_frame:
@@ -288,6 +303,15 @@ def process_video(
     cap.release()
     writer.release()
 
+    # A positive CAP_PROP_FRAME_COUNT doesn't guarantee any frame actually
+    # decoded successfully (some corrupt/truncated files misreport a frame
+    # count but fail every cap.read()) — belt-and-suspenders on top of the
+    # total_frames check above.
+    if processed_count == 0:
+        raise RuntimeError(
+            f"Unusable video file — no frames could be read: {video_path}"
+        )
+
     total_time = time.perf_counter() - t_start
 
     # ── write CSV ─────────────────────────────────────────────────
@@ -306,7 +330,16 @@ def process_video(
             w.writerow(row_copy)
 
     # ── build summary ─────────────────────────────────────────────
-    unique_stable = mapper.total_minted
+    # Drop flicker IDs: a track only counts if it was actually visible for
+    # at least `min_frames_visible` frames. `mapper.total_minted`/
+    # `all_stable_ids` still reflect every ID ever minted (kept for
+    # debugging via raw_track_ids-style inspection) — the reported count
+    # uses the filtered set.
+    qualifying_ids = {
+        sid for sid, count in frames_visible.items()
+        if count >= cfg.min_frames_visible
+    }
+    unique_stable = len(qualifying_ids)
     count_method = "tracking" if cfg.use_tracking and unique_stable > 0 else "max_in_frame"
     final_count = unique_stable if count_method == "tracking" else max_in_frame
 
@@ -315,7 +348,7 @@ def process_video(
         final_cattle_count=final_count,
         count_method=count_method,
         unique_tracked_cattle=unique_stable,
-        unique_track_ids=sorted(mapper.all_stable_ids),
+        unique_track_ids=sorted(qualifying_ids),
         raw_tracker_ids=sorted(all_raw_ids),
         max_cattle_in_frame=max_in_frame,
         average_confidence=(

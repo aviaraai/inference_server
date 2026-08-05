@@ -18,3 +18,8 @@ cctv/uploads/
 cctv/cctv.db
 cctv/cctv.db-wal
 cctv/cctv.db-shm
+
+# Training pipeline + dataset now live in their own repo (D:\Group Projects\model_training).
+# Never commit training code/data/artifacts here — this is a safety net in case
+# anything regenerates a cctv/training folder in this repo again.
+cctv/training/

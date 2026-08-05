@@ -71,8 +71,9 @@ class PipelineConfig:
     filter_cattle_classes: bool = True
 
     # stable-ID mapper
-    stable_id_iou_thresh: float = 0.25
-    stable_id_memory_frames: int = 30
+    stable_id_iou_thresh: float = 0.15
+    stable_id_memory_frames: int = 90
+    min_frames_visible: int = 5              # drop flicker IDs seen in fewer frames than this
 
     # analytics
     enable_analytics: bool = True
@@ -88,7 +89,11 @@ PRESETS: dict[Preset, dict] = {
         model_path="yolo11s.pt",
         img_size=640,
         vid_stride=2,
-        tracker_yaml=str(BASE_DIR / "trackers" / "botsort_cattle_fast.yaml"),
+        # switched from botsort_cattle_fast.yaml (with_reid: false) — appearance
+        # ReID re-identifies cattle after occlusion, which is what the flicker/
+        # duplicate-ID problem on real footage needed. "Fast" now means only
+        # img_size=640/vid_stride=2, not "no ReID" — accept the throughput cost.
+        tracker_yaml=str(BASE_DIR / "trackers" / "botsort_cattle.yaml"),
         half=False,
     ),
     Preset.BALANCED: dict(
