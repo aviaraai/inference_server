@@ -200,6 +200,44 @@ of two genuinely different animals (ideally with visibly different
 horn/ear shapes) and check whether `horn_length_ratio`/`ear_span_ratio`
 actually separate them before trusting this for anything beyond display.
 
+### Silent zeros were replaced with an explicit `status`/`reason`
+
+First cut of this returned `{horn_length_ratio: 0.0, ear_span_ratio: 0.0,
+confidence: 0.0}` on any failure — indistinguishable from a real
+low-confidence reading, and gave a caller nothing to explain WHY. Fixed:
+every reading now carries `status` (`OK`, `INVALID_IMAGE`,
+`NO_ANIMAL_DETECTED`, `NO_CLEAR_SILHOUETTE`, or register-only `PARTIAL` —
+one of two front photos failed) and a human-readable `reason` string. Only
+`OK`/`PARTIAL` carry a real (possibly confidence-weighted) reading —
+anything else means the ratios are the zero default and must not be read
+as data. `average_readings()` (register's 2-photo combine) propagates this
+too: if only one of two photos produced a reading, status is `PARTIAL` with
+a reason naming how many failed, not a silently-blended number that looks
+as trustworthy as two genuine agreeing readings.
+
+**What "no horn visible" actually means — asked directly, answered
+honestly:** if a horn points backward, is occluded, or the animal is
+genuinely polled/dehorned (routine in Indian cattle, not an edge case),
+this v1 heuristic cannot tell those apart. All of them come back as
+`NO_CLEAR_SILHOUETTE` or a low `horn_length_ratio` with `OK` status — a
+weak/absent contour above the head band looks identical whether the cause
+is "no horns," "horns not visible from this angle," or "bad lighting on
+the crown." **This is a structural limit of single-2D-front-photo
+silhouette analysis, not a bug to chase** — no amount of tuning
+`MIN_CONTOUR_AREA_FRACTION` or the edge-detection parameters fixes it,
+because the information (a backward horn's true shape) simply isn't in a
+front-facing 2D photo. The two real fixes, neither in scope here: a
+horn-specific detector trained to recognize "no horn present" vs "horn
+occluded" as different classes (needs labeled data that doesn't exist —
+see above), or a second capture angle (side profile) where a backward horn
+becomes visible — a capture-flow product decision for the app, not
+something this service can solve alone. **Until then, the contract is:**
+treat any non-`OK` status, and any `OK` reading with a near-zero
+`horn_length_ratio`, as "no horn confirmed in this photo" — never as
+"confirmed no horns." Don't use a low reading as negative evidence
+anywhere (e.g. don't let it argue two animals are "different" just because
+one photo happened to hide the horn).
+
 ### `/search` candidates now carry stored morphology too — a real BREAKING CHANGE to its request contract
 
 Follow-up ask: `/search`'s candidates should carry morphology the same way

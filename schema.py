@@ -49,6 +49,23 @@ class MorphologyResult(BaseModel):
             "validated against labeled data — see pipeline/morphology.py."
         ),
     )
+    status: str = Field(
+        ...,
+        description=(
+            "OK, INVALID_IMAGE, NO_ANIMAL_DETECTED, NO_CLEAR_SILHOUETTE, or "
+            "PARTIAL (register only — some but not all front photos produced "
+            "a reading). Only OK/PARTIAL carry a real (possibly blended) "
+            "reading; anything else means the ratios are the zero default "
+            "and MUST NOT be read as data. A non-OK status does NOT mean "
+            "'no horns' — it means 'no horn confirmed visible in this "
+            "photo,' which is also what a genuinely hornless/polled animal "
+            "or a backward-facing horn look like. See pipeline/morphology.py."
+        ),
+    )
+    reason: str = Field(
+        "",
+        description="Human-readable detail for `status` when it isn't OK (empty string otherwise).",
+    )
 
 
 # ── Candidate input (register duplicate-check AND search) ─────────────────────
