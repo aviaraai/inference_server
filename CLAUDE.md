@@ -879,3 +879,134 @@ REVIEW, which the app still surfaces as a result.
   its lifespan). To embed: `crop_cattle(img)` → `cv2.imencode(".jpg", crop)` →
   `embed_batch([jpg], model, device)`. Cosine = dot product of unit-norm 256-d
   vectors.
+- To run locally outside Docker, `MODEL_PATH`/`FAISS_INDEX_PATH` env vars are
+  required (lifespan raises if unset). `MODEL_PATH` must point at a real file
+  (`for_aditya/best_top1.pt` works); `FaissIndex.load()` tolerates a
+  non-existent `FAISS_INDEX_PATH` — just logs a warning and starts empty, so
+  any placeholder path is fine for testing anything that isn't `/register`/
+  `/search`. `YOLO_MODEL_PATH` is optional, defaults to a bundled name.
+
+## CCTV counting was unreliable on real footage — full tuning history
+
+Everything below happened on `feature/cctv-video-analytics`, on top of the
+`0f2b312` CCTV commit, across several rounds. The branch is pushed — confirm
+`git log --oneline -6` matches before assuming any of this is still pending.
+
+**The original problem, on a real 48.8s field clip (herder + small herd,
+never more than ~10 cattle visible in any frame):** `final_cattle_count`
+(then = unique tracked IDs) read **81** — it grew almost linearly with video
+duration (34 on a 15s trim, 56 on 30s, 81 on 48.8s) regardless of how many
+animals were actually ever on screen at once. Root cause, confirmed
+**visually** by extracting annotated frames, not just from the numbers: the
+tracker was minting a new ID for the same physical animal repeatedly
+(flicker), and — separately — the detector itself sometimes fires two
+overlapping boxes on one animal in a single frame.
+
+Fixes tried, each verified against the same clip before moving to the next
+(diminishing but real returns — 81 → 51 unique-ID count across all of them):
+1. `stable_id_iou_thresh` 0.25→0.15, `stable_id_memory_frames` 30→90
+   (`PipelineConfig` dataclass defaults — these are **not** per-preset, no
+   `PRESETS` entry overrides them, so this affects every preset equally).
+2. New `min_frames_visible=5` config knob — drop any stable ID seen in fewer
+   frames from the final count (kills pure flicker).
+3. `fast` preset switched from `botsort_cattle_fast.yaml` (`with_reid:
+   false`) to `botsort_cattle.yaml` (`with_reid: true`) — appearance ReID
+   re-identifies cattle after occlusion. Barely moved the number (53→51) and
+   barely changed processing time either — the earlier "accurate preset is
+   slower" difference was mostly the higher `img_size`/no frame-skip, not
+   ReID itself.
+4. NMS/confidence: added `nms_iou=0.45` (new field, passed as `iou=` to
+   `model.track()`/`.predict()` — wasn't wired at all before), raised
+   `confidence` 0.25→0.35. Reduced the **same-frame duplicate-box** artifact
+   from 3 overlapping boxes on one cow down to 2 — did not eliminate it, and
+   the count plateaued around 50, not the 15-20 range a genuinely-fixed
+   count should land in on this footage. **Conclusion at the time: the
+   remaining inflation looks like the model itself sometimes double-detecting
+   or under-segmenting close-together cattle at some angles — a real
+   detection-quality question, not a threshold to keep nudging.**
+
+**Given that, the counting methodology itself changed** rather than chasing
+the detector further: `/result`'s `final_cattle_count` and `/analytics`'s
+`total_cattle` were both switched to report `max_cattle_in_frame` (peak
+simultaneous count — visually countable against the video) instead of the
+unique-tracked-ID count, which is what all the tuning above was trying to
+stabilize. `unique_tracked_cattle` stays exposed separately for whoever wants
+the tracking-based figure. On the same clip this reads **9** — the tuning
+work above is still real (it's what the tracker/analytics internals use to
+build `unique_tracked_cattle` and the per-cow list), it's just no longer
+what gets surfaced as *the* number.
+
+**`analytics.py`'s per-cow count and `pipeline.py`'s final count can silently
+disagree if you touch one without the other** — this bit twice. First
+`VideoAnalytics` computed `total_cattle=len(per_cow)` completely
+independently of `pipeline.py`'s flicker filter (fixed by adding the same
+`min_frames_visible` filter to `_compute_per_cow`, threaded through from
+`cfg.min_frames_visible` via `routes.py`'s `VideoAnalytics(...)` call). Then
+the max-in-frame switch above had to touch **both** `routes.py` (`/result`)
+and `analytics.py`'s `compute()` (`total_cattle=peak_count` from
+`max(self._frame_counts)`) for the same reason — one file's number without
+the other just moves the disagreement around instead of closing it.
+
+**This is still open, not yet fixed:** `GET /history`/`GET /trends` read
+straight from the `sessions` table, and `database.py`'s `save_session()`
+persists `summary.final_cattle_count` — the pipeline-level field, which
+was deliberately **not** changed to peak-in-frame (only the `/result` and
+`/analytics` response layer was). So a job's live `/result` now shows 9 while
+that same job shows 50 in `/history`/`/trends` — confirmed, not theoretical.
+Fixing it means either writing `max_cattle_in_frame` into the
+`final_cattle_count` DB column too, or adding a real `peak_cattle_count`
+column — hasn't been decided, flagging rather than guessing.
+
+### The annotated video was never actually playable in a browser
+
+`pipeline.py` wrote `annotated.mp4` via `cv2.VideoWriter(fourcc=mp4v)` —
+confirmed via `CAP_PROP_FOURCC` readback the file was really tagged `FMP4`
+(MPEG-4 Part 2). No mainstream browser decodes that in a `<video>` tag —
+confirmed directly, not just from the codec name: loaded a real output file
+in Chrome, `readyState` stayed `0` forever, `canPlayType('...mp4v...')` came
+back `""` while `canPlayType('...avc1...')` said `"probably"`.
+
+The fix is not "pass a different fourcc to `cv2.VideoWriter`" — tried
+`avc1`/`h264`/`H264`/`x264`, all fail identically on this machine:
+```
+Failed to load OpenH264 library: openh264-1.8.0-win64.dll
+Could not open codec libopenh264, error: Unspecified error (-22)
+```
+OpenCV's bundled FFmpeg needs Cisco's OpenH264 DLL for H.264 encoding and it
+won't load here — `cv2.VideoWriter.isOpened()` still reports `True` and
+writes a non-empty file regardless, which is a trap: that file **also**
+never leaves `readyState 0` in a real browser. Don't trust `isOpened()` or
+"cv2 can read back its own file" as evidence a browser can play it — verify
+in an actual `<video>` tag.
+
+**Actual fix:** added `imageio-ffmpeg` (real, self-contained ffmpeg binary,
+bundled via pip — independent of whatever codecs the host has) to
+`pyproject.toml` (this repo is uv-managed, there is no `requirements.txt`).
+`process_video()` now re-encodes the raw `cv2.VideoWriter` output to real
+H.264 immediately after `writer.release()`:
+```python
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+subprocess.run([ffmpeg_path, "-y", "-i", raw_path, "-vcodec", "libx264",
+                 "-preset", "fast", "-crf", "23", "-movflags", "+faststart",
+                 h264_path], check=True, capture_output=True)
+os.replace(h264_path, raw_path)
+```
+Verified via ffmpeg's own stream probe afterward: `Video: h264 (High) (avc1
+/ 0x31637661), yuv420p`. Range-request support (needed for browser
+seeking/scrubbing) needed **no code change** — Starlette's `FileResponse`
+(used by `GET /jobs/{id}/video`) already answers `Range` headers with a
+correct `206 Partial Content` + `Content-Range`.
+
+**One caveat that's environmental, not a code problem:** could not get a
+`<video>` element to actually reach `playing` in this session's browser-
+automation tooling. Before concluding the fix was broken, ran a control
+experiment — generated a trivially tiny, freshly-encoded H.264 file via the
+exact same `imageio-ffmpeg`/libx264 path, served it through the same
+`FileResponse` mechanism, zero cross-origin variables. **It also never left
+`readyState 0`.** That means this specific automated Chrome instance can't
+decode H.264 at all right now, independent of anything about this fix —
+every other independently-checkable signal (container structure, codec
+probe via ffmpeg itself, `Content-Length` matching disk size, correct Range
+handling) came back correct. Get a real visual confirmation from an actual
+desktop browser before fully trusting this — the automation environment
+could not provide one.
