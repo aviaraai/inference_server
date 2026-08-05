@@ -213,7 +213,12 @@ async def get_job_result(job_id: str):
     s = job["summary"]
     return JobResult(
         job_id=s.job_id,
-        final_cattle_count=s.final_cattle_count,
+        # Primary displayed count is the peak simultaneous-in-frame count,
+        # not the unique-tracked-ID count — visually verifiable against the
+        # video, unlike unique_tracked_cattle which is sensitive to tracker
+        # ID churn. See unique_tracked_cattle below for the tracking-based
+        # figure.
+        final_cattle_count=s.max_cattle_in_frame,
         count_method=s.count_method,
         unique_tracked_cattle=s.unique_tracked_cattle,
         max_cattle_in_frame=s.max_cattle_in_frame,

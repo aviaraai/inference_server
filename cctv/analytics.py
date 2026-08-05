@@ -169,8 +169,14 @@ class VideoAnalytics:
         speeds = [c.avg_speed_px_per_frame for c in per_cow if c.frames_visible > 1]
         avg_herd_speed = sum(speeds) / len(speeds) if speeds else 0.0
 
+        # Primary count is the peak simultaneously-visible-in-frame count, not
+        # len(per_cow) (unique tracked IDs) — visually verifiable against the
+        # video, unlike the tracked-ID count which is sensitive to ID churn.
+        peak_count = max(self._frame_counts) if self._frame_counts else 0
+
         summary_lines = [
-            f"Detected {len(per_cow)} unique cattle across {len(self._frame_counts)} processed frames.",
+            f"Peak cattle count in this recording: {peak_count} "
+            f"(highest simultaneously visible in any single frame).",
             f"Average herd speed: {avg_herd_speed:.1f} px/frame.",
         ]
         if isolated:
@@ -186,7 +192,7 @@ class VideoAnalytics:
             density_grid=density_grid,
             density_cells=density_cells,
             heatmap_image=heatmap,
-            total_cattle=len(per_cow),
+            total_cattle=peak_count,
             avg_herd_speed=round(avg_herd_speed, 2),
             isolated_cattle=isolated,
             activity_breakdown=activity_breakdown,

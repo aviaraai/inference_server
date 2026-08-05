@@ -13,6 +13,8 @@ what to do with them.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from pathlib import Path
 from typing import Generator, Optional
 
 import cv2
+import imageio_ffmpeg
 import numpy as np
 
 from cctv.config import CATTLE_TERMS, RUNS_DIR, PipelineConfig
@@ -313,6 +316,31 @@ def process_video(
         raise RuntimeError(
             f"Unusable video file — no frames could be read: {video_path}"
         )
+
+    # ── re-encode to real H.264 ──────────────────────────────────────
+    # cv2.VideoWriter's mp4v/FMP4 output (MPEG-4 Part 2) is not decodable by
+    # any mainstream browser's <video> tag. This machine's OpenCV/FFmpeg build
+    # also can't encode H.264 directly (bundled libopenh264 fails to load) —
+    # confirmed by testing avc1/h264/H264/x264 fourcc values directly in
+    # Chrome, all produced files stuck at readyState 0 forever. imageio-ffmpeg
+    # bundles a real, self-contained ffmpeg binary with genuine libx264
+    # support, independent of whatever codecs happen to be on the host.
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    raw_path = str(out_video_path)
+    h264_path = raw_path.replace(".mp4", "_h264.mp4")
+
+    subprocess.run([
+        ffmpeg_path, "-y",
+        "-i", raw_path,
+        "-vcodec", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-movflags", "+faststart",
+        h264_path,
+    ], check=True, capture_output=True)
+
+    # replace original with H.264 version
+    os.replace(h264_path, raw_path)
 
     total_time = time.perf_counter() - t_start
 
