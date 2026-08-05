@@ -32,12 +32,14 @@ from dependency import (
     get_device,
     get_faiss_index,
     get_model,
+    get_morphology_extractor,
 )
 from faiss_index import FaissIndex
 from godhaar.config import DUPLICATE_THRESHOLD, EMB_DIM, MODEL_VERSION
 from godhaar.model import GodhaarModel
 from helpers import _decode_image, _ms_since
 from pipeline.color import RuleBasedColorExtractor
+from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
 from pipeline.quality import quality_check, quality_check_cv2
 from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
@@ -47,6 +49,7 @@ from schema import (
     ExtractedColors,
     HealthResponse,
     MatchCandidate,
+    MorphologyResult,
     RegisterResponse,
     SearchResponse,
     VersionInfo,
@@ -99,6 +102,10 @@ async def lifespan(app: FastAPI):
     color_extractor = RuleBasedColorExtractor()
     app.state.color_extractor = color_extractor
 
+    # 4b. Load Morphology Extractor (horn/ear proportions — unvalidated v1
+    #     heuristic, see pipeline/morphology.py)
+    app.state.morphology_extractor = RuleBasedMorphologyExtractor()
+
     # 5. Load YOLO
     yolo_path = os.getenv("YOLO_MODEL_PATH", None)
     load_yolo(yolo_path)
@@ -142,6 +149,7 @@ async def register(
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
     color_extractor: Any = Depends(get_color_extractor),
+    morphology_extractor: Any = Depends(get_morphology_extractor),
 ):
     """
     Register a cattle animal.
@@ -196,13 +204,14 @@ async def register(
     )
 
     # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
-    embeddings_np, body_color, muzzle_color = await asyncio.to_thread(
+    embeddings_np, body_color, muzzle_color, morphology = await asyncio.to_thread(
         _run_registration_pipeline,
         muzzle_bytes,
         front_bytes,
         model,
         device,
         color_extractor,
+        morphology_extractor,
     )
 
     new_body  = body_color["label"]    # e.g. "BLACK"
@@ -268,6 +277,7 @@ async def register(
             body=ColorResult(**body_color),
             muzzle=ColorResult(**muzzle_color),
         ),
+        morphology=MorphologyResult(**morphology),
         potential_matches=potential_matches,
         versions=VersionInfo(
             model=MODEL_VERSION,
@@ -284,7 +294,8 @@ def _run_registration_pipeline(
     model: Any,
     device: torch.device,
     color_extractor: Any,
-) -> tuple[np.ndarray, dict, dict]:
+    morphology_extractor: Any,
+) -> tuple[np.ndarray, dict, dict, dict]:
     """
     Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
     embedding, and color extraction. Executed entirely inside a single
@@ -374,7 +385,18 @@ def _run_registration_pipeline(
     avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
     muzzle_color = {"label": majority_label, "confidence": avg_conf}
 
-    return embeddings.numpy(), body_color, muzzle_color
+    # ── Morphology (horn/ear proportions) — return-only, not a gate ───────
+    # Unlike color, there's no majority/consistency check here: this is a
+    # continuous, unvalidated heuristic (see pipeline/morphology.py), not a
+    # categorical label, so "the 2 photos disagree" isn't a retake-worthy
+    # error the way a color mismatch is. Both readings are combined via a
+    # confidence-weighted average instead.
+    morphology_readings = [
+        morphology_extractor.extract(_decode_image(fb)) for fb in front_bytes
+    ]
+    morphology = average_readings(morphology_readings)
+
+    return embeddings.numpy(), body_color, muzzle_color, morphology
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -382,25 +404,47 @@ async def search(
     muzzle: UploadFile = File(...),
     front: UploadFile = File(...),
     top_k: int = Form(5),
-    candidate_ids: list[int] = Form(...),
+    candidate_json: str = Form(..., alias="candidates"),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
     color_extractor: Any = Depends(get_color_extractor),
+    morphology_extractor: Any = Depends(get_morphology_extractor),
 ):
     """
-    Search endpoint: receives candidate FAISS IDs from the API server,
-    embeds the query muzzle, then ranks only those candidates via
-    restricted_search (reconstruct → dot product → sort).
+    Search endpoint: receives candidates from the API server (same shape as
+    /register's `candidates`, faiss_id + whatever stored color/morphology
+    the caller has), embeds the query muzzle, then ranks only those
+    candidates via restricted_search (reconstruct → dot product → sort).
+
+    Each stored candidate's color/morphology is echoed back on its
+    corresponding entry in `top_matches`, alongside the query's own
+    freshly-extracted `morphology`/`query_colors` at the top level — so
+    both sides are available to compare without a second lookup. No
+    comparison/similarity math is computed here; this endpoint returns
+    data only, same as /register does for morphology (see CLAUDE.md).
 
     No index-wide FAISS search is performed. The API server decides
     which candidates to send based on GPS / Supabase filtering.
+
+    ⚠️ Contract change: this used to accept a bare repeated `candidate_ids`
+    form field. It now expects a `candidates` field carrying the same JSON
+    shape /register already uses (list of CandidateInfo). Callers built
+    against the old bare-ID contract will get a 422 until updated.
     """
     request_id = uuid.uuid4().hex
     t_start = time.monotonic()
 
-    if not candidate_ids:
-        raise HTTPException(status_code=422, detail="candidate_ids must contain at least one FAISS ID")
+    try:
+        candidate_list: list[CandidateInfo] = [CandidateInfo(**c) for c in json.loads(candidate_json)]
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid candidates format: {e}")
+
+    if not candidate_list:
+        raise HTTPException(status_code=422, detail="candidates must contain at least one entry")
+
+    candidate_lookup = {c.faiss_id: c for c in candidate_list}
+    candidate_ids = [c.faiss_id for c in candidate_list]
 
     log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)}")
 
@@ -412,13 +456,14 @@ async def search(
 
     # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
     t_embed_start = time.monotonic()
-    emb_np, muzzle_color, body_color = await asyncio.to_thread(
+    emb_np, muzzle_color, body_color, morphology = await asyncio.to_thread(
         _run_search_pipeline,
         muzzle_bytes,
         front_bytes,
         model,
         device,
         color_extractor,
+        morphology_extractor,
     )
     t_embed = _ms_since(t_embed_start)
 
@@ -441,8 +486,16 @@ async def search(
             body=ColorResult(**body_color),
             muzzle=ColorResult(**muzzle_color),
         ),
+        morphology=MorphologyResult(**morphology),
         top_matches=[
-            MatchCandidate(**m) for m in matches
+            MatchCandidate(
+                **m,
+                body_color=candidate_lookup[m["faiss_id"]].body_color,
+                muzzle_color=candidate_lookup[m["faiss_id"]].muzzle_color,
+                horn_length_ratio=candidate_lookup[m["faiss_id"]].horn_length_ratio,
+                ear_span_ratio=candidate_lookup[m["faiss_id"]].ear_span_ratio,
+            )
+            for m in matches
         ],
         versions=VersionInfo(
             model=MODEL_VERSION,
@@ -458,7 +511,8 @@ def _run_search_pipeline(
     model: Any,
     device: torch.device,
     color_extractor: Any,
-) -> tuple[np.ndarray, dict, dict]:
+    morphology_extractor: Any,
+) -> tuple[np.ndarray, dict, dict, dict]:
     """
     Synchronous CPU/GPU pipeline for /search: quality gate, crop, embed,
     color extraction. Runs entirely inside asyncio.to_thread.
@@ -487,8 +541,9 @@ def _run_search_pipeline(
     muzzle_color = color_extractor.extract_muzzle(crop)
     front_img = _decode_image(front_bytes)
     body_color = color_extractor.extract_body(front_img)
+    morphology = morphology_extractor.extract(front_img)
 
-    return emb_np, muzzle_color, body_color
+    return emb_np, muzzle_color, body_color, morphology
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────

@@ -127,6 +127,143 @@ Two gotchas this caused (two different black cows wrongly merged):
   black cows still clear 0.80 — if so, this threshold (and/or the color gate)
   needs revisiting, not just the crop.
 
+## Horn/ear morphology — a new signal for the weak color gate, v1 is an unvalidated heuristic
+
+Requested directly in response to the "color gate is near-useless for black
+cattle" problem above: return horn-length and ear-span as an extra signal,
+the same way `body_color`/`muzzle_color` already are, in **both**
+`/register` and `/search` — not gated on anything, just returned alongside
+the existing colors so the caller (go-apiserver) can eventually factor it
+into the duplicate/match decision the same way it already uses color.
+
+**There is no horn/ear detector, keypoint model, or labeled dataset
+anywhere in this project.** Checked both this repo's bundled `wildlife/`
+copy and the full `Godhaar/Wildlife` source repo — neither has anything
+beyond the existing color classifiers. So this had to be built from
+scratch, and — critically — there was no ground truth to validate it
+against (no equivalent of the blur-threshold calibration story elsewhere in
+this file, where real photos were measured against the real server formula
+before shipping). Absolute measurement (centimeters) was also ruled out
+immediately: a phone photo carries no scale reference, so the same horn
+would measure differently depending only on how far away the phone was
+held.
+
+**What got built** (`pipeline/morphology.py`), mirroring `pipeline/color.py`'s
+exact architecture — a `MorphologyExtractor` ABC with a
+`RuleBasedMorphologyExtractor` implementation, swappable later for a trained
+model without touching callers:
+1. Run `crop_cattle` (the existing whole-animal YOLO) on the front-facing
+   photo to get a scale-normalized crop.
+2. Take the top 35% of that crop as the head/horn/ear band — the same region
+   `wildlife/color/roi.py` already excludes from body color for the opposite
+   reason (its own comment: "often contains background, sky, ears, horns").
+3. Canny-edge the band, take the largest contour, measure its top/left/right
+   extremities.
+4. Return everything as **ratios of the crop's own width** — `horn_length_ratio`,
+   `ear_span_ratio` — never an absolute length, plus a `confidence` **capped
+   at 0.6** so a heuristic with zero validation data can never report itself
+   as more certain than a real classifier would.
+
+Wired into both endpoints exactly like color: `RuleBasedMorphologyExtractor`
+loads at startup (`app.state.morphology_extractor`, `dependency.py`'s
+`get_morphology_extractor`), `MorphologyResult` added to
+`RegisterResponse`/`SearchResponse` (`schema.py`) as `morphology`. Register
+gets 2 front photos, so both are read and combined via a new
+`average_readings()` helper — confidence-weighted, so a failed reading
+(confidence 0) doesn't drag a good one toward zero, and the combined
+confidence is the **mean**, not the max, so "only 1 of 2 photos worked"
+correctly reads as less certain than "both worked." Unlike color, there's no
+majority/consistency check across the 2 front photos — these are continuous
+ratios, not categorical labels, so "the two readings disagree slightly"
+isn't a retake-worthy error the way a color mismatch is.
+
+**Smoke-tested against the real local `Karunya`/`Rama` front photos**
+(no labeled ground truth exists, so this only confirms it runs and fails
+open, not that the numbers are meaningful): 2 of 3 photos produced a
+reading (confidence capped at 0.6 as designed), the third failed
+detection and correctly returned the zero/unknown reading rather than
+throwing. `ear_span_ratio` came back ~0.999 on both successful reads —
+plausible for a wide horn/ear band, but also consistent with the contour
+just tracing the crop's own edges rather than isolating ears specifically;
+this is exactly the kind of thing that needs real validation, not
+guessed at.
+
+**Deliberately NOT wired into any accept/reject decision** — not the
+`/register` 409 duplicate check, not any match scoring. It's return-only,
+same as this section's opening paragraph said, until someone validates it
+against real different-animal photos the way the crop fix above still
+needs to be. Wiring an unvalidated heuristic into a decision that can block
+a real farmer's registration would repeat the exact mistake this file's
+blur-threshold story warns against: shipping a threshold before checking it
+against real data. **Still open, same as the crop fix above:** get photos
+of two genuinely different animals (ideally with visibly different
+horn/ear shapes) and check whether `horn_length_ratio`/`ear_span_ratio`
+actually separate them before trusting this for anything beyond display.
+
+### `/search` candidates now carry stored morphology too — a real BREAKING CHANGE to its request contract
+
+Follow-up ask: `/search`'s candidates should carry morphology the same way
+`/register`'s already do, "so they can be compared against the query's
+morphology — not just returned for the query animal alone." Before this,
+`/search` only ever returned the QUERY's own extracted color/morphology;
+each ranked match carried nothing but `faiss_id/score/rank/gap` — no stored
+color or morphology for the animal that was actually matched, even though
+go-apiserver's `h.search()` already pulls `body_color`/`muzzle_color` per
+candidate from its own DB (`FindFAISSCandidates`) — it just wasn't sending
+that data into this endpoint the way `/register` does.
+
+**Explicitly scoped to this service only, on the user's direct instruction
+— go-apiserver is the CTO's side and was not touched.** That makes this a
+real, not theoretical, breaking change: go-apiserver's `Search()` client
+(`internal/inference/client.go`) currently sends bare repeated
+`candidate_ids` form fields; this endpoint no longer accepts that shape at
+all. **Until go-apiserver's Search client is updated to send a `candidates`
+field with the same JSON shape `/register` already uses, every `/search`
+call will 422.** This is the main challenge worth flagging: this commit
+alone does not ship a working `/search` — it ships one half of a two-repo
+change, deliberately, because the other half isn't this repo's to make.
+
+What changed here (`main.py`, `schema.py`):
+- `/search`'s `candidate_ids: list[int] = Form(...)` → `candidates:
+  Form(...)` — same `CandidateInfo` list `/register` already parses, now
+  with `horn_length_ratio`/`ear_span_ratio`/`morphology_confidence` added
+  as **optional** fields (default `None`, not a fabricated `0.0`) — so a
+  caller with no morphology to send yet (nothing persists it — see below)
+  doesn't have to send anything new to keep working, once it's updated to
+  the new `candidates` shape at all.
+- `MatchCandidate` gained the same optional fields plus `body_color`/
+  `muzzle_color`, populated by echoing back whatever the matching
+  `CandidateInfo` in the request carried. **No comparison/similarity math
+  is computed here** — this endpoint hands back both sides (the query's own
+  `morphology` at the top level, each match's stored morphology on
+  `top_matches[i]`) and leaves any actual comparison to the caller,
+  consistent with the "return-only" decision above and with the fact that
+  `decide()` (wherever it lives now) is explicitly not this repo's to
+  change.
+
+**Second challenge, worth knowing before anyone wires this further:**
+go-apiserver's own code already explains why color isn't used to filter
+search results — `h.search()`'s comment: *"Color labels from inference are
+intentionally NOT used to hard-filter — classifier confidence is
+unreliable."* That decision was made for **color**, which has actual
+calibration behind it. This morphology heuristic has none at all (see
+above — zero labeled data, capped confidence, `ear_span_ratio` reading
+suspiciously close to 1.0 on real test photos). So even once go-apiserver
+is updated to plumb this through, the same reasoning that kept color out of
+`decide()` applies at least as strongly to morphology — there's no basis
+yet to trust it more than the thing that was already rejected for the same
+job.
+
+**Third challenge, already true before this change and unaffected by it:**
+nothing persists horn/ear data anywhere. `animal.CandidateRow` (go-apiserver)
+only has `body_color`/`muzzle_color` columns; there's no
+`horn_length_ratio`/`ear_span_ratio` column, no migration, and `/register`'s
+response `morphology` field isn't written into `CreateAnimalTx.Animal`
+anywhere. So even with `/search`'s contract fixed on the go-apiserver side,
+every candidate's morphology fields would come back `None` until a DB
+migration + the register write path are also updated — again, not done
+here, on the same "CTO's side" instruction.
+
 ## Registration quality gate now checks all 3 muzzle photos before failing, not just the first
 
 `_run_registration_pipeline`'s quality/detection loop used to `raise` the

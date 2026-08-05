@@ -27,13 +27,51 @@ class ExtractedColors(BaseModel):
     muzzle: ColorResult
 
 
-# ── Register input ────────────────────────────────────────────────────────────
+class MorphologyResult(BaseModel):
+    horn_length_ratio: float = Field(
+        ...,
+        description=(
+            "Horn/head extent above the head band, ÷ crop width. Scale-invariant "
+            "proxy, NOT a real-world measurement — see pipeline/morphology.py."
+        ),
+    )
+    ear_span_ratio: float = Field(
+        ...,
+        description=(
+            "Left-right silhouette extent within the head band, ÷ crop width. "
+            "Scale-invariant proxy, NOT a real-world measurement — see pipeline/morphology.py."
+        ),
+    )
+    confidence: float = Field(
+        ...,
+        description=(
+            "Heuristic confidence 0.0-0.6 (capped). v1 rule-based estimate, not "
+            "validated against labeled data — see pipeline/morphology.py."
+        ),
+    )
+
+
+# ── Candidate input (register duplicate-check AND search) ─────────────────────
 
 class CandidateInfo(BaseModel):
-    """A nearby cattle candidate sent by the API server for duplicate checking."""
+    """A nearby cattle candidate sent by the API server, for duplicate
+    checking (/register) or for echoing stored data back on each match
+    (/search). Morphology fields are optional so a caller that doesn't
+    have them yet (nothing persists horn/ear data today) can omit them —
+    they default to "unknown," not a fabricated 0.
+    """
     faiss_id: int = Field(..., description="FAISS integer ID of the stored embedding")
     body_color: str = Field(..., description="Stored body color label (e.g. BLACK)")
     muzzle_color: str = Field(..., description="Stored muzzle color label (e.g. PINK)")
+    horn_length_ratio: Optional[float] = Field(
+        None, description="This candidate's stored horn/head ratio, if known — see pipeline/morphology.py."
+    )
+    ear_span_ratio: Optional[float] = Field(
+        None, description="This candidate's stored ear-span ratio, if known — see pipeline/morphology.py."
+    )
+    morphology_confidence: Optional[float] = Field(
+        None, description="Confidence of this candidate's stored morphology reading, if known."
+    )
 
 
 # ── Match ─────────────────────────────────────────────────────────────────────
@@ -43,6 +81,18 @@ class MatchCandidate(BaseModel):
     score: float = Field(..., description="Cosine similarity score")
     rank: int = Field(..., description="1-indexed rank among returned candidates")
     gap: float = Field(..., description="Score delta to the next candidate (0.0 for last)")
+    body_color: Optional[str] = Field(
+        None, description="This candidate's stored body color, echoed back from the request's candidates list, if provided."
+    )
+    muzzle_color: Optional[str] = Field(
+        None, description="This candidate's stored muzzle color, echoed back from the request's candidates list, if provided."
+    )
+    horn_length_ratio: Optional[float] = Field(
+        None, description="This candidate's stored horn/head ratio, echoed back so it can be compared against the query's own `morphology` field."
+    )
+    ear_span_ratio: Optional[float] = Field(
+        None, description="This candidate's stored ear-span ratio, echoed back so it can be compared against the query's own `morphology` field."
+    )
 
 
 # ── Register ──────────────────────────────────────────────────────────────────
@@ -52,6 +102,7 @@ class RegisterResponse(BaseModel):
         ..., description="FAISS integer IDs for the stored embeddings"
     )
     extracted_colors: ExtractedColors
+    morphology: MorphologyResult
     potential_matches: list[MatchCandidate] = Field(
         default_factory=list,
         description="Top matches against candidate_ids (empty if no candidates provided)",
@@ -65,6 +116,7 @@ class RegisterResponse(BaseModel):
 class SearchResponse(BaseModel):
     request_id: str = Field(..., description="UUID for request tracing")
     query_colors: ExtractedColors
+    morphology: MorphologyResult
     top_matches: list[MatchCandidate]
     versions: VersionInfo
 
@@ -79,3 +131,6 @@ class HealthResponse(BaseModel):
     gpu_available: bool
     model_version: str
     color_extractor_available: bool
+    morphology_extractor_available: bool = Field(
+        True, description="Always true — the rule-based morphology extractor has no external dependency to fail."
+    )

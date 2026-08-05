@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 
 from faiss_index import FaissIndex
 from pipeline.color import ColorExtractor
+from pipeline.morphology import MorphologyExtractor
 
 
 def get_model(request: Request) -> Any:
@@ -50,5 +51,16 @@ def get_color_extractor(request: Request) -> ColorExtractor:
         raise HTTPException(
             status_code=500,
             detail="color_extractor_not_loaded",
+        )
+    return extractor
+
+
+def get_morphology_extractor(request: Request) -> MorphologyExtractor:
+    """Retrieve the horn/ear morphology extractor from application state."""
+    extractor = getattr(request.app.state, "morphology_extractor", None)
+    if extractor is None:
+        raise HTTPException(
+            status_code=500,
+            detail="morphology_extractor_not_loaded",
         )
     return extractor
