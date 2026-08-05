@@ -114,10 +114,12 @@ photos; 4 real non-close-up photos showed **identical** behaviour (no
 regression), and the one over-threshold photo now crops instead of passing the
 full frame through.
 
-**Status: local working-tree change only — NOT committed, NOT deployed.** The
-running GPU server is unaffected until someone pulls this and restarts the
-inference container. **This fix removes the catastrophic case but has NOT been
-confirmed to fully fix matching** — see "Still open" below.
+**Status: committed** (`1db86da`, on `feature/cctv-video-analytics` — this was
+still an uncommitted working-tree change when this note was first written).
+Not yet confirmed deployed — a running GPU server only picks this up once
+someone pulls the branch and restarts the inference container. **This fix
+removes the catastrophic case but has NOT been confirmed to fully fix
+matching** — see "Still open" below.
 
 ### Still open: is the crop fix ENOUGH? (needs a real different-animal test)
 
