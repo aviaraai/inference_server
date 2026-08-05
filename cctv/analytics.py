@@ -98,6 +98,7 @@ class VideoAnalytics:
         isolation_multiplier: float = 2.0,
         source_fps: float = 30.0,
         vid_stride: int = 1,
+        min_frames_visible: int = 5,
     ):
         self.frame_w = frame_w
         self.frame_h = frame_h
@@ -105,6 +106,9 @@ class VideoAnalytics:
         self.isolation_mult = isolation_multiplier
         self.source_fps = source_fps
         self.vid_stride = vid_stride
+        # Same flicker filter pipeline.py applies to final_cattle_count — kept
+        # in sync so /result and /analytics agree on count for the same job.
+        self.min_frames_visible = min_frames_visible
 
         # per-cow accumulation: stable_id → list of (frame_idx, cx, cy, area)
         self._tracks: dict[int, list[tuple[int, float, float, float]]] = {}
@@ -203,6 +207,8 @@ class VideoAnalytics:
 
         for sid, track in self._tracks.items():
             frames_visible = len(track)
+            if frames_visible < self.min_frames_visible:
+                continue
             trajectory = [(cx, cy) for _, cx, cy, _ in track]
             areas = [a for _, _, _, a in track]
 

@@ -76,6 +76,7 @@ def _run_job(job_id: str, video_path: Path, cfg, location_tag: str | None, filen
             frame_w=0, frame_h=0,  # set after first frame
             grid_cells=cfg.density_grid_cells,
             isolation_multiplier=cfg.isolation_multiplier,
+            min_frames_visible=cfg.min_frames_visible,
         )
         first_frame_seen = False
 

@@ -57,7 +57,8 @@ class PipelineConfig:
     # model
     model_path: str = "yolo11s.pt"
     img_size: int = 640
-    confidence: float = 0.25
+    confidence: float = 0.35                 # conf floor -- raised from 0.25 to kill low-confidence duplicate boxes
+    nms_iou: float = 0.45                    # NMS IoU threshold -- removes overlapping detections on the same animal
     half: bool = False                       # FP16
 
     # sampling
