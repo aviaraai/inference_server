@@ -296,27 +296,35 @@ def _run_registration_pipeline(
     re-raises it on the awaiting coroutine, where FastAPI's normal
     exception handling picks it up.
     """
-    # ── Quality gate on raw muzzle images ──────────────────────────────
+    # ── Quality gate + YOLO crop + crop-quality, evaluated for ALL 3 images ──
+    # Every muzzle image is checked before any failure is raised, so a single
+    # 422 names every bad slot at once instead of the caller discovering them
+    # one retake at a time (each retake is a full network round trip). Each
+    # image still stops at its OWN first failure (quality, then detection,
+    # then crop-quality) — only the across-images fail-fast was removed.
+    errors: list[str] = []
+    cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     for i, mb in enumerate(muzzle_bytes, 1):
         status, reason = quality_check(mb)
         if status != "GOOD":
-            raise HTTPException(status_code=422, detail=f"muzzle_{i}: {reason}")
+            errors.append(f"muzzle_{i}: {reason}")
+            continue
 
-    # ── YOLO crop + quality check on crops ──────────────────────────────
-    cropped_images = []
-    for i, mb in enumerate(muzzle_bytes, 1):
         img_bgr = _decode_image(mb)
         crop, det_status, _det_conf = crop_cattle(img_bgr)
         if crop is None:
-            raise HTTPException(status_code=422, detail=f"muzzle_{i}: {det_status}")
+            errors.append(f"muzzle_{i}: {det_status}")
+            continue
 
         crop_status, crop_reason = quality_check_cv2(crop)
         if crop_status != "GOOD":
-            raise HTTPException(
-                status_code=422, detail=f"muzzle_{i}_crop: {crop_reason}"
-            )
+            errors.append(f"muzzle_{i}_crop: {crop_reason}")
+            continue
 
-        cropped_images.append(crop)
+        cropped_images[i - 1] = crop
+
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
 
     # ── Embed (batched forward pass) ─────────────────────────────────────
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]

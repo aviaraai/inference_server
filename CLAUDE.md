@@ -127,6 +127,37 @@ Two gotchas this caused (two different black cows wrongly merged):
   black cows still clear 0.80 — if so, this threshold (and/or the color gate)
   needs revisiting, not just the crop.
 
+## Registration quality gate now checks all 3 muzzle photos before failing, not just the first
+
+`_run_registration_pipeline`'s quality/detection loop used to `raise` the
+instant it hit the first bad muzzle image (bad blur, no cattle detected, or
+bad crop quality) — the other two images were never evaluated at all. From
+the app's side this meant a field officer retaking one bad photo,
+resubmitting, and discovering a *second* bad photo only on the next round
+trip — one full network request per bad slot. Flagged from the frontend side
+(see the Telangana app's `CLAUDE.md` blur-fix notes, same underlying
+`/register` endpoint) as a real field inconvenience worth fixing at the
+source rather than patching around client-side.
+
+Fixed by merging the quality-gate and crop/detection loops into a single pass
+over all 3 images (`main.py`): each image still stops at its own first
+problem, in the same priority order as before (quality → detection →
+crop-quality), but a bad image no longer aborts evaluation of the remaining
+two. Only after all 3 are checked does the endpoint raise `422`, with every
+bad slot joined into one `detail` string — e.g. `muzzle_1: bad_quality
+blur=8.9; muzzle_3: RECAPTURE_NO_DETECTION` instead of stopping at
+`muzzle_1` alone. One retake cycle can now fix every flagged photo instead
+of one at a time. Behavior is unchanged when all 3 images pass.
+
+**Deliberately scoped to this service only.** go-apiserver relays this
+`detail` string to the app as-is, so the app already surfaces the longer
+combined message — but nobody has reshaped it into a structured per-photo
+list on either go-apiserver or the app yet; the app's error handling still
+treats the whole thing as one opaque string (unlike the existing
+client-side blur guard, which already lists bad photo numbers cleanly). If
+that's wanted, it needs matching changes in go-apiserver's response and
+`src/api/animals.ts` — not done here.
+
 ## Decision thresholds live in the API SERVER, not here
 
 This service returns raw scores only. MATCH/REVIEW/UNKNOWN and the 3 km GPS
