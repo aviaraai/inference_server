@@ -28,18 +28,21 @@ class ExtractedColors(BaseModel):
 
 
 class MorphologyResult(BaseModel):
-    horn_length_ratio: float = Field(
-        ...,
+    has_horns: Optional[bool] = Field(
+        None,
         description=(
-            "Horn/head extent above the head band, ÷ crop width. Scale-invariant "
-            "proxy, NOT a real-world measurement — see pipeline/morphology.py."
+            "True/False if a reading was produced, else None. False means "
+            "'no horn confirmed visible in this photo' — NOT 'confirmed "
+            "hornless' (a genuinely polled animal and a backward/occluded "
+            "horn look identical to this heuristic). See pipeline/morphology.py."
         ),
     )
-    ear_span_ratio: float = Field(
-        ...,
+    horn_shape: Optional[str] = Field(
+        None,
         description=(
-            "Left-right silhouette extent within the head band, ÷ crop width. "
-            "Scale-invariant proxy, NOT a real-world measurement — see pipeline/morphology.py."
+            "One of pipeline.morphology.HornShape: NONE (no horns detected), "
+            "STRAIGHT, CURVED, or UNKNOWN. None (the JSON field, not the "
+            "enum) means `status` isn't OK/PARTIAL — no reading was produced."
         ),
     )
     confidence: float = Field(
@@ -52,14 +55,12 @@ class MorphologyResult(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "OK, INVALID_IMAGE, NO_ANIMAL_DETECTED, NO_CLEAR_SILHOUETTE, or "
+            "OK, INVALID_IMAGE, NO_ANIMAL_DETECTED, NO_CLEAR_SILHOUETTE, "
+            "INCONSISTENT (register only — the 2 front photos disagreed), or "
             "PARTIAL (register only — some but not all front photos produced "
-            "a reading). Only OK/PARTIAL carry a real (possibly blended) "
-            "reading; anything else means the ratios are the zero default "
-            "and MUST NOT be read as data. A non-OK status does NOT mean "
-            "'no horns' — it means 'no horn confirmed visible in this "
-            "photo,' which is also what a genuinely hornless/polled animal "
-            "or a backward-facing horn look like. See pipeline/morphology.py."
+            "a reading). Only OK/PARTIAL carry a real reading; anything else "
+            "means has_horns/horn_shape are null and MUST NOT be read as "
+            "data. See pipeline/morphology.py."
         ),
     )
     reason: str = Field(
@@ -80,11 +81,11 @@ class CandidateInfo(BaseModel):
     faiss_id: int = Field(..., description="FAISS integer ID of the stored embedding")
     body_color: str = Field(..., description="Stored body color label (e.g. BLACK)")
     muzzle_color: str = Field(..., description="Stored muzzle color label (e.g. PINK)")
-    horn_length_ratio: Optional[float] = Field(
-        None, description="This candidate's stored horn/head ratio, if known — see pipeline/morphology.py."
+    has_horns: Optional[bool] = Field(
+        None, description="This candidate's stored horn presence, if known — see pipeline/morphology.py."
     )
-    ear_span_ratio: Optional[float] = Field(
-        None, description="This candidate's stored ear-span ratio, if known — see pipeline/morphology.py."
+    horn_shape: Optional[str] = Field(
+        None, description="This candidate's stored horn shape (pipeline.morphology.HornShape), if known."
     )
     morphology_confidence: Optional[float] = Field(
         None, description="Confidence of this candidate's stored morphology reading, if known."
@@ -104,11 +105,11 @@ class MatchCandidate(BaseModel):
     muzzle_color: Optional[str] = Field(
         None, description="This candidate's stored muzzle color, echoed back from the request's candidates list, if provided."
     )
-    horn_length_ratio: Optional[float] = Field(
-        None, description="This candidate's stored horn/head ratio, echoed back so it can be compared against the query's own `morphology` field."
+    has_horns: Optional[bool] = Field(
+        None, description="This candidate's stored horn presence, echoed back so it can be compared against the query's own `morphology` field."
     )
-    ear_span_ratio: Optional[float] = Field(
-        None, description="This candidate's stored ear-span ratio, echoed back so it can be compared against the query's own `morphology` field."
+    horn_shape: Optional[str] = Field(
+        None, description="This candidate's stored horn shape, echoed back so it can be compared against the query's own `morphology` field."
     )
 
 

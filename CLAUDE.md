@@ -129,6 +129,13 @@ Two gotchas this caused (two different black cows wrongly merged):
 
 ## Horn/ear morphology — a new signal for the weak color gate, v1 is an unvalidated heuristic
 
+> ⚠️ **The field names in this section (`horn_length_ratio`, `ear_span_ratio`)
+> are HISTORICAL.** They were replaced with categorical `has_horns`/
+> `horn_shape` fields — see "Redesigned: ratios → has_horns/horn_shape"
+> below. The architecture, the "no dataset exists" finding, and the
+> not-wired-into-any-decision policy described here are all still current;
+> only the specific field names changed.
+
 Requested directly in response to the "color gate is near-useless for black
 cattle" problem above: return horn-length and ear-span as an extra signal,
 the same way `body_color`/`muzzle_color` already are, in **both**
@@ -301,6 +308,66 @@ anywhere. So even with `/search`'s contract fixed on the go-apiserver side,
 every candidate's morphology fields would come back `None` until a DB
 migration + the register write path are also updated — again, not done
 here, on the same "CTO's side" instruction.
+
+### Redesigned: ratios → `has_horns`/`horn_shape` — explicit request to drop the numbers
+
+On direct instruction: replace `horn_length_ratio`/`ear_span_ratio` with
+"does the cattle have horns or not, if yes what's the shape (hardcoded
+string/enum), if no horns it should be null" — categorical fields, the
+same style `body_color`/`muzzle_color` already use, not a measurement.
+Ear-specific fields were dropped entirely, not just renamed — the request
+only asked about horn presence/shape.
+
+`pipeline/morphology.py` now returns `has_horns: bool | None` and
+`horn_shape: str | None` (`pipeline.morphology.HornShape` — `NONE`,
+`STRAIGHT`, `CURVED`, `UNKNOWN`), replacing both ratio fields everywhere
+they appeared (`MorphologyResult`, `CandidateInfo`, `MatchCandidate` in
+`schema.py`; the `/search` match-echoing code in `main.py`). Detection
+reuses the same pipeline as before (`crop_cattle` → head band → largest
+edge contour), just interpreted differently:
+- **Presence**: a protrusion above the head-band base ≥
+  `MIN_HORN_PX_FRACTION` (3% of crop width) → `has_horns=True`; below that
+  → `has_horns=False`, `horn_shape=NONE`.
+- **Shape**: for a present horn, fit a line (`cv2.fitLine`) to the
+  contour's upper points and measure normalized RMS deviation from it
+  (`_classify_shape`) — below `STRAIGHTNESS_THRESHOLD` (0.10) → `STRAIGHT`,
+  above → `CURVED`.
+
+**Shape classification is a rougher guess than presence detection was,
+and presence detection was already unvalidated.** Both thresholds
+(`MIN_HORN_PX_FRACTION`, `STRAIGHTNESS_THRESHOLD`) are picked, not
+calibrated — there's still no labeled data anywhere in this project to
+check them against (see the section above). `STRAIGHT` vs `CURVED` also
+can't distinguish curl/spiral shapes from a simple bend — collapsed
+into one `CURVED` bucket deliberately, rather than inventing more
+categories (`CURLED`, direction-of-curve, etc.) that would need their own
+uncalibrated thresholds on top of an already-uncalibrated one. `UNKNOWN`
+exists as its own value specifically so "couldn't classify" is never
+silently folded into `NONE` — the same "false = not confirmed absent"
+principle as `has_horns`, applied to shape too.
+
+**`average_readings()` (register's 2-photo combine) had to change shape,
+not just field names** — the old version could confidence-weight-blend
+two numbers; there's no such thing as "the average of STRAIGHT and
+CURVED." New behavior: both photos agree → that value, confidence =
+mean; only one produced a reading → that one, `status=PARTIAL` (as
+before); **both produced a reading but disagree → `status=INCONSISTENT`,
+`has_horns`/`horn_shape` both `None`** — a new status, because picking
+one of two disagreeing readings arbitrarily would misrepresent the one
+not picked, which is worse than admitting uncertainty.
+
+**Smoke-tested against the real `Karunya`/`Rama` photos** (still no
+ground truth, so this only confirms behavior, not accuracy):
+`Karunya front1` → `has_horns=True, horn_shape=STRAIGHT`; `Rama front1` →
+`has_horns=True, horn_shape=CURVED` (straightness 0.101, barely over the
+0.10 cutoff — a reminder this boundary is a guess, not a calibrated line);
+`Karunya front2` → still correctly `NO_CLEAR_SILHOUETTE`, not miscast as
+"no horns." Averaging `Karunya front1` (STRAIGHT) with `Rama front1`
+(CURVED) correctly produced `INCONSISTENT` rather than picking one.
+
+Still return-only, still not wired into any accept/reject decision, still
+scoped to this repo only — none of the policy from the sections above
+changed, only the field shape.
 
 ## Registration quality gate now checks all 3 muzzle photos before failing, not just the first
 

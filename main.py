@@ -492,8 +492,8 @@ async def search(
                 **m,
                 body_color=candidate_lookup[m["faiss_id"]].body_color,
                 muzzle_color=candidate_lookup[m["faiss_id"]].muzzle_color,
-                horn_length_ratio=candidate_lookup[m["faiss_id"]].horn_length_ratio,
-                ear_span_ratio=candidate_lookup[m["faiss_id"]].ear_span_ratio,
+                has_horns=candidate_lookup[m["faiss_id"]].has_horns,
+                horn_shape=candidate_lookup[m["faiss_id"]].horn_shape,
             )
             for m in matches
         ],
