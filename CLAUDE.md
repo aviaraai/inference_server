@@ -947,15 +947,17 @@ and `analytics.py`'s `compute()` (`total_cattle=peak_count` from
 `max(self._frame_counts)`) for the same reason — one file's number without
 the other just moves the disagreement around instead of closing it.
 
-**This is still open, not yet fixed:** `GET /history`/`GET /trends` read
-straight from the `sessions` table, and `database.py`'s `save_session()`
-persists `summary.final_cattle_count` — the pipeline-level field, which
-was deliberately **not** changed to peak-in-frame (only the `/result` and
-`/analytics` response layer was). So a job's live `/result` now shows 9 while
-that same job shows 50 in `/history`/`/trends` — confirmed, not theoretical.
-Fixing it means either writing `max_cattle_in_frame` into the
-`final_cattle_count` DB column too, or adding a real `peak_cattle_count`
-column — hasn't been decided, flagging rather than guessing.
+**Fixed, in a follow-up commit:** `GET /history`/`GET /trends` read straight
+from the `sessions` table, and `database.py`'s `save_session()` was
+persisting `summary.final_cattle_count` — the pipeline-level, tracked-ID
+field — while `/result`/`/analytics` had already moved to peak-in-frame.
+Same job showed 9 live and 50 in `/history`/`/trends`, confirmed not
+theoretical. Fix: `save_session()` now writes `summary.max_cattle_in_frame`
+into the `final_cattle_count` column too (same value already going into the
+`max_in_frame` column — both columns are redundant now, left as-is rather
+than restructuring the schema for this). Verified end-to-end: submitted a
+video, got 9/9/9/9 across `/result`, `/analytics`, `/history`, and `/trends`
+for the same job.
 
 ### The annotated video was never actually playable in a browser
 
