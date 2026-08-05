@@ -40,9 +40,11 @@ class MorphologyResult(BaseModel):
     horn_shape: Optional[str] = Field(
         None,
         description=(
-            "One of pipeline.morphology.HornShape: NONE (no horns detected), "
-            "STRAIGHT, CURVED, or UNKNOWN. None (the JSON field, not the "
-            "enum) means `status` isn't OK/PARTIAL — no reading was produced."
+            "One of pipeline.morphology.HornShape (STRAIGHT, CURVED, UNKNOWN) "
+            "when has_horns=True. Null whenever has_horns is False or None — "
+            "there is no separate 'NONE' shape value, since has_horns=False "
+            "already says there's no horn; repeating that as a shape would "
+            "just be the same fact twice."
         ),
     )
     confidence: float = Field(

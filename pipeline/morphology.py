@@ -51,10 +51,15 @@ log = logging.getLogger("godhaar.morphology")
 
 
 class HornShape(str, Enum):
-    NONE = "NONE"          # no protrusion found above the head silhouette
+    """Only meaningful when has_horns=True. There is deliberately no NONE
+    member here — "no horn" is already fully expressed by has_horns=False;
+    a separate NONE shape would just be the same fact said twice. When
+    there's no horn (or no reading at all), horn_shape is plain `None`,
+    not a member of this enum.
+    """
     STRAIGHT = "STRAIGHT"  # protrusion found, low curvature
     CURVED = "CURVED"      # protrusion found, notable curvature
-    UNKNOWN = "UNKNOWN"    # could not determine — see `status`/`reason`
+    UNKNOWN = "UNKNOWN"    # a horn was found but its shape couldn't be classified
 
 
 # Top fraction of the whole-animal crop treated as the head/horn/ear band.
@@ -269,7 +274,7 @@ class RuleBasedMorphologyExtractor(MorphologyExtractor):
                     f"see module docstring: NOT confirmed hornless, just "
                     f"none visible in this photo",
                     has_horns=False,
-                    horn_shape=HornShape.NONE,
+                    horn_shape=None,
                     confidence=confidence,
                 )
 

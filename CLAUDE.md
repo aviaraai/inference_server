@@ -319,19 +319,34 @@ Ear-specific fields were dropped entirely, not just renamed — the request
 only asked about horn presence/shape.
 
 `pipeline/morphology.py` now returns `has_horns: bool | None` and
-`horn_shape: str | None` (`pipeline.morphology.HornShape` — `NONE`,
-`STRAIGHT`, `CURVED`, `UNKNOWN`), replacing both ratio fields everywhere
-they appeared (`MorphologyResult`, `CandidateInfo`, `MatchCandidate` in
-`schema.py`; the `/search` match-echoing code in `main.py`). Detection
-reuses the same pipeline as before (`crop_cattle` → head band → largest
-edge contour), just interpreted differently:
+`horn_shape: str | None` (`pipeline.morphology.HornShape` — `STRAIGHT`,
+`CURVED`, `UNKNOWN`), replacing both ratio fields everywhere they appeared
+(`MorphologyResult`, `CandidateInfo`, `MatchCandidate` in `schema.py`; the
+`/search` match-echoing code in `main.py`). Detection reuses the same
+pipeline as before (`crop_cattle` → head band → largest edge contour),
+just interpreted differently:
 - **Presence**: a protrusion above the head-band base ≥
   `MIN_HORN_PX_FRACTION` (3% of crop width) → `has_horns=True`; below that
-  → `has_horns=False`, `horn_shape=NONE`.
+  → `has_horns=False`, `horn_shape=None`.
 - **Shape**: for a present horn, fit a line (`cv2.fitLine`) to the
   contour's upper points and measure normalized RMS deviation from it
   (`_classify_shape`) — below `STRAIGHTNESS_THRESHOLD` (0.10) → `STRAIGHT`,
   above → `CURVED`.
+
+**`HornShape` deliberately has no `NONE` member — caught in review.** The
+first cut had one (`horn_shape="NONE"` alongside `has_horns=False`), and
+it was flagged as redundant: `has_horns=False` already says there's no
+horn, so a `NONE` shape said the identical thing a second way, and a
+second, different way (`horn_shape=None`, the JSON null) already existed
+for "no reading at all" (non-OK status). Two representations of "nothing
+here" — one a string, one a null — for two different reasons was exactly
+the kind of confusion this file's own conventions try to avoid. Fixed:
+`horn_shape` is `None` (not a string) whenever there's no horn to
+describe, for either reason (`has_horns=False`, or status isn't OK).
+`HornShape` now only has real shapes — `STRAIGHT`, `CURVED`, and
+`UNKNOWN` (reserved for "a horn was found but its shape couldn't be
+classified," e.g. too few contour points — this is the only case where
+`has_horns=True` and `horn_shape` isn't a real shape).
 
 **Shape classification is a rougher guess than presence detection was,
 and presence detection was already unvalidated.** Both thresholds
@@ -341,10 +356,7 @@ check them against (see the section above). `STRAIGHT` vs `CURVED` also
 can't distinguish curl/spiral shapes from a simple bend — collapsed
 into one `CURVED` bucket deliberately, rather than inventing more
 categories (`CURLED`, direction-of-curve, etc.) that would need their own
-uncalibrated thresholds on top of an already-uncalibrated one. `UNKNOWN`
-exists as its own value specifically so "couldn't classify" is never
-silently folded into `NONE` — the same "false = not confirmed absent"
-principle as `has_horns`, applied to shape too.
+uncalibrated thresholds on top of an already-uncalibrated one.
 
 **`average_readings()` (register's 2-photo combine) had to change shape,
 not just field names** — the old version could confidence-weight-blend
