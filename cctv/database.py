@@ -133,7 +133,11 @@ def save_session(
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             summary.job_id, location_tag, video_filename,
-            summary.final_cattle_count, summary.count_method,
+            # Peak-in-frame, matching what /result and /analytics now report
+            # (see CLAUDE.md) -- was summary.final_cattle_count (tracked-ID
+            # count), which is why /history and /trends used to disagree
+            # with /result for the same job.
+            summary.max_cattle_in_frame, summary.count_method,
             summary.max_cattle_in_frame, summary.average_confidence,
             summary.total_detections, summary.throughput_fps,
             summary.processing_seconds, summary.source_fps,
