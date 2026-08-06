@@ -1012,3 +1012,102 @@ probe via ffmpeg itself, `Content-Length` matching disk size, correct Range
 handling) came back correct. Get a real visual confirmation from an actual
 desktop browser before fully trusting this — the automation environment
 could not provide one.
+
+### Both counts shown side by side, not one picked as "the" answer
+
+Reported live: a panning shot down a long goshala feeding-trough row read
+`final_cattle_count: 22` when the herd visibly looked far larger than that.
+The full report had a second number that wasn't being surfaced anywhere
+except `/result`: `unique_tracked_cattle: 62`. Both are real, honestly
+computed, and biased in *opposite* directions depending on whether the
+camera is static or panning — max-in-frame (the original tuning history
+above) undercounts a panning shot across a herd bigger than any single
+frame ever holds; the tracked-ID count over-counts a static scene via
+tracker churn (the original 81-vs-~10 problem this file already documents).
+Rather than pick one as authoritative, `/analytics`, `/history`, and
+`/trends` now all expose both — `total_cattle`/`final_cattle_count` (peak)
+alongside `unique_tracked_cattle` (tracking) — and the goshala manager
+picks whichever fits their camera setup. `AnalyticsResult.unique_tracked_cattle`
+is free to compute: it's just `len(per_cow)`, already filtered by the same
+`min_frames_visible` fix `pipeline.py`'s peak/tracking numbers use, so the
+two stay in sync automatically rather than needing separately-maintained
+logic. Session rows created before this column existed read back as `null`
+for the new field via a migration (`PRAGMA table_info` + `ALTER TABLE` —
+`CREATE TABLE IF NOT EXISTS` alone doesn't add a column to an existing
+table) rather than erroring.
+
+Also fixed while surfacing counts: `JobResult.output_video` and the
+`sessions` DB row's `output_video` were both raw server filesystem paths
+(`D:\...\annotated.mp4`) — useless to any client. Renamed to `video_url`,
+set to the actual `GET /jobs/{id}/video` route. This surfaced a real latent
+bug: that endpoint only ever read from the in-memory `_jobs` tracker, which
+is never persisted, so a `/history` video link for any session older than
+the current server process's uptime would 404 even though the DB row and
+on-disk file both survive a restart. Fixed by falling back to
+`db.get_session(job_id)` when the job isn't in memory. Verified by actually
+downloading the video through the real endpoint (not just checking the file
+exists on disk) both immediately after processing and again after clearing
+`_jobs` to simulate a restart — same URL, same file, both times.
+
+### `crowded` preset — FAST's thresholds badly undercount a packed goshala row
+
+Reported live, on the same panning-shot clip above: even `max_cattle_in_frame`
+(22) looked low against the actual video — a wide shot down a long feeding
+trough visibly holds far more cattle at once than that. Confirmed by
+extracting frames and counting by eye: single frames in this clip show
+roughly 35-55+ cattle simultaneously, well above what `FAST` was reporting
+even as its *peak*.
+
+Root cause, confirmed empirically rather than guessed (raw-YOLO test across
+3 of the densest frames, then re-verified through the full detect+track
+pipeline on the whole clip — scratch scripts, not committed, results below
+are what matters): `FAST`'s `confidence=0.35` (raised from 0.25 earlier in
+this file's own history, but tuned against a *sparse* open-field herd to
+kill duplicate-box artifacts on a single animal) was filtering out genuine,
+lower-confidence detections of small/rear-view/heavily-occluded animals
+further back in a packed row — **not** a false-positive problem, so
+loosening it doesn't reintroduce the noise the original fix was guarding
+against:
+
+- Raw YOLO on 3 dense frames: `conf=0.35/iou=0.45` (current) found 10-13
+  boxes each. `conf=0.15/iou=0.45` nearly doubled that (18-26). Adding
+  `iou=0.6` pushed further (20-31).
+- Full pipeline, whole clip: baseline `peak=22/tracked=62`. `conf=0.15,
+  iou=0.45` reached `peak=26` but tripped ultralytics' *"NMS time limit
+  exceeded"* warning on this clip — a real reliability risk, not just a
+  number. `conf=0.15, iou=0.6` and `conf=0.20, iou=0.55` both reached the
+  same `peak=26` without that warning; picked `0.20/0.55` as the safer of
+  the two equally-good options.
+- Checked for regression on a second, less-crowded clip before trusting
+  this: `peak=14→16`, `tracked=20→26` — same direction, much smaller
+  magnitude, no false-positive blow-up. Total detections and average
+  confidence scaled proportionately with the count increase on both clips
+  (not exploding independently), consistent with recovering real missed
+  animals rather than adding noise.
+- Tried `yolo11m` (what `BALANCED`/`ACCURATE` already use) at the same
+  tuned thresholds, expecting a further gain. It didn't help —
+  `peak=23`, slightly *worse* than `yolo11s`'s 26, at the same processing
+  cost. Model size isn't the bottleneck here; this preset stays on
+  `yolo11s`.
+
+**Deliberately shipped as a new opt-in `Preset.CROWDED`
+(`confidence=0.20, nms_iou=0.55`, otherwise identical to `FAST`), not a
+change to `FAST`'s defaults.** The original `0.35/0.45` was tuned against a
+genuinely different clip (the sparse open-field herd earlier in this file)
+that is no longer available to re-verify against — changing the global
+default risks silently undoing that fix for the case it was built for.
+Same principle as showing peak vs. tracked side by side above: let the
+caller pick the tool for their camera setup instead of guessing one
+answer fits every scene. `nms_iou` is now also exposed as a per-request
+`/analyze` override (`img_size`/`confidence`/`vid_stride` already were;
+this closed the inconsistency), independent of the new preset.
+
+**Still an honest gap, not a full fix.** `peak=26` against a ~35-55 visual
+estimate on the same clip means real animals are still being missed even
+after this tuning — the gains plateaued at the same `peak=26` across three
+different confidence/IoU combinations, which looks like `yolo11s` approaching
+its real detection ceiling on this level of shoulder-to-shoulder occlusion,
+not a threshold left untuned. This generic COCO-pretrained model was never
+trained on this specific scene type. If more accuracy is needed here, the
+next lever is a model fine-tuned on genuinely crowded barn footage — a
+data/training problem, not a config change.

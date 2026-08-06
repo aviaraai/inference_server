@@ -149,6 +149,7 @@ async def analyze_video(
     enable_analytics: bool = Form(True),
     img_size: Optional[int] = Form(None),
     confidence: Optional[float] = Form(None),
+    nms_iou: Optional[float] = Form(None),
     vid_stride: Optional[int] = Form(None),
 ):
     """Upload a video and start processing in the background."""
@@ -165,6 +166,8 @@ async def analyze_video(
         overrides["img_size"] = img_size
     if confidence:
         overrides["confidence"] = confidence
+    if nms_iou:
+        overrides["nms_iou"] = nms_iou
     if vid_stride:
         overrides["vid_stride"] = vid_stride
 

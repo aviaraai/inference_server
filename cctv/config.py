@@ -48,6 +48,7 @@ class Preset(str, Enum):
     ACCURATE = "accurate"
     LIVE_CPU = "live_cpu"
     LIVE_GPU = "live_gpu"
+    CROWDED = "crowded"                      # dense goshala/shed footage -- see PRESETS comment
 
 
 @dataclass
@@ -124,6 +125,55 @@ PRESETS: dict[Preset, dict] = {
         vid_stride=1,
         tracker_yaml=str(BASE_DIR / "trackers" / "botsort_cattle.yaml"),
         half=True,
+    ),
+    # For dense goshala/shed footage: a long feeding-trough row shot with
+    # cattle standing shoulder-to-shoulder, heavily occluded. FAST's
+    # confidence=0.35/nms_iou=0.45 (tuned against a SPARSE open-field herd
+    # to kill duplicate-box artifacts on a single animal) badly undercounts
+    # here — measured on a real 32s dense clip: peak_cattle_in_frame=22
+    # against a visual estimate of 35-55+ actually in frame. Root cause,
+    # confirmed empirically (scratch_detection_tune.py, scratch_pipeline_tune.py
+    # — not committed, see CLAUDE.md): confidence=0.35 was filtering out
+    # genuine but lower-confidence detections of small/rear-view/occluded
+    # animals further back in the row -- NOT a false-positive problem, so
+    # loosening it doesn't reintroduce noise. Lowering to 0.20 (with nms_iou
+    # relaxed to 0.55 so adjacent, genuinely-distinct animals standing close
+    # together stop getting merged into one box) raised peak count 22->26 on
+    # the dense clip with total_detections/avg_confidence scaling
+    # proportionately (not exploding, i.e. real detections, not noise), and
+    # produced a smaller, same-direction gain (14->16 peak) on a second,
+    # less-crowded clip -- no false-positive blow-up there either.
+    # conf=0.15 got one step closer (peak=26 too, same ceiling) but tripped
+    # ultralytics' "NMS time limit exceeded" warning on the dense clip; 0.20
+    # reaches the same peak without that reliability risk. Tried yolo11m
+    # (BALANCED/ACCURATE's model) at these same thresholds expecting a
+    # further gain -- it did NOT help (peak=23, slightly WORSE than
+    # yolo11s's 26, at the same processing cost) — model size isn't the
+    # bottleneck here, so this preset stays on yolo11s.
+    #
+    # Still an HONEST GAP, not a full fix: 26 vs a ~35-55 visual estimate on
+    # the same clip means real animals are still being missed even after
+    # this tuning -- this looks like it's approaching yolo11s's real
+    # detection ceiling on this level of occlusion, which threshold tuning
+    # alone can't fully close. A model fine-tuned on genuinely crowded
+    # barn footage (this generic COCO-pretrained model was never trained on
+    # shoulder-to-shoulder cattle) is the next lever if more accuracy is
+    # needed here — out of scope for a config change.
+    #
+    # Deliberately NOT applied to FAST's defaults: the original 0.35/0.45
+    # was tuned against a genuinely different, sparse-herd clip (see
+    # CLAUDE.md's CCTV tuning history) that is no longer available to
+    # re-verify against, so changing the global default risks silently
+    # undoing that fix. This is an opt-in choice instead, same principle as
+    # showing peak vs. tracked counts side by side rather than picking one.
+    Preset.CROWDED: dict(
+        model_path="yolo11s.pt",
+        img_size=640,
+        vid_stride=2,
+        confidence=0.20,
+        nms_iou=0.55,
+        tracker_yaml=str(BASE_DIR / "trackers" / "botsort_cattle.yaml"),
+        half=False,
     ),
 }
 
