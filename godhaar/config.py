@@ -102,6 +102,20 @@ DUPLICATE_THRESHOLD = 0.80                      # cosine similarity above which
                                                 # enough margin to avoid false positives
                                                 # on genuinely different cattle.
 
+# Above this, embedding similarity alone is treated as sufficient proof of a
+# duplicate -- color agreement is no longer required (see main.py's duplicate
+# check). Reported live: a real animal was double-registered because its
+# second registration's front photo was shot in a crowded goshala stall,
+# detect_primary_animal() (pipeline/yolo_crop.py) picked a neighbouring
+# animal's coat instead of the subject's (it has no quality/multi-cattle
+# gate, unlike the muzzle path), so body_color mismatched and the AND-gated
+# duplicate check silently let a real duplicate through. Not independently
+# calibrated -- chosen as a conservative midpoint between DUPLICATE_THRESHOLD
+# (0.80) and the one measured genuine same-animal score on record (0.9712,
+# see CLAUDE.md's crop-bug investigation). Revisit if real registrations
+# show this is too tight/loose once more same-animal score data exists.
+DUPLICATE_HIGH_CONFIDENCE_THRESHOLD = 0.90
+
 IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp"}
 
 # ── Versioning ────────────────────────────────────────────────────────────────

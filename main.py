@@ -39,6 +39,7 @@ from dependency import (
 from faiss_index import FaissIndex
 from godhaar.config import (
     BODY_COLOR_MAJORITY_CONFIDENCE,
+    DUPLICATE_HIGH_CONFIDENCE_THRESHOLD,
     DUPLICATE_THRESHOLD,
     EMB_DIM,
     MODEL_VERSION,
@@ -261,12 +262,36 @@ async def register(
                 break  # sorted descending — no point checking further
 
             stored = candidate_colors[match.faiss_id]
-            color_match = (
-                stored.body_color == new_body
-                and stored.muzzle_color == new_muzzle
-            )
+            body_match = stored.body_color == new_body
+            muzzle_match = stored.muzzle_color == new_muzzle
 
-            if color_match:
+            # Tiered, not a flat AND-gate. body_color comes from
+            # detect_primary_animal() (pipeline/yolo_crop.py), which has NO
+            # quality/multi-cattle gate — unlike muzzle_color, which only
+            # ever comes from photos that already passed one. Requiring both
+            # to agree let one bad body_color read (a crowded goshala front
+            # photo picking a neighbour's coat) silently defeat a genuinely
+            # correct muzzle-embedding match — reported live as a real
+            # double-registration. See DUPLICATE_HIGH_CONFIDENCE_THRESHOLD's
+            # comment in godhaar/config.py for the full incident.
+            if match.score >= DUPLICATE_HIGH_CONFIDENCE_THRESHOLD:
+                # Embedding alone is decisive at this similarity — color
+                # cannot veto it, only corroborate/contradict for the log.
+                is_duplicate = True
+                if not (body_match and muzzle_match):
+                    log.warning(
+                        f"/register duplicate at score={match.score:.4f} "
+                        f"(>= {DUPLICATE_HIGH_CONFIDENCE_THRESHOLD}) despite "
+                        f"color mismatch — body_match={body_match} "
+                        f"muzzle_match={muzzle_match}; rejecting anyway"
+                    )
+            else:
+                # Ambiguous band: require the more trustworthy signal
+                # (muzzle_color) to corroborate. body_color is deliberately
+                # NOT required here — see comment above.
+                is_duplicate = muzzle_match
+
+            if is_duplicate:
                 log.info(
                     f"/register 409 duplicate | "
                     f"score={match.score:.4f} | "
