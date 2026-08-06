@@ -337,10 +337,9 @@ Deployment notes:
   white calf reads `GREY` not `WHITE` because indoor shade puts it at L\*≈44,
   well under `L_WHITE_MIN=75`. Better than `BLACK`, still not calibrated.
 - **Unrelated, found while testing:** real goshala front photos hit
-  `RECAPTURE_MULTI_CATTLE` in `crop_cattle` (several animals in frame). This
-  does not affect color — `main.py` runs `crop_cattle` only on the *muzzle*
-  photos, and front photos go straight to `extract_body` — but the same
-  photos submitted as muzzle shots would be rejected. Pre-existing, untouched.
+  `RECAPTURE_MULTI_CATTLE` in `crop_cattle` (several animals in frame).
+  ~~Pre-existing, untouched.~~ **Now fixed — see "Multi-cattle goshala photos"
+  below.**
 
 **The embedding path is deliberately unchanged.** `main.py` register/search
 still feed `crop_cattle()`'s whole-animal crop to the encoder. Routing the
@@ -602,6 +601,175 @@ ground truth, so this only confirms behavior, not accuracy):
 Still return-only, still not wired into any accept/reject decision, still
 scoped to this repo only — none of the policy from the sections above
 changed, only the field shape.
+
+## ⚠️ Fixed: multi-cattle goshala photos — pick the dominant subject instead of rejecting
+
+Reported live: registration was impossible at a goshala because the cattle
+stand shoulder to shoulder, so a **correctly-framed** photo of one animal
+always has neighbours in frame and `crop_cattle` returned
+`RECAPTURE_MULTI_CATTLE`. There is no retake that fixes this — the officer
+cannot make the neighbouring cow leave. Requested behaviour: *"the cattle
+which is concentrated more should [be] given priority."*
+
+**Fix:** when more than `MAX_CATTLE_PER_IMAGE` boxes survive dedup,
+`crop_cattle` now calls a new `select_dominant_box()` instead of rejecting
+outright. Each box scores
+
+```
+area_fraction * (1 - center_distance) ** SUBJECT_CENTER_WEIGHT_POWER
+```
+
+(`center_distance` = box center's distance from frame center, normalized by
+the half-diagonal → 0 at dead center, 1 in a corner, so it is resolution- and
+aspect-independent). The top box wins only if it beats the runner-up by
+`SUBJECT_DOMINANCE_RATIO`; otherwise the image is still rejected as
+multi-cattle.
+
+**Why area alone was not enough — this is the measurement that shaped it.**
+`godhaar/config.py` already carried a `DOMINANT_AREA_RATIO = 3.0` with the
+comment "if top box is >=3x larger than next, drop smaller boxes" — **dead
+code, nothing ever imported it.** Measured on the 5 reported photos, the
+subject's *area* ratio over the neighbour was only **1.62x** (front1) and
+**2.28x** (the muzzle shots), so a 3.0 area gate would have rejected 3 of 5.
+Centrality is what actually separates them: the neighbour sits far off-center
+in every photo (center distance 0.39–0.55 vs the subject's 0.04–0.16). With
+the center term squared, the same photos score **5.9x, 7.2x and 42x** — a wide
+gap that 2.0 clears with margin. `DOMINANT_AREA_RATIO` was deleted rather than
+left dead.
+
+**Confidence is deliberately NOT part of the score.** It measures how sure
+YOLO is that something is a cow, not which cow was photographed — and on the
+reported front photo the *background* white cow scored **higher** confidence
+than the subject (0.922 vs 0.861), being unblurred and side-on. Scoring on
+confidence would have picked exactly the wrong animal.
+
+**The ambiguity fallback is kept on purpose.** When two animals are comparably
+large *and* comparably centered, `select_dominant_box` returns `None` and the
+422 still fires. That is the case the single-animal gate genuinely exists for:
+an embedding that could belong to either animal is worse than a retake, since
+it silently poisons the FAISS index. Verified with a synthetic equal pair
+(two identical boxes mirrored about center) → still rejected.
+
+**`detect_primary_animal()` was switched to the same score**, replacing its
+"largest box" rule. This is a consistency fix, not cosmetics: front photos
+reach *body color* through `detect_primary_animal` while muzzle photos reach
+the *encoder* through `crop_cattle`, so under two different rules `/register`
+could store the **neighbour's coat color against the subject's embedding**. It
+keeps its old always-return-something semantics (no ratio gate) — the fallback
+there is a fixed center crop of the whole frame, which is strictly worse than
+the top-scoring animal's box even on a close call. Verified the old and new
+rules pick the **identical** box on both reported front photos, so this
+carries no regression risk for the body-color work validated earlier.
+
+**Verified on the 5 reported photos:** all 5 now return `OK` (were
+`RECAPTURE_MULTI_CATTLE`); the saved crops confirm the **black bull** was
+selected and the white neighbour excluded in every one. Muzzle color reads
+`BLACK` 3/3 (majority gate passes). The 14 existing color unit tests still
+pass.
+
+### Two MORE gates were blocking the same photos — a stack of three
+
+Registration was blocked by three independent gates in series; fixing only the
+first would have looked like no progress at all from the field. Each was found
+by fixing the one in front of it and re-running the real
+`_run_registration_pipeline`. **All three are now fixed and the reported
+photos register end-to-end.** The other two:
+
+#### 2. Body-color unanimity was a policy bug, not a calibration bug
+
+`/register` 422'd whenever the 2 front photos read different body colors.
+Fixed in `main.py::_resolve_disagreeing_body_colors`.
+
+The tell is an asymmetry in the same function: **muzzle** color takes 3
+samples and accepts a **majority**, while **body** color took 2 and demanded
+**unanimity**. Body was never stricter because it is more reliable — it is
+stricter only because you cannot form a majority out of 2. Meanwhile
+go-apiserver deliberately does *not* hard-filter search on these same labels
+("classifier confidence is unreliable"), so a signal too weak to filter a
+search result was strong enough to block a registration outright.
+
+Worse, the officer could not comply: the disagreement's usual cause is the two
+front shots framing the animal differently, so the coat's share of sampled
+pixels shifts and a near-boundary coat lands on either side. Retaking the same
+two angles reproduces it exactly.
+
+Now: the reading claiming at least `BODY_COLOR_MAJORITY_CONFIDENCE` (0.50) of
+the sampled coat wins. That is **not a tuned number** — `body_color.py`
+defines confidence as the winning label's *share of the sampled coat*, so 0.50
+is literally "this color covers most of the animal," the same majority idea
+muzzle color already uses. Still 422 when **both** readings are confident and
+contradictory (a real retake case — possibly two different animals), or when
+**neither** is decisive. Accepted readings have confidence **halved**,
+following `average_readings()`'s existing convention for morphology's
+`PARTIAL`. **Zero regression risk on the 8-photo body-color set: those photos
+all AGREED, and the agreement path is untouched** — this code only runs where
+a hard 422 previously fired.
+
+#### 3. The blur gate was measuring the wrong pixels on a sharp photo
+
+`quality_check_cv2` rejected a reported muzzle photo as `bad_quality
+blur=17.50`. The photo is not blurry: **the same photo's full frame scores
+511.97.** Blur is measured on the **central 50%** (`_BLUR_CENTER_FRAC`), a
+guard against penalizing bokeh backgrounds — which assumes the subject is
+central and the out-of-focus part peripheral. That assumption **inverts for a
+tight YOLO crop**: the background is already cropped away, and dead-center is
+now the animal's smooth hide (the bridge of the nose), while the texture that
+proves focus — the muzzle's bead pattern, hair boundaries — sits off-center.
+Note this became reachable for *every* close-up once the close-up passthrough
+was removed (see the top of this file); it is not goshala-specific.
+
+This is the same class of defect as the muzzle-color ROI bug documented above,
+and the same rule applies: **no `BLUR_THRESHOLD` change can fix measuring the
+wrong pixels** — lowering 20.0 to admit this photo would admit genuinely
+blurry ones too. So the threshold was NOT touched. `_blur_score()` now takes
+the **max** of the central region and the whole crop, answering the question
+the gate actually cares about ("is the subject in focus anywhere?"). Being a
+max, it is **monotonically ≥ the old value, so it cannot reject any image that
+passes today** — verified over 200 random images. `quality_check()` (raw full
+frame) keeps the central-50% rule, where the bokeh rationale genuinely holds.
+
+#### Verified end-to-end
+
+`main.py`'s real `_run_registration_pipeline`, the reported photos, encoder
+stubbed (no embedding code was touched): **PASSED** — 3×256 unit-norm
+embeddings, `body_color=BLACK` (conf 0.41, `RESOLVED_DISAGREEMENT`),
+`muzzle_color=BLACK` (conf 0.87), morphology `INCONSISTENT` (return-only,
+never a gate). 14 color unit tests still pass.
+
+**Note on the sample photos:** two of the three supplied muzzle images were
+**byte-identical duplicates** of each other. Registration expects 3 distinct
+muzzle photos, so real captures should not look like this — it does not affect
+the fixes, but it means the 3-photo majority vote was effectively a 2-photo
+one here.
+
+### Still open: the underlying body-color classifier is still wrong here
+
+The gate no longer blocks registration, but the classifier that caused the
+disagreement was **not** fixed — it is now tolerated, not corrected. The
+measured cause:
+
+| | front1 | front2 |
+|---|---|---|
+| top cluster chroma | **10.23** → `BROWN` | 3.66 → `BLACK` |
+| runner-up/primary | **0.888** → `SPOTTED` | 0.219 → `BLACK` |
+
+Two documented-as-uncalibrated constants are both implicated, and this animal
+is **new evidence against the calibration story recorded above**:
+- `NEUTRAL_THRESHOLD = 9.0` was set because measured achromatic coats ran
+  0.05–7.1 and brown coats 12.4–16.7, with 9.0 "in the empty gap between the
+  two populations." **This bull's coat sits at 10.23 — inside that supposedly
+  empty gap.** Part of its dark coat therefore reads `BROWN` and part `BLACK`.
+- `SPOTTED_RATIO_MIN = 0.60` repeats the exact failure its own note warns
+  about: the same animal gives 0.888 and 0.219 on its two front photos purely
+  because the head fills more of one frame than the other, and 0.60 sits
+  between them.
+
+**Deliberately NOT blind-tuned.** Moving either constant to make this one
+animal pass would be the precise mistake this file's blur-threshold and
+GrabCut stories warn against, and the 8-photo real set those values were
+calibrated against **is no longer in the repo**, so a change cannot be checked
+for regressions. Needs that photo set (or a new labeled one) before either
+threshold moves.
 
 ## Registration quality gate now checks all 3 muzzle photos before failing, not just the first
 

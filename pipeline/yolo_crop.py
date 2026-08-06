@@ -20,6 +20,8 @@ from godhaar.config import (
     CROP_PADDING_PX,
     MAX_CATTLE_PER_IMAGE,
     MIN_BBOX_AREA_PCT,
+    SUBJECT_CENTER_WEIGHT_POWER,
+    SUBJECT_DOMINANCE_RATIO,
     YOLO_CONF,
     YOLO_INTERNAL_CONF,
     YOLO_CATTLE_CLASS_IDS,
@@ -172,19 +174,110 @@ def _run_yolo(
     return boxes
 
 
+def _dominance_score(
+    box: tuple[float, int, int, int, int], w: int, h: int
+) -> float:
+    """Score how strongly a box reads as "the animal this photo is OF".
+
+    Two things make an animal the subject of a hand-held field photo: it fills
+    a lot of the frame, and it sits near the middle of it (the photographer
+    pointed the phone at it). Neighbouring cattle in a goshala stall can match
+    on the first — they are the same size animal, standing just as close — but
+    not on the second, because the operator framed the one they meant.
+
+    score = area_fraction * (1 - center_distance) ** SUBJECT_CENTER_WEIGHT_POWER
+
+    center_distance is the box center's distance from the frame center,
+    normalized by the half-diagonal so it is 0 at dead center and 1 in a
+    corner — resolution- and aspect-independent, so the score means the same
+    thing on any phone. Confidence is deliberately NOT a factor: it measures
+    how sure YOLO is that something is a cow, not which cow was photographed,
+    and on the real photos the background animal often scores HIGHER
+    confidence than the subject (0.922 vs 0.861 on the reported front photo)
+    because it is unblurred and side-on.
+    """
+    _, x1, y1, x2, y2 = box
+    area_frac = (max(0, x2 - x1) * max(0, y2 - y1)) / float(w * h)
+
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    # Normalize by the half-diagonal so distance is 0..1 regardless of shape.
+    half_diag = ((w / 2.0) ** 2 + (h / 2.0) ** 2) ** 0.5
+    dist = (((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) ** 0.5) / half_diag
+
+    return area_frac * (1.0 - min(1.0, dist)) ** SUBJECT_CENTER_WEIGHT_POWER
+
+
+def select_dominant_box(
+    boxes: list[tuple[float, int, int, int, int]], w: int, h: int
+) -> Optional[tuple[float, int, int, int, int]]:
+    """Pick the single subject animal out of several detections, or None.
+
+    Returns the top-scoring box only when it beats the runner-up by at least
+    SUBJECT_DOMINANCE_RATIO. A None return means no animal stood out — two or
+    more are comparably large and comparably centered — and the caller should
+    keep rejecting the image rather than guess, since an embedding that could
+    belong to either animal is worse than asking for a retake.
+    """
+    if len(boxes) == 0:
+        return None
+    if len(boxes) == 1:
+        return boxes[0]
+
+    scored = sorted(
+        ((_dominance_score(b, w, h), b) for b in boxes),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    top_score, top_box = scored[0]
+    runner_up_score = scored[1][0]
+
+    for score, b in scored:
+        log.info(
+            f"  dominance: box=({b[1]},{b[2]},{b[3]},{b[4]}) "
+            f"conf={b[0]:.3f} score={score:.4f}"
+        )
+
+    if runner_up_score <= 0.0:
+        ratio = float("inf")
+    else:
+        ratio = top_score / runner_up_score
+
+    if ratio < SUBJECT_DOMINANCE_RATIO:
+        log.warning(
+            f"select_dominant_box: no dominant subject — top/runner-up "
+            f"score ratio {ratio:.2f} < {SUBJECT_DOMINANCE_RATIO}"
+        )
+        return None
+
+    log.info(
+        f"select_dominant_box: subject box=({top_box[1]},{top_box[2]},"
+        f"{top_box[3]},{top_box[4]}) wins by {ratio:.2f}x"
+    )
+    return top_box
+
+
 def detect_primary_animal(img: np.ndarray) -> Optional[tuple[int, int, int, int]]:
     """Detect the primary animal's box, for body-color ROI localization only.
 
-    Unlike crop_cattle() (the muzzle-embedding path), this does NOT enforce
-    MAX_CATTLE_PER_IMAGE: a real field/goshala photo often has other cattle
-    in the background, and refusing to read the subject's coat color because
-    a neighbor is also in frame would be wrong for this use case (the
-    single-animal constraint exists so muzzle embeddings aren't ambiguous
-    about which animal they represent — that reasoning doesn't apply to
-    localizing where to sample body color). Among all detected boxes, the
-    LARGEST one by area is taken as the subject — not the highest-confidence
-    one — since the photographed animal is normally closest to the camera
-    and fills more of the frame than anything in the background.
+    Picks the subject with the SAME dominance score crop_cattle() uses
+    (_dominance_score: large in frame AND near its center), so every signal
+    extracted from one animal's photos describes the same animal. That
+    consistency is the point: front photos reach body color through here while
+    muzzle photos reach the encoder through crop_cattle(), and a goshala frame
+    holds several cattle — if the two used different rules, /register could
+    store the neighbour's coat color against the subject's embedding. This
+    used to take the LARGEST box, which on the reported front photo picks the
+    same animal but for a reason that does not generalize: the white neighbour
+    there is 62% the subject's area, so a slightly closer neighbour would flip
+    it. Centrality is what actually identifies the animal the operator aimed
+    at.
+
+    Unlike crop_cattle() this does NOT enforce MAX_CATTLE_PER_IMAGE, and it
+    ignores the dominance RATIO gate — it always returns its best guess when
+    anything was detected. Refusing to read a coat color because two animals
+    are comparably prominent would help nobody: the fallback is a fixed
+    center crop of the whole frame, which is strictly worse than the
+    top-scoring animal's box even when that score is a close call.
 
     Uses only the first two (cheapest) detection attempts from crop_cattle's
     ladder — this is a "nice to have" ROI improvement, not a hard gate, so
@@ -193,8 +286,8 @@ def detect_primary_animal(img: np.ndarray) -> Optional[tuple[int, int, int, int]
 
     Returns
     -------
-    (x1, y1, x2, y2) of the largest detected box, or None if no cattle-like
-    animal was detected or the model isn't loaded.
+    (x1, y1, x2, y2) of the subject's box, or None if no cattle-like animal
+    was detected or the model isn't loaded.
     """
     if img is None or img.size == 0 or _yolo_model is None:
         return None
@@ -209,11 +302,7 @@ def detect_primary_animal(img: np.ndarray) -> Optional[tuple[int, int, int, int]
     if len(boxes) == 0:
         return None
 
-    def _area(box: tuple[float, int, int, int, int]) -> int:
-        _, bx1, by1, bx2, by2 = box
-        return max(0, bx2 - bx1) * max(0, by2 - by1)
-
-    _, x1, y1, x2, y2 = max(boxes, key=_area)
+    _, x1, y1, x2, y2 = max(boxes, key=lambda b: _dominance_score(b, w, h))
     return x1, y1, x2, y2
 
 
@@ -329,8 +418,22 @@ def crop_cattle(
     boxes = kept
     log.info(f"crop_cattle: {len(boxes)} box(es) after IoU deduplication")
 
+    # ── Resolve multiple animals to the one the photo is OF ─────────────────
+    # In a goshala the cattle stand adjacent, so a correctly-framed photo of
+    # one animal normally has neighbours in frame too. Rejecting all of those
+    # outright made registration impossible there. Instead, prefer the
+    # dominant subject — largest AND most centered (see select_dominant_box) —
+    # and only fall back to RECAPTURE_MULTI_CATTLE when no animal stands out,
+    # which is the case the single-animal gate genuinely exists for: two
+    # equally prominent animals, no way to know which one was meant.
     if len(boxes) > MAX_CATTLE_PER_IMAGE:
-        return None, "RECAPTURE_MULTI_CATTLE", max(b[0] for b in boxes)
+        log.info(
+            f"crop_cattle: {len(boxes)} animals in frame — selecting subject"
+        )
+        subject = select_dominant_box(boxes, w, h)
+        if subject is None:
+            return None, "RECAPTURE_MULTI_CATTLE", max(b[0] for b in boxes)
+        boxes = [subject]
 
     # Take the highest-confidence detection
     boxes.sort(reverse=True)

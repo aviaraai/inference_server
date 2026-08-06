@@ -35,7 +35,12 @@ from dependency import (
     get_morphology_extractor,
 )
 from faiss_index import FaissIndex
-from godhaar.config import DUPLICATE_THRESHOLD, EMB_DIM, MODEL_VERSION
+from godhaar.config import (
+    BODY_COLOR_MAJORITY_CONFIDENCE,
+    DUPLICATE_THRESHOLD,
+    EMB_DIM,
+    MODEL_VERSION,
+)
 from godhaar.model import GodhaarModel
 from helpers import _decode_image, _ms_since
 from pipeline.color import RuleBasedColorExtractor
@@ -295,6 +300,77 @@ async def register(
     )
 
 
+def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
+    """Resolve two front photos that read different body colors.
+
+    This used to be an unconditional 422 ("retake photos"). That was the wrong
+    response to the most common cause of disagreement, which is not a bad
+    photo at all: the two front shots frame the animal differently, so the
+    coat's share of the sampled pixels shifts and a coat sitting near a
+    classifier boundary lands on either side of it. The officer cannot fix
+    that by retaking — the same two angles produce the same split — so the
+    endpoint rejected registrations that no retake would ever repair.
+
+    It is also disproportionate to what the label is worth downstream.
+    go-apiserver deliberately does NOT hard-filter search on these labels
+    ("classifier confidence is unreliable"), and CLAUDE.md records the body
+    thresholds as explicitly uncalibrated. A signal too weak to filter a
+    search result should not be strong enough to block a registration.
+
+    The asymmetry it leaves behind is the giveaway: MUZZLE color takes 3
+    samples and accepts a MAJORITY, while body color took 2 and demanded
+    UNANIMITY. Body was not stricter because it is more reliable — it is
+    stricter only because you cannot have a majority out of 2. This restores
+    the muzzle rule's spirit for a 2-sample vote.
+
+    The tie-break uses confidence as what body_color.py actually defines it to
+    be: the winning label's SHARE of the sampled coat. So a reading at or
+    above BODY_COLOR_MAJORITY_CONFIDENCE means "this color covers most of the
+    animal" — a substantive claim, not a tuned number.
+
+      - Exactly one reading claims a majority of the coat → take it. The other
+        photo saw no color clearly enough to outvote it.
+      - Both claim a majority, and disagree → still 422. Two confident,
+        contradictory readings is the case a retake genuinely serves (e.g.
+        the two front photos are of different animals).
+      - Neither claims a majority → still 422. Nothing here is trustworthy
+        enough to store.
+
+    Confidence of an accepted reading is HALVED, following the same
+    convention average_readings() uses for morphology's PARTIAL status: one of
+    two photos failed to support this label, so the result must read as less
+    certain than two agreeing photos would.
+    """
+    confident = [c for c in body_colors if c["confidence"] >= BODY_COLOR_MAJORITY_CONFIDENCE]
+
+    if len(confident) != 1:
+        labels = " vs ".join(
+            f"{c['label']}({c['confidence']:.2f})" for c in body_colors
+        )
+        detail = (
+            "body_color_inconsistent: front images disagree and neither is "
+            "decisive"
+            if not confident
+            else "body_color_inconsistent: front images give conflicting "
+                 "confident readings"
+        )
+        raise HTTPException(status_code=422, detail=f"{detail} ({labels}), retake photos")
+
+    winner = dict(confident[0])
+    loser = next(c for c in body_colors if c is not confident[0])
+    log.warning(
+        f"body_color: front photos disagree ({winner['label']} "
+        f"{winner['confidence']:.2f} vs {loser['label']} "
+        f"{loser['confidence']:.2f}) — accepting the decisive reading"
+    )
+    winner["confidence"] = round(winner["confidence"] / 2.0, 4)
+    winner["reason"] = (
+        f"RESOLVED_DISAGREEMENT: other front photo read "
+        f"{loser['label']} at {loser['confidence']:.2f}"
+    )
+    return winner
+
+
 def _run_registration_pipeline(
     muzzle_bytes: tuple[bytes, ...],
     front_bytes: tuple[bytes, ...],
@@ -360,16 +436,11 @@ def _run_registration_pipeline(
     body_colors = [color_extractor.extract_body(_decode_image(fb)) for fb in front_bytes]
     body_labels = [c["label"] for c in body_colors]
 
-    if body_labels[0] != body_labels[1]:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"body_color_inconsistent: front images disagree "
-                f"({body_labels[0]} vs {body_labels[1]}), retake photos"
-            ),
-        )
-    # Both agree — pick highest confidence reading
-    body_color = max(body_colors, key=lambda c: c["confidence"])
+    if body_labels[0] == body_labels[1]:
+        # Both agree — pick highest confidence reading
+        body_color = max(body_colors, key=lambda c: c["confidence"])
+    else:
+        body_color = _resolve_disagreeing_body_colors(body_colors)
 
     muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
     muzzle_labels = [c["label"] for c in muzzle_colors]
