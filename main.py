@@ -20,12 +20,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, NoReturn
 
 import cv2
 import numpy as np
 import torch
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 
 from cctv.database import init_db as init_cctv_db
 from cctv.routes import router as cctv_router
@@ -54,9 +55,15 @@ from pipeline.muzzle_detect import load_muzzle_detector, warmup_muzzle_detector
 from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
 from schema import (
     CandidateInfo,
+    ColorInconsistencyDetail,
+    ColorReading,
     ColorResult,
+    DuplicateDetail,
+    ErrorCode,
     ExtractedColors,
     HealthResponse,
+    ImageFailure,
+    ImageQualityDetail,
     MatchCandidate,
     RegisterResponse,
     SearchResponse,
@@ -69,6 +76,73 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("godhaar.server")
+
+
+# ── Error contract ────────────────────────────────────────────────────────────
+
+
+class InferenceError(Exception):
+    """A deliberate rejection, carrying a machine-readable code.
+
+    Raised instead of HTTPException wherever this server is making a judgement
+    about the images or the animal. The distinction is load-bearing: a plain
+    HTTPException still produces FastAPI's {"detail": ...}, which the API server
+    reads as "we disagree about the contract" and alerts on. So bad input from
+    the caller stays an HTTPException, while anything the user could act on
+    becomes an InferenceError.
+
+    Safe to raise from inside asyncio.to_thread — it is re-raised on the
+    awaiting coroutine, where the handler below picks it up.
+    """
+
+    def __init__(self, status_code: int, error_code: ErrorCode, detail: Any = None):
+        self.status_code = status_code
+        self.error_code = error_code
+        self.detail = detail if detail is not None else {}
+        super().__init__(f"{error_code.value} ({status_code})")
+
+
+def _quality_error_code(reason: str) -> ErrorCode:
+    """Map a pipeline quality/detection reason onto a wire code.
+
+    The reason strings come from pipeline/quality.py and pipeline/yolo_crop.py
+    and carry measured values ("bad_quality blur=12.30"), so they are matched by
+    prefix. An unrecognised reason falls back to the generic code rather than
+    inventing a specific instruction the user cannot act on.
+    """
+    if reason.startswith("RECAPTURE_NO_DETECTION"):
+        return ErrorCode.NO_ANIMAL_DETECTED
+    if "blur=" in reason:
+        return ErrorCode.IMAGE_TOO_BLURRY
+    if "exposure=" in reason:
+        return ErrorCode.IMAGE_BAD_EXPOSURE
+    if "short=" in reason:
+        return ErrorCode.IMAGE_TOO_SMALL
+    if reason in ("cannot_decode_image", "empty_image"):
+        return ErrorCode.IMAGE_UNREADABLE
+    return ErrorCode.POOR_IMAGE_QUALITY
+
+
+def _raise_image_failures(failures: list[ImageFailure]) -> NoReturn:
+    """Raise a 422 describing every failed image at once.
+
+    The top-level code is the shared one when all the images failed the same
+    way, so the app can give precise advice ("hold the camera steadier"). Mixed
+    causes collapse to POOR_IMAGE_QUALITY, with the specifics preserved per
+    image in detail.failures — the caller still has everything it needs to
+    highlight individual photos.
+    """
+    codes = {f.error_code for f in failures}
+    top_code = codes.pop() if len(codes) == 1 else ErrorCode.POOR_IMAGE_QUALITY
+
+    raise InferenceError(
+        status_code=422,
+        error_code=top_code,
+        detail=ImageQualityDetail(
+            message="; ".join(f"{f.slot}: {f.reason}" for f in failures),
+            failures=failures,
+        ).model_dump(),
+    )
 
 
 @asynccontextmanager
@@ -163,6 +237,20 @@ app = FastAPI(
 app.include_router(cctv_router)
 
 
+@app.exception_handler(InferenceError)
+async def _inference_error_handler(request: Request, exc: InferenceError) -> JSONResponse:
+    """Render a deliberate rejection as {"error_code": ..., "detail": {...}}.
+
+    error_code sits at the top level rather than nested inside detail so it can
+    be read without knowing the shape of detail, which varies per code.
+    """
+    log.info(f"{request.url.path} {exc.status_code} {exc.error_code.value}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error_code": exc.error_code.value, "detail": exc.detail},
+    )
+
+
 @app.post("/register", response_model=RegisterResponse, status_code=201)
 async def register(
     muzzle_images: list[UploadFile] = File(...),
@@ -197,6 +285,17 @@ async def register(
     409 — duplicate muzzle detected, not stored
     422 — bad input (wrong image count, quality failure, no detection)
     500 — FAISS or internal system failure
+
+    Error bodies
+    ------------
+    Rejections this server decides on (409, and 422s about the photos) carry
+    {"error_code": ..., "detail": {...}} — see schema.ErrorCode. A 409 always
+    includes detail.matched_faiss_id so the caller can name the animal being
+    duplicated.
+
+    Failures caused by the caller sending the wrong thing — image counts,
+    malformed candidates — keep FastAPI's plain {"detail": ...} with no
+    error_code, which is how the API server tells the two cases apart.
     """
     if len(muzzle_images) != 3:
         raise HTTPException(
@@ -298,13 +397,15 @@ async def register(
                     f"body={new_body} muzzle={new_muzzle} | "
                     f"matched_faiss_id={match.faiss_id}"
                 )
-                raise HTTPException(
+                raise InferenceError(
                     status_code=409,
-                    detail={
-                        "error": "duplicate_muzzle",
-                        "top_score": match.score,
-                        "matched_faiss_id": match.faiss_id,
-                    },
+                    error_code=ErrorCode.DUPLICATE_ANIMAL,
+                    detail=DuplicateDetail(
+                        matched_faiss_id=match.faiss_id,
+                        top_score=match.score,
+                        body_color=new_body,
+                        muzzle_color=new_muzzle,
+                    ).model_dump(),
                 )
 
     # ── Store in FAISS ────────────────────────────────────────────────────
@@ -382,14 +483,24 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
         labels = " vs ".join(
             f"{c['label']}({c['confidence']:.2f})" for c in body_colors
         )
-        detail = (
+        message = (
             "body_color_inconsistent: front images disagree and neither is "
             "decisive"
             if not confident
             else "body_color_inconsistent: front images give conflicting "
                  "confident readings"
         )
-        raise HTTPException(status_code=422, detail=f"{detail} ({labels}), retake photos")
+        raise InferenceError(
+            status_code=422,
+            error_code=ErrorCode.BODY_COLOR_INCONSISTENT,
+            detail=ColorInconsistencyDetail(
+                message=f"{message} ({labels})",
+                readings=[
+                    ColorReading(slot=f"front_{n}", label=c["label"], confidence=c["confidence"])
+                    for n, c in enumerate(body_colors, 1)
+                ],
+            ).model_dump(),
+        )
 
     winner = dict(confident[0])
     loser = next(c for c in body_colors if c is not confident[0])
@@ -431,29 +542,40 @@ def _run_registration_pipeline(
     # one retake at a time (each retake is a full network round trip). Each
     # image still stops at its OWN first failure (quality, then detection,
     # then crop-quality) — only the across-images fail-fast was removed.
-    errors: list[str] = []
+    failures: list[ImageFailure] = []
     cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     for i, mb in enumerate(muzzle_bytes, 1):
+        slot = f"muzzle_{i}"
+
         status, reason = quality_check(mb)
         if status != "GOOD":
-            errors.append(f"muzzle_{i}: {reason}")
+            failures.append(ImageFailure(
+                slot=slot, stage="quality",
+                error_code=_quality_error_code(reason), reason=reason,
+            ))
             continue
 
         img_bgr = _decode_image(mb)
         crop, det_status, _det_conf = crop_cattle(img_bgr)
         if crop is None:
-            errors.append(f"muzzle_{i}: {det_status}")
+            failures.append(ImageFailure(
+                slot=slot, stage="detection",
+                error_code=_quality_error_code(det_status), reason=det_status,
+            ))
             continue
 
         crop_status, crop_reason = quality_check_cv2(crop)
         if crop_status != "GOOD":
-            errors.append(f"muzzle_{i}_crop: {crop_reason}")
+            failures.append(ImageFailure(
+                slot=slot, stage="crop_quality",
+                error_code=_quality_error_code(crop_reason), reason=crop_reason,
+            ))
             continue
 
         cropped_images[i - 1] = crop
 
-    if errors:
-        raise HTTPException(status_code=422, detail="; ".join(errors))
+    if failures:
+        _raise_image_failures(failures)
 
     # ── Embed (batched forward pass) ─────────────────────────────────────
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
@@ -486,12 +608,19 @@ def _run_registration_pipeline(
 
     if majority_count < 2:
         # All 3 different — no majority
-        raise HTTPException(
+        raise InferenceError(
             status_code=422,
-            detail=(
-                f"muzzle_color_inconsistent: no majority among crops "
-                f"({', '.join(muzzle_labels)}), retake photos"
-            ),
+            error_code=ErrorCode.MUZZLE_COLOR_INCONSISTENT,
+            detail=ColorInconsistencyDetail(
+                message=(
+                    f"muzzle_color_inconsistent: no majority among crops "
+                    f"({', '.join(muzzle_labels)})"
+                ),
+                readings=[
+                    ColorReading(slot=f"muzzle_{n}", label=c["label"], confidence=c["confidence"])
+                    for n, c in enumerate(muzzle_colors, 1)
+                ],
+            ).model_dump(),
         )
     # Majority found — use avg confidence of agreeing images
     agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
@@ -633,18 +762,27 @@ def _run_search_pipeline(
     if q_status != "GOOD":
         log.error(f"Quality status: {q_status}")
         log.error(f"Quality reason: {q_reason}")
-        raise HTTPException(status_code=422, detail=q_reason)
+        _raise_image_failures([ImageFailure(
+            slot="muzzle", stage="quality",
+            error_code=_quality_error_code(q_reason), reason=q_reason,
+        )])
 
     img_bgr = _decode_image(muzzle_bytes)
     crop, det_status, _det_conf = crop_cattle(img_bgr)
     if crop is None:
         log.error(f"Crop: {crop} | Det Status: {det_status} | Det conf: {_det_conf}")
-        raise HTTPException(status_code=422, detail=det_status)
+        _raise_image_failures([ImageFailure(
+            slot="muzzle", stage="detection",
+            error_code=_quality_error_code(det_status), reason=det_status,
+        )])
 
     crop_status, crop_reason = quality_check_cv2(crop)
     if crop_status != "GOOD":
         log.error(f"Crop Status: {crop_status} | Crop reason: {crop_reason}")
-        raise HTTPException(status_code=422, detail=f"muzzle_crop: {crop_reason}")
+        _raise_image_failures([ImageFailure(
+            slot="muzzle", stage="crop_quality",
+            error_code=_quality_error_code(crop_reason), reason=crop_reason,
+        )])
 
     crop_bytes = cv2.imencode(".jpg", crop)[1].tobytes()
     embedding = embed_batch([crop_bytes], model, device)  # (1, 256)
