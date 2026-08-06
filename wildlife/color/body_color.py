@@ -10,12 +10,22 @@ try:
     from . import color_constants as C
     from .quality import check_roi_quality
     from .roi import get_body_roi
-    from .utils import bgr_to_lab, calculate_median_lab, extract_dominant_lab_features
+    from .utils import (
+        aggregate_clusters_by_label,
+        bgr_to_lab,
+        calculate_median_lab,
+        extract_dominant_lab_features,
+    )
 except ImportError:
     import color_constants as C
     from quality import check_roi_quality
     from roi import get_body_roi
-    from utils import bgr_to_lab, calculate_median_lab, extract_dominant_lab_features
+    from utils import (
+        aggregate_clusters_by_label,
+        bgr_to_lab,
+        calculate_median_lab,
+        extract_dominant_lab_features,
+    )
 
 
 def _classify_lab(lab: list[float]) -> str:
@@ -60,7 +70,8 @@ def classify_body_color(img_bgr: np.ndarray) -> dict:
         Unified API contract containing label, confidence, method, reason,
         and raw LAB statistics.
     """
-    # 1. Bounding box ROI
+    # 1. Bounding box ROI — YOLO-localized when available, else a
+    # fixed-percentage center crop.
     roi = get_body_roi(img_bgr)
 
     # 2. Quality Gate check
@@ -69,7 +80,7 @@ def classify_body_color(img_bgr: np.ndarray) -> dict:
         return {
             "label": C.LABEL_UNKNOWN,
             "confidence": 0.0,
-            "method": "LAB_HISTOGRAM_V1",
+            "method": "LAB_KMEANS_V2",
             "reason": f"LOW_QUALITY: {quality_reason}",
             "median_lab": [0.0, 0.0, 0.0],
             "dominant_lab": [0.0, 0.0, 0.0],
@@ -86,41 +97,48 @@ def classify_body_color(img_bgr: np.ndarray) -> dict:
     features = extract_dominant_lab_features(img_lab)
     dominant_lab = features["dominant_lab"]
 
-    # 6. Apply classification rules
-    primary_label = _classify_lab(dominant_lab)
+    # 6. Classify every cluster and sum weights per label, so a coat split
+    # across several lighting clusters is scored as one color. Peripheral
+    # clusters are dropped as scene rather than animal.
+    ranked = aggregate_clusters_by_label(
+        features["clusters"],
+        _classify_lab,
+        centrality_ratio_min=C.SPOTTED_CENTRALITY_RATIO_MIN,
+    )
+    if not ranked:
+        return {
+            "label": C.LABEL_UNKNOWN,
+            "confidence": 0.0,
+            "method": "LAB_KMEANS_V2",
+            "reason": "NO_COLOR_CLUSTERS",
+            "median_lab": median_lab,
+            "dominant_lab": dominant_lab,
+        }
 
-    # 7. Check for Spotted/Mixed coats (Multimodal peak check)
-    if features["peak_ratio"] >= C.SPOTTED_RATIO_MIN:
-        # Determine if the secondary peak represents a different color class
-        # To simulate secondary peak, perturb dominant LAB based on a*-b* direction offsets
-        # If the primary label is Black/Grey and secondary represents White, or vice versa,
-        # we mark it as SPOTTED.
-        # For simplicity, if primary is BLACK or BROWN and it's multimodal, we tend to classify
-        # as SPOTTED when the overall contrast or lightness variance is high.
-        h, w = img_lab.shape[:2]
-        gray_roi = cv2.cvtColor(blurred_roi, cv2.COLOR_BGR2GRAY)
-        std_dev = gray_roi.std()
-        if std_dev > 25.0:  # High local contrast implies spotted pattern
-            label = C.LABEL_SPOTTED
-        else:
-            label = primary_label
-    else:
-        label = primary_label
+    primary_label, primary_weight = ranked[0]
+    runner_up_weight = ranked[1][1] if len(ranked) > 1 else 0.0
 
-    # Adjust confidence mathematically:
-    # Scale based on how clearly the dominant color stands out
-    confidence = features["confidence"]
-    # Adjust for neutral margins
+    # 7. Spotted coats — a second color class holding a comparable share of
+    # the animal, not merely a present one. Nearly every real animal shows
+    # some second color (a blaze, a sock, an ear), so requiring only that one
+    # exists labels almost everything SPOTTED. Requiring the two to be
+    # genuinely comparable reserves SPOTTED for actually two-tone coats.
+    label = primary_label
+    if primary_weight > 0 and runner_up_weight / primary_weight >= C.SPOTTED_RATIO_MIN:
+        label = C.LABEL_SPOTTED
+
+    # Confidence: the winning color's share of the sampled coat.
+    confidence = primary_weight / sum(w for _, w in ranked) if ranked else 0.0
+    # A coat sitting right on the neutral/chromatic boundary could go either
+    # way on the next photo — say so rather than reporting false certainty.
     chroma = math.sqrt(dominant_lab[1]**2 + dominant_lab[2]**2)
-    neutral_dist = abs(chroma - C.NEUTRAL_THRESHOLD)
-    # If it is extremely close to the neutral boundary, reduce confidence
-    if neutral_dist < 3.0:
+    if abs(chroma - C.NEUTRAL_THRESHOLD) < 3.0:
         confidence *= 0.7
 
     return {
         "label": label,
         "confidence": round(float(np.clip(confidence, 0.0, 1.0)), 4),
-        "method": "LAB_HISTOGRAM_V1",
+        "method": "LAB_KMEANS_V2",
         "reason": "OK",
         "median_lab": median_lab,
         "dominant_lab": dominant_lab,

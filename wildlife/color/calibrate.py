@@ -61,7 +61,8 @@ def main():
             if img is None:
                 continue
 
-            # Extract central ROI
+            # Extract body ROI (YOLO-localized when available, else
+            # fixed-percentage center crop)
             roi = get_body_roi(img)
             if roi is None or roi.size == 0:
                 continue

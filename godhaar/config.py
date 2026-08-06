@@ -6,6 +6,8 @@ Business logic thresholds (MATCH_THRESHOLD, REVIEW_THRESHOLD, GPS bonuses,
 COLOR_MISMATCH_PENALTY, etc.) belong in the API server, NOT here.
 """
 
+import os
+
 # ── Model & Preprocessing ────────────────────────────────────────────────────
 IMG_SIZE = 518                                  # DINOv2 ViT-B/14 native resolution
 IMG_MEAN = (0.485, 0.456, 0.406)                # ImageNet mean
@@ -25,6 +27,17 @@ YOLO_INTERNAL_CONF = 0.10                       # passed to YOLO inference — m
                                                 # before filtering. YOLO default (0.25) silently
                                                 # drops dark-cattle detections we need to see.
 MIN_BBOX_AREA_PCT  = 0.05                       # bbox must be ≥5% of image area
+# ── Muzzle detector (color sampling only, NOT the embedding path) ────────────
+# Single-class YOLOv8n (`cattle_muzzle_3`) exported to TFLite — the same
+# weights the Telangana Android app ships in its assets. Used to localize the
+# muzzle before reading its color; without it, muzzle color is sampled from
+# the center of the whole-animal crop, i.e. the coat. See
+# pipeline/muzzle_detect.py. `appstorage/` is gitignored, so this file must be
+# placed on the deployment volume alongside the other models.
+MUZZLE_MODEL_PATH  = os.getenv(
+    "MUZZLE_MODEL_PATH", "appstorage/Models/muzzle_detect/best_float16.tflite"
+)
+MUZZLE_DETECT_CONF = 0.30                       # measured 0.82–0.91 on real field photos
 MAX_CATTLE_PER_IMAGE = 1                        # reject multi-cattle images
 CROP_PADDING_PX    = 10                         # pixels to pad around detection box
 DOMINANT_AREA_RATIO = 3.0                       # if top box is >=3x larger than next,

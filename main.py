@@ -42,6 +42,7 @@ from pipeline.color import RuleBasedColorExtractor
 from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
 from pipeline.quality import quality_check, quality_check_cv2
+from pipeline.muzzle_detect import load_muzzle_detector, warmup_muzzle_detector
 from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
 from schema import (
     CandidateInfo,
@@ -109,12 +110,19 @@ async def lifespan(app: FastAPI):
     yolo_path = os.getenv("YOLO_MODEL_PATH", None)
     load_yolo(yolo_path)
 
+    # 5b. Load the muzzle detector — localizes the muzzle before its color is
+    #     read. Optional: if absent, muzzle color degrades to a fixed center
+    #     crop of the whole-animal box (i.e. reads coat, not muzzle) but the
+    #     service still serves. See pipeline/muzzle_detect.py.
+    load_muzzle_detector()
+
     # 6. Warmup — run dummy inference through both models
     log.info("Running warmup inference...")
     dummy = torch.randn(1, 3, 518, 518, device=device)
     with torch.inference_mode():
         model(dummy)
     warmup_yolo()
+    warmup_muzzle_detector()
     log.info("Warmup complete.")
 
     elapsed = time.monotonic() - start
@@ -384,7 +392,7 @@ def _run_registration_pipeline(
     avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
     muzzle_color = {"label": majority_label, "confidence": avg_conf}
 
-    # ── Morphology (horn/ear proportions) — return-only, not a gate ───────
+    # ── Morphology (horn/e ar proportions) — return-only, not a gate ───────
     # Unlike color, there's no majority/consistency check here: this is a
     # continuous, unvalidated heuristic (see pipeline/morphology.py), not a
     # categorical label, so "the 2 photos disagree" isn't a retake-worthy

@@ -11,8 +11,19 @@ except ImportError:
     import color_constants as C
 
 
-def check_roi_quality(roi: np.ndarray) -> tuple[bool, str]:
+def check_roi_quality(
+    roi: np.ndarray,
+    min_width: int | None = None,
+    min_height: int | None = None,
+) -> tuple[bool, str]:
     """Perform image quality checks on the BGR Region of Interest (ROI).
+
+    Parameters
+    ----------
+    min_width, min_height : int, optional
+        Override the default minimum ROI size. A detector-localized ROI is
+        legitimately smaller than a fixed crop of the whole frame — see
+        MIN_MUZZLE_ROI_WIDTH in color_constants.py.
 
     Returns
     -------
@@ -24,11 +35,14 @@ def check_roi_quality(roi: np.ndarray) -> tuple[bool, str]:
     if roi is None or roi.size == 0:
         return False, "EMPTY_ROI"
 
+    min_w = C.MIN_ROI_WIDTH if min_width is None else min_width
+    min_h = C.MIN_ROI_HEIGHT if min_height is None else min_height
+
     h, w = roi.shape[:2]
 
     # 1. Size Check
-    if w < C.MIN_ROI_WIDTH or h < C.MIN_ROI_HEIGHT:
-        return False, f"ROI_TOO_SMALL: {w}x{h} (min {C.MIN_ROI_WIDTH}x{C.MIN_ROI_HEIGHT})"
+    if w < min_w or h < min_h:
+        return False, f"ROI_TOO_SMALL: {w}x{h} (min {min_w}x{min_h})"
 
     # Convert to Grayscale for checks
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)

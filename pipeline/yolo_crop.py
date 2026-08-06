@@ -172,6 +172,51 @@ def _run_yolo(
     return boxes
 
 
+def detect_primary_animal(img: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+    """Detect the primary animal's box, for body-color ROI localization only.
+
+    Unlike crop_cattle() (the muzzle-embedding path), this does NOT enforce
+    MAX_CATTLE_PER_IMAGE: a real field/goshala photo often has other cattle
+    in the background, and refusing to read the subject's coat color because
+    a neighbor is also in frame would be wrong for this use case (the
+    single-animal constraint exists so muzzle embeddings aren't ambiguous
+    about which animal they represent — that reasoning doesn't apply to
+    localizing where to sample body color). Among all detected boxes, the
+    LARGEST one by area is taken as the subject — not the highest-confidence
+    one — since the photographed animal is normally closest to the camera
+    and fills more of the frame than anything in the background.
+
+    Uses only the first two (cheapest) detection attempts from crop_cattle's
+    ladder — this is a "nice to have" ROI improvement, not a hard gate, so
+    callers should fall back to a non-localized crop on a None return rather
+    than pay for the expensive imgsz=1280/TTA retries.
+
+    Returns
+    -------
+    (x1, y1, x2, y2) of the largest detected box, or None if no cattle-like
+    animal was detected or the model isn't loaded.
+    """
+    if img is None or img.size == 0 or _yolo_model is None:
+        return None
+
+    h, w = img.shape[:2]
+    img_area = h * w
+
+    boxes = _run_yolo(img, img_area)
+    if len(boxes) == 0:
+        boxes = _run_yolo(_enhance_for_detection(img), img_area)
+
+    if len(boxes) == 0:
+        return None
+
+    def _area(box: tuple[float, int, int, int, int]) -> int:
+        _, bx1, by1, bx2, by2 = box
+        return max(0, bx2 - bx1) * max(0, by2 - by1)
+
+    _, x1, y1, x2, y2 = max(boxes, key=_area)
+    return x1, y1, x2, y2
+
+
 def crop_cattle(
     img: np.ndarray, no_crop: bool = False
 ) -> tuple[Optional[np.ndarray], str, float]:

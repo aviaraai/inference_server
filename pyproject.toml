@@ -15,6 +15,10 @@ dependencies = [
     "timm==1.0.27",
     "opencv-python-headless==4.13.0.92",
     "ultralytics==8.4.83",
+    # TFLite backend for the muzzle detector (pipeline/muzzle_detect.py).
+    # ultralytics auto-installs this on first use, but that needs network and
+    # a writable env — neither is guaranteed in the container, so pin it here.
+    "ai-edge-litert==2.1.6",
     "python-multipart==0.0.32",
 ]
 

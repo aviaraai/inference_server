@@ -26,6 +26,29 @@ except ImportError:
     from .muzzle_color import classify_muzzle_color
 
 
+def _field_scene(coat_bgr, bg_bgr, coat_frac=0.40, patch_bgr=None, size=600, seed=0):
+    """Build a synthetic photo shaped like a real field capture.
+
+    The coat deliberately occupies a MINORITY of the frame against a
+    contrasting background. This matters: a naive test image where the coat
+    fills most of the frame passes even against the old buggy classifier and
+    therefore proves nothing. The bugs these tests cover only reproduce when
+    the animal is a minority of the frame, which is the normal case in real
+    field photos (see get_body_roi / the center-crop fallback).
+    """
+    rs = np.random.RandomState(seed)
+    img = np.zeros((size, size, 3), np.uint8)
+    img[:, :] = bg_bgr
+    side = int(size * coat_frac)
+    off = (size - side) // 2
+    img[off:off + side, off:off + side] = coat_bgr
+    if patch_bgr is not None:
+        # A patch ON the animal (upper half of the coat block), i.e. a real
+        # two-tone coat rather than a differently-colored background.
+        img[off:off + side // 2, off:off + side] = patch_bgr
+    return np.clip(img.astype(np.int16) + rs.randint(-12, 12, (size, size, 3)), 0, 255).astype(np.uint8)
+
+
 class TestColorContract(unittest.TestCase):
     """Sanity checks to ensure classification functions conform to the API contract."""
 
@@ -35,7 +58,7 @@ class TestColorContract(unittest.TestCase):
         noise = np.random.randint(-30, 30, size=(400, 400, 3))
         img = (np.ones((400, 400, 3), dtype=np.uint8) * 128).astype(np.int16)
         img = np.clip(img + noise, 0, 255).astype(np.uint8)
-        
+
         result = classify_body_color(img)
 
         # Check fields
@@ -46,9 +69,153 @@ class TestColorContract(unittest.TestCase):
         self.assertIn("median_lab", result)
         self.assertIn("dominant_lab", result)
 
-        self.assertEqual(result["method"], "LAB_HISTOGRAM_V1")
+        self.assertEqual(result["method"], "LAB_KMEANS_V2")
         self.assertEqual(result["label"], C.LABEL_GREY)
         self.assertEqual(result["reason"], "OK")
+
+
+class TestBodyColorRegressions(unittest.TestCase):
+    """Regressions for the "white/brown animal classified BLACK" field bug.
+
+    Root cause was two independent defects in the dominant-color extractor:
+
+    1. It returned a HISTOGRAM BIN CENTER as the dominant color rather than a
+       real measurement. The neutral point sat on a bin EDGE, so every
+       near-neutral coat landed in the bin centered at (+8, +8) and reported
+       an identical fabricated chroma of 11.3 whatever its true color. That
+       also put chroma permanently below NEUTRAL_THRESHOLD (15), making BROWN
+       unreachable for any animal.
+    2. Peak-finding ran over a*/b* only, ignoring L*. A black coat and a
+       white coat are both achromatic, so they shared a bin and had their
+       lightness values median-ed together — and that merged lightness is
+       what decided BLACK vs WHITE.
+
+    EVERY test in this class fails against the pre-fix implementation.
+    """
+
+    def test_dominant_color_is_a_real_measurement_not_a_bin_center(self):
+        """Different-colored coats must not report identical chromaticity."""
+        white = classify_body_color(_field_scene((235, 235, 235), (45, 45, 45)))
+        brown = classify_body_color(_field_scene((40, 80, 145), (128, 128, 128)))
+
+        white_ab = tuple(white["dominant_lab"][1:])
+        brown_ab = tuple(brown["dominant_lab"][1:])
+        self.assertNotEqual(
+            white_ab, brown_ab,
+            "white and brown coats reported identical chromaticity — the "
+            "dominant color is a fabricated bin center, not a measurement",
+        )
+        # The old code pinned every near-neutral coat to exactly (+8, +8).
+        self.assertNotEqual(white_ab, (8.0, 8.0))
+
+    def test_white_coat_on_dark_background_is_not_black(self):
+        """The exact reported failure: a white animal came back BLACK."""
+        result = classify_body_color(_field_scene((235, 235, 235), (45, 45, 45)))
+        self.assertEqual(result["label"], C.LABEL_WHITE)
+
+    def test_black_coat_on_bright_background_is_not_white(self):
+        """The same defect in the opposite direction."""
+        result = classify_body_color(_field_scene((30, 30, 30), (210, 210, 210)))
+        self.assertEqual(result["label"], C.LABEL_BLACK)
+
+    def test_brown_is_reachable(self):
+        """BROWN was unreachable: fabricated chroma never exceeded NEUTRAL_THRESHOLD."""
+        result = classify_body_color(_field_scene((40, 80, 145), (128, 128, 128)))
+        self.assertEqual(result["label"], C.LABEL_BROWN)
+
+    def test_coat_color_survives_a_colored_background(self):
+        """Foliage/soil behind the animal must not become the reported coat color."""
+        result = classify_body_color(_field_scene((235, 235, 235), (60, 110, 50)))
+        self.assertEqual(result["label"], C.LABEL_WHITE)
+
+    def test_genuinely_two_tone_coat_is_still_spotted(self):
+        """Control: the fix must not work by simply disabling SPOTTED.
+
+        A patch ON the animal (not a differently-colored background) must
+        still classify as SPOTTED. The old code got this backwards too,
+        reporting a solid color for a genuinely two-tone coat.
+        """
+        result = classify_body_color(
+            _field_scene((240, 240, 240), (70, 70, 70), patch_bgr=(25, 25, 25))
+        )
+        self.assertEqual(result["label"], C.LABEL_SPOTTED)
+
+    def test_classification_is_deterministic(self):
+        """/register rejects (422) when two front photos disagree on body color.
+
+        The classifier clusters pixels, so it must be seeded — an unseeded
+        RNG would make the same animal fail registration at random.
+        """
+        img = _field_scene((235, 235, 235), (45, 45, 45), seed=7)
+        results = [classify_body_color(img) for _ in range(5)]
+        self.assertEqual(len({r["label"] for r in results}), 1)
+        self.assertEqual(len({tuple(r["dominant_lab"]) for r in results}), 1)
+        self.assertEqual(len({r["confidence"] for r in results}), 1)
+
+
+class TestMuzzleColorRegressions(unittest.TestCase):
+    """Regressions for muzzle color.
+
+    Two defects, both distinct from the body-color bugs:
+
+    1. The ROI was never localized on the muzzle. main.py passes
+       crop_cattle()'s WHOLE-ANIMAL box to extract_muzzle(), and the old
+       get_muzzle_roi() took a fixed center crop of it — i.e. the animal's
+       neck/chest. On real photos of a brown-hided cow this reported PINK for
+       an obviously black muzzle, because it was measuring coat.
+    2. _classify_muzzle_lab() returned MIXED as its catch-all for a SINGLE
+       color sample. MIXED describes a muzzle carrying two skin colors, which
+       is a property of the whole muzzle — one cluster is one color. The
+       phantom "MIXED color" then outvoted the real reading.
+    """
+
+    def test_single_sample_is_never_classified_mixed(self):
+        """MIXED is an aggregate outcome and must never label one color sample."""
+        from muzzle_color import _classify_muzzle_lab
+
+        # Sweep the LAB space a real muzzle can occupy.
+        for l in range(0, 101, 5):
+            for a in range(-20, 41, 5):
+                for b in range(-20, 41, 5):
+                    self.assertNotEqual(
+                        _classify_muzzle_lab([float(l), float(a), float(b)]),
+                        C.LABEL_MIXED,
+                        f"single sample [{l},{a},{b}] classified MIXED",
+                    )
+
+    def test_dark_muzzle_with_lighter_lip_is_black_not_mixed(self):
+        """A black nose pad whose lower lip is lighter is still a BLACK muzzle."""
+        rs = np.random.RandomState(3)
+        img = np.zeros((300, 300, 3), np.uint8)
+        img[:, :] = (38, 36, 40)            # dark nose pad
+        img[220:, :] = (120, 110, 135)      # lighter lower lip
+        img = np.clip(img.astype(np.int16) + rs.randint(-14, 14, (300, 300, 3)), 0, 255).astype(np.uint8)
+
+        self.assertEqual(classify_muzzle_color(img)["label"], C.LABEL_BLACK)
+
+    def test_genuinely_two_tone_muzzle_is_still_mixed(self):
+        """Control: MIXED must remain reachable for a real two-color muzzle."""
+        rs = np.random.RandomState(4)
+        img = np.zeros((300, 300, 3), np.uint8)
+        img[:150, :] = (35, 33, 37)         # black half
+        img[150:, :] = (150, 140, 225)      # pink half
+        img = np.clip(img.astype(np.int16) + rs.randint(-14, 14, (300, 300, 3)), 0, 255).astype(np.uint8)
+
+        self.assertEqual(classify_muzzle_color(img)["label"], C.LABEL_MIXED)
+
+    def test_muzzle_classification_is_deterministic(self):
+        """Same reasoning as the body-color determinism test."""
+        rs = np.random.RandomState(5)
+        img = np.clip(
+            np.full((300, 300, 3), 40, np.int16) + rs.randint(-14, 14, (300, 300, 3)), 0, 255
+        ).astype(np.uint8)
+        results = [classify_muzzle_color(img) for _ in range(5)]
+        self.assertEqual(len({r["label"] for r in results}), 1)
+        self.assertEqual(len({tuple(r["dominant_lab"]) for r in results}), 1)
+
+
+class TestColorQualityAndMuzzle(unittest.TestCase):
+    """Quality-gate and muzzle contract checks."""
 
     def test_body_color_quality_gate(self):
         # Create a tiny 50x50 image which should fail size check

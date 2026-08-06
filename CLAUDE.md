@@ -127,6 +127,228 @@ Two gotchas this caused (two different black cows wrongly merged):
   black cows still clear 0.80 — if so, this threshold (and/or the color gate)
   needs revisiting, not just the crop.
 
+## ⚠️ Fixed: body color returned BLACK for white/brown animals (the "dominant color" was fabricated)
+
+Reported live twice: a **white Ongole-type bull** classified `BLACK`, and a
+**brown-and-white Gir cow** classified `BLACK` on *both* its front photos.
+Root cause was **not** photo quality — it was two independent defects in
+`wildlife/color/utils.py::extract_dominant_lab_features`, the helper shared by
+`body_color.py` **and** `muzzle_color.py`:
+
+1. **The "dominant color" was a histogram bin center, not a measurement.** It
+   binned the a*/b* channels 16 wide and returned the **bin center** as
+   `dominant_lab`. The neutral point (128) sits on a bin **edge**, so every
+   near-neutral (grey/black/white) coat landed in the bin centered at
+   `(+8, +8)` — a fabricated chroma of **11.3 regardless of the real color**.
+   Verified on real photos: 4 different animals all returned the *identical*
+   chromaticity `(+8.0, +8.0)`, and the two reported Gir photos returned
+   byte-identical `dominant_lab = [32.94, 8.0, 8.0]`. Because 11.3 is
+   permanently below `NEUTRAL_THRESHOLD` (15), **`BROWN` was literally
+   unreachable for any animal.**
+2. **Peak-finding ignored L\* entirely** — the histogram was 2D over a*/b*
+   only. A black coat and a white coat are both achromatic, so they shared a
+   bin and had their lightness values **median-ed together**; that merged
+   lightness is what then decided BLACK vs WHITE. This is the direct mechanism
+   for the reported bug: a white animal against dark ground/shadow gets its
+   lightness dragged down and comes back BLACK.
+
+**Compounding:** `get_body_roi()` cropped a fixed percentage of the **frame**
+center, not the animal — so most sampled pixels could be background/shadow
+even before the algorithm ran.
+
+### What the fix actually required (three layers, each found by testing the previous one)
+
+Replacing the histogram with k-means was **necessary but not sufficient**.
+Each layer below was added only after measuring that the previous one still
+got real photos wrong — worth knowing before "simplifying" any of it away:
+
+1. **k-means over full L\*a\*b\*** (`_kmeans_lab`, k=4, k-means++ init, pure
+   numpy — sklearn is not a dependency here). Returns each cluster's **real
+   centroid**. Fixes both defects above. **Fixed RNG seed (42) is mandatory,
+   not cosmetic:** `/register` 422s when two front photos disagree on body
+   color, so an unseeded clusterer would fail registrations at random.
+   Verified deterministic across repeated runs (label, LAB and confidence all
+   identical).
+2. **Animal localization** (`roi.py`). k-means alone
+   still returned the *background's* color, because "largest cluster" **is**
+   the background when the animal is a minority of the frame. `get_body_roi`
+   now crops to a YOLO-detected animal box.
+   Detection uses a **new `detect_primary_animal()`** in `pipeline/yolo_crop.py`,
+   deliberately *not* `crop_cattle()`: that enforces `MAX_CATTLE_PER_IMAGE=1`,
+   which is right for muzzle embedding but wrong here — a goshala photo
+   routinely has other animals in frame, and that is no reason to refuse to
+   read the subject's coat. It picks the **largest** box, not the
+   highest-confidence one (the photographed animal is nearest the camera).
+   When localization is unavailable (YOLO not loaded, `pipeline/` not
+   importable, or no detection) it falls back to the old fixed center crop.
+   A **center-weighted spatial prior** is applied either way, so a centered
+   subject isn't outvoted by peripheral background.
+3. **Aggregate cluster weights BY LABEL, not by cluster**
+   (`aggregate_clusters_by_label`). Clustering over L\* means one perceptual
+   color **fragments across several clusters** that differ only in lighting.
+   Measured on the real Gir photo: the coat split into `BROWN 0.29` +
+   `BROWN 0.27` while a white blaze formed a single `0.29` cluster — so
+   "heaviest cluster" was a coin-flip the coat could *lose*. Summing per label
+   first (BROWN 0.56 vs WHITE 0.29) asks the question that actually matters.
+
+4. **`NEUTRAL_THRESHOLD` recalibrated 15.0 → 9.0 — this was the real root
+   cause of the remaining errors, and nearly got misattributed to
+   segmentation.** Measured cluster chroma on real photos:
+   genuinely achromatic (white/grey Brahman) = **0.05–7.1**; brown Gir coat =
+   **12.4–16.7**. The old 15.0 sat *inside the brown distribution*, so lit
+   parts of a brown coat fell to `GREY` and shadowed parts to `BLACK`. 9.0
+   sits in the empty gap between the two populations.
+
+### GrabCut was added, then removed — read this before re-adding it
+
+An intermediate version ran **GrabCut** foreground segmentation inside the
+YOLO box, and it looked indispensable: without it, brown animals came back
+`SPOTTED`/`BLACK` (5 of 7 real photos wrong). It was **misattribution**. The
+real cause was the `NEUTRAL_THRESHOLD` miscalibration above; GrabCut was only
+nudging cluster centroids across an arbitrary line.
+
+Two measurements exposed it, both worth repeating on any similar "essential"
+component:
+- **Cost:** ~6700 ms/image, ~50x the rest of the pipeline. At two front photos
+  per `/register` that is ~13 s of added request latency — it turned body
+  color from 59 ms to 8121 ms, a **137x regression** that no accuracy gain
+  would have justified.
+- **Non-monotonic accuracy in resolution:** 6/7 correct at 384 px but **5/7 at
+  512 px**, and 7/7 only at full resolution. A component whose accuracy is not
+  monotonic in input quality is not doing the job it appears to be doing — it
+  was landing on right answers by luck.
+
+With the threshold calibrated, GrabCut changes **no label** on the real photo
+set, so it was deleted rather than tuned. `get_body_roi()` consequently
+returns a plain `np.ndarray` again (not `(crop, mask)`), and the `mask`
+parameters were removed from `calculate_median_lab` /
+`extract_dominant_lab_features` rather than left as dead paths.
+
+**Lesson worth keeping:** the first fix that makes the numbers go green is not
+necessarily the fix. Measure cost, and check that accuracy degrades *smoothly*
+when you weaken the component — if it doesn't, you have found a coincidence,
+not a cause.
+
+**`SPOTTED`/`MIXED` detection was rebuilt on top of this**, replacing a
+`grayscale std_dev > 25` kludge that fired just as readily on a solid-colored
+animal in harsh sunlight. It now means "the runner-up **color** holds a
+comparable share of the animal." `SPOTTED_RATIO_MIN`/`MIXED_RATIO_MIN` were
+raised `0.25 → 0.60` for a measured reason: the same Gir cow gave white/brown
+ratios of **0.51 and 0.22 on its two register photos**, purely because the
+head fills more of one frame than the other. Any threshold between those two
+values labels one photo `SPOTTED` and the other `BROWN` and **trips
+/register's 422 on a perfectly good pair.**
+
+### Verified against the real reported photos (before → after)
+
+Across 8 real photos: **body 0/8 → 8/8, muzzle 4/8 → 8/8**, at 110 → 315
+ms/image for both classifiers combined (the extra is `detect_primary_animal`
+plus the muzzle detector; the 8-second GrabCut regression is gone).
+
+| photo | old body | new body | truth |
+|---|---|---|---|
+| reported Gir front1/front2 | `BLACK` | **`BROWN`** | brown |
+| white/grey Brahman calf ×2 | `BLACK` | **`GREY`** | white/grey |
+| brown Gir calf ×2 | `GREY` | **`BROWN`** | brown |
+| brown Gir wide shots ×2 | `GREY` | **`BROWN`** | brown |
+
+Both photos of each animal now agree, so `/register`'s consistency check
+passes. Verified deterministic across repeated runs (label + confidence). `wildlife/color/tests/test_color.py` gained a
+`TestBodyColorRegressions` class — **7 of its tests fail against the old
+implementation and all 10 pass against the new one**, confirmed by running the
+new suite against a pristine copy of the pre-fix module. Note the tests build
+scenes where the coat is a **minority** of the frame: a naive synthetic image
+with the coat filling most of the frame passes even on the buggy code and
+proves nothing.
+
+## ⚠️ Fixed: muzzle color was reading the COAT, not the muzzle
+
+Same report, second half: muzzle color came back `PINK` for obviously black
+muzzles. Two defects, both distinct from the body-color bugs above (though it
+also shared the fabricated-bin-center helper, fixed above):
+
+1. **The ROI was never localized on the muzzle.** `main.py` passes
+   `crop_cattle()`'s **whole-animal** box to `extract_muzzle()`, and
+   `get_muzzle_roi()` took a fixed center crop *of that box* — i.e. the
+   animal's **neck/chest**. It reported `PINK` because it was measuring brown
+   hide. No threshold change can fix measuring the wrong pixels.
+2. **`_classify_muzzle_lab()` returned `MIXED` as its catch-all for a SINGLE
+   color sample.** `MIXED` describes a muzzle carrying two skin colors — a
+   property of the whole muzzle; one cluster is one color by definition. A
+   real muzzle whose lower lip fell outside both the BLACK and PINK rules
+   contributed a phantom "MIXED color" that then outvoted the real reading and
+   mislabeled a plainly black muzzle. It now returns only `BLACK`/`PINK`/
+   `UNKNOWN`; `MIXED` is produced solely by the aggregation step when both
+   real skin colors hold comparable share. `UNKNOWN` clusters get no vote on
+   the color but **still count against confidence**, so a partly-unreadable
+   muzzle doesn't report false certainty.
+
+**The muzzle detector is now wired in** (`pipeline/muzzle_detect.py`), using
+the app's `best_float16.tflite` (single-class YOLOv8n, `cattle_muzzle_3`) via
+`YOLO(path, task="detect")`. Measured **0.82–0.91 confidence** on real field
+photos with tight boxes. `get_muzzle_roi()` crops to that box (8% inset to
+drop hair clipped at the edges) and falls back to the old fixed center crop
+when the detector is unavailable or finds nothing. **No GrabCut here**, unlike
+the body ROI — a tight muzzle box is nearly all skin, so there is no
+background to segment and running it would only risk eating real nostril/lip
+pixels.
+
+It picks the **highest-confidence** box, deliberately the opposite of
+`detect_primary_animal()`'s largest-box rule: there is exactly one muzzle on
+the subject, and a background animal nearer the camera would win on size.
+
+Deployment notes:
+- `MUZZLE_MODEL_PATH` (`godhaar/config.py`, env-overridable) defaults to
+  `appstorage/Models/muzzle_detect/best_float16.tflite`. **`appstorage/` is
+  gitignored**, so the file must be placed on the deployment volume alongside
+  the other models — it is NOT carried by a git pull.
+- `ai-edge-litert==2.1.6` added to `pyproject.toml`. `ultralytics`
+  auto-installs it on first use, but that needs network and a writable env,
+  neither guaranteed in the container.
+- Loading is **non-fatal**: a missing model logs a warning and degrades to the
+  fixed crop rather than failing startup.
+- `MIN_MUZZLE_ROI_WIDTH/HEIGHT = 64` (new) — the old 120px gate was sized for
+  a fixed crop of a whole frame and **rejected real 117×113 detector crops as
+  "too small,"** discarding the best pixels available in favour of nothing.
+
+**Verified on real photos: 8/8 muzzles correct** (was `PINK`/`MIXED`), through
+`main.py`'s exact path (`crop_cattle` → `extract_muzzle`).
+
+### Still open
+
+- **Only BLACK muzzles have been tested.** All 8 real photos available are
+  black-muzzled, so this confirms the classifier stopped reporting `PINK` for
+  black muzzles — it does **not** prove it can tell PINK from BLACK on a real
+  pink muzzle. `L_BLACK_MAX=40` and the `L>45 and a>4 → PINK` rule are still
+  the original uncalibrated guesses, **deliberately not blind-tuned** (same
+  reasoning as the blur-threshold story elsewhere in this file). Needs a
+  labeled PINK/BLACK set; synthetic tests cover both directions but synthetic
+  is not calibration.
+- **The muzzle ROI bug cannot be reproduced synthetically** — the detector
+  won't fire on a synthetic image, so the localization half of this fix is
+  covered only by real-photo verification, not by the unit suite.
+- **Every animal registered before this has wrong stored `body_color` AND
+  `muzzle_color`.** The duplicate gate (`main.py`, `stored.body_color ==
+  new_body and stored.muzzle_color == new_muzzle`) compares new correct labels
+  against old fabricated ones, so it will silently stop matching those rows
+  until they are re-extracted. Needs a backfill on the go-apiserver side —
+  not done here.
+- `L_BLACK_MAX`/`L_WHITE_MIN` remain uncalibrated for **body** color too: the
+  white calf reads `GREY` not `WHITE` because indoor shade puts it at L\*≈44,
+  well under `L_WHITE_MIN=75`. Better than `BLACK`, still not calibrated.
+- **Unrelated, found while testing:** real goshala front photos hit
+  `RECAPTURE_MULTI_CATTLE` in `crop_cattle` (several animals in frame). This
+  does not affect color — `main.py` runs `crop_cattle` only on the *muzzle*
+  photos, and front photos go straight to `extract_body` — but the same
+  photos submitted as muzzle shots would be rejected. Pre-existing, untouched.
+
+**The embedding path is deliberately unchanged.** `main.py` register/search
+still feed `crop_cattle()`'s whole-animal crop to the encoder. Routing the
+muzzle detector into embedding would likely improve matching (see the section
+above on the encoder being trained on tight muzzle crops), but it moves stored
+and query embeddings into a different space and **invalidates every vector
+already in the FAISS index** — a separate, much larger migration.
+
 ## Horn/ear morphology — a new signal for the weak color gate, v1 is an unvalidated heuristic
 
 > ⚠️ **The field names in this section (`horn_length_ratio`, `ear_span_ratio`)
