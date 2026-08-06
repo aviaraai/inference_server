@@ -59,6 +59,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 final_cattle_count  INTEGER,
                 count_method    TEXT,
                 max_in_frame    INTEGER,
+                unique_tracked_cattle INTEGER,
                 avg_confidence  REAL,
                 total_detections INTEGER,
                 throughput_fps  REAL,
@@ -106,6 +107,12 @@ def init_db(db_path: Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_sessions_location ON sessions(location_tag);
         """)
 
+        # Migration for DBs created before unique_tracked_cattle existed —
+        # CREATE TABLE IF NOT EXISTS above only helps a brand-new DB file.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "unique_tracked_cattle" not in existing_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN unique_tracked_cattle INTEGER")
+
 
 # ── write ─────────────────────────────────────────────────────────
 
@@ -124,21 +131,25 @@ def save_session(
             INSERT OR REPLACE INTO sessions (
                 job_id, location_tag, video_filename,
                 final_cattle_count, count_method, max_in_frame,
+                unique_tracked_cattle,
                 avg_confidence, total_detections, throughput_fps,
                 processing_sec, source_fps, source_width, source_height,
                 total_frames, frames_processed, frames_with_cattle,
                 avg_herd_speed, isolated_cattle, activity_breakdown,
                 frame_count_series, summary_text,
                 output_video, output_report, output_csv
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             summary.job_id, location_tag, video_filename,
             # Peak-in-frame, matching what /result and /analytics now report
             # (see CLAUDE.md) -- was summary.final_cattle_count (tracked-ID
             # count), which is why /history and /trends used to disagree
-            # with /result for the same job.
+            # with /result for the same job. unique_tracked_cattle now stored
+            # separately so both honest numbers survive to /history/trends,
+            # not just the peak one (see CLAUDE.md, "show both" decision).
             summary.max_cattle_in_frame, summary.count_method,
-            summary.max_cattle_in_frame, summary.average_confidence,
+            summary.max_cattle_in_frame, summary.unique_tracked_cattle,
+            summary.average_confidence,
             summary.total_detections, summary.throughput_fps,
             summary.processing_seconds, summary.source_fps,
             summary.source_width, summary.source_height,
@@ -244,8 +255,8 @@ def get_trend_data(
     with _tx(db_path) as conn:
         query = """
             SELECT
-                created_at, final_cattle_count, avg_herd_speed,
-                isolated_cattle, location_tag, job_id
+                created_at, final_cattle_count, unique_tracked_cattle,
+                avg_herd_speed, isolated_cattle, location_tag, job_id
             FROM sessions
         """
         params: list = []
@@ -263,6 +274,7 @@ def get_trend_data(
         results.append({
             "date": r["created_at"],
             "count": r["final_cattle_count"],
+            "unique_tracked_cattle": r["unique_tracked_cattle"],
             "avg_speed": r["avg_herd_speed"],
             "isolated_count": len(iso),
             "location": r["location_tag"],

@@ -247,6 +247,7 @@ async def get_job_analytics(job_id: str):
     return AnalyticsSummary(
         job_id=job_id,
         total_cattle=a.total_cattle,
+        unique_tracked_cattle=a.unique_tracked_cattle,
         avg_herd_speed=a.avg_herd_speed,
         isolated_cattle=a.isolated_cattle,
         activity_breakdown=a.activity_breakdown,
@@ -293,6 +294,7 @@ async def list_history(
             location_tag=r.get("location_tag"),
             video_filename=r.get("video_filename"),
             final_cattle_count=r["final_cattle_count"],
+            unique_tracked_cattle=r.get("unique_tracked_cattle"),
             avg_herd_speed=r.get("avg_herd_speed"),
             processing_sec=r.get("processing_sec"),
         )

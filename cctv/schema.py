@@ -35,10 +35,16 @@ class JobStatus(BaseModel):
 
 class JobResult(BaseModel):
     job_id: str
-    final_cattle_count: int
+    final_cattle_count: int = Field(
+        ..., description="Same value as max_cattle_in_frame — kept for backward compatibility. Prefer reading max_cattle_in_frame/unique_tracked_cattle directly."
+    )
     count_method: str
-    unique_tracked_cattle: int
-    max_cattle_in_frame: int
+    max_cattle_in_frame: int = Field(
+        ..., description="\"Cattle in view (peak)\" — highest count visible in any single frame. Accurate for a mostly-static camera; undercounts a camera panning across a large herd."
+    )
+    unique_tracked_cattle: int = Field(
+        ..., description="\"Cattle observed (tracking)\" — distinct tracked IDs seen for at least min_frames_visible frames. Accurate for a panning shot; can overcount a static herd via tracker ID churn."
+    )
     average_confidence: float
     total_detections: int
     throughput_fps: float
@@ -52,7 +58,12 @@ class JobResult(BaseModel):
 
 class AnalyticsSummary(BaseModel):
     job_id: str
-    total_cattle: int
+    total_cattle: int = Field(
+        ..., description="\"Cattle in view (peak)\" — highest count visible in any single frame."
+    )
+    unique_tracked_cattle: int = Field(
+        ..., description="\"Cattle observed (tracking)\" — distinct tracked IDs seen for at least min_frames_visible frames."
+    )
     avg_herd_speed: float
     isolated_cattle: list[int]
     activity_breakdown: dict[str, int]
@@ -63,7 +74,10 @@ class AnalyticsSummary(BaseModel):
 
 class TrendPoint(BaseModel):
     date: str
-    count: int
+    count: int = Field(..., description="\"Cattle in view (peak)\" for this session.")
+    unique_tracked_cattle: Optional[int] = Field(
+        None, description="\"Cattle observed (tracking)\" for this session. None for sessions recorded before this field existed."
+    )
     avg_speed: float
     isolated_count: int
     location: Optional[str]
@@ -75,7 +89,10 @@ class SessionInfo(BaseModel):
     created_at: str
     location_tag: Optional[str]
     video_filename: Optional[str]
-    final_cattle_count: int
+    final_cattle_count: int = Field(..., description="\"Cattle in view (peak)\" for this session.")
+    unique_tracked_cattle: Optional[int] = Field(
+        None, description="\"Cattle observed (tracking)\" for this session. None for sessions recorded before this field existed."
+    )
     avg_herd_speed: Optional[float]
     processing_sec: Optional[float]
 
