@@ -51,7 +51,9 @@ class JobResult(BaseModel):
     processing_seconds: float
     frames_processed: int
     frames_with_cattle: int
-    output_video: str
+    video_url: str = Field(
+        ..., description="Path (relative to this server) to GET for the annotated video — bounding boxes, stable Cow IDs, and confidence drawn on every frame. H.264, browser-playable, range-request seekable."
+    )
     output_report: str
     output_csv: str
 
@@ -95,6 +97,9 @@ class SessionInfo(BaseModel):
     )
     avg_herd_speed: Optional[float]
     processing_sec: Optional[float]
+    video_url: str = Field(
+        ..., description="Path (relative to this server) to GET this session's annotated video — bounding boxes and all, same as JobResult.video_url."
+    )
 
 
 class CctvHealthResponse(BaseModel):

@@ -228,7 +228,7 @@ async def get_job_result(job_id: str):
         processing_seconds=s.processing_seconds,
         frames_processed=s.frames_processed,
         frames_with_cattle=s.frames_with_cattle,
-        output_video=s.output_video,
+        video_url=f"/cctv/jobs/{job_id}/video",
         output_report=s.output_report,
         output_csv=s.output_csv,
     )
@@ -273,9 +273,20 @@ async def get_job_analytics(job_id: str):
 @router.get("/jobs/{job_id}/video")
 async def download_video(job_id: str):
     job = _get_job(job_id)
-    if not job or job.get("status") != "done":
-        raise HTTPException(404, "Job not done or not found")
-    path = Path(job["summary"].output_video)
+    if job and job.get("status") == "done":
+        video_path = job["summary"].output_video
+    else:
+        # Not in the in-memory job tracker — either the server restarted
+        # since this job ran, or it's an older session. _jobs is never
+        # persisted, but the sessions table and the on-disk file both
+        # survive a restart, so fall back to those rather than 404ing on
+        # every session that isn't the most recent server lifetime's.
+        row = db.get_session(job_id)
+        if not row:
+            raise HTTPException(404, "Job not done or not found")
+        video_path = row["output_video"]
+
+    path = Path(video_path)
     if not path.exists():
         raise HTTPException(404, "Video file missing")
     return FileResponse(path, media_type="video/mp4", filename=f"cctv_{job_id}.mp4")
@@ -297,6 +308,7 @@ async def list_history(
             unique_tracked_cattle=r.get("unique_tracked_cattle"),
             avg_herd_speed=r.get("avg_herd_speed"),
             processing_sec=r.get("processing_sec"),
+            video_url=f"/cctv/jobs/{r['job_id']}/video",
         )
         for r in rows
     ]
