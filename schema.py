@@ -77,6 +77,13 @@ class ErrorCode(str, Enum):
     # YOLO found nothing to crop.
     NO_ANIMAL_DETECTED = "NO_ANIMAL_DETECTED"
 
+    # YOLO found several animals and none of them stands out as the subject.
+    # Distinct from NO_ANIMAL_DETECTED because the advice is the opposite:
+    # there is nothing wrong with the photo, the officer just has to isolate
+    # the animal they mean. Telling them to "step back so the whole animal is
+    # in frame" makes a multi-cattle frame worse.
+    MULTI_CATTLE = "MULTI_CATTLE"
+
     # Single-image quality failures, split by cause because each one implies
     # different advice to whoever is holding the phone.
     IMAGE_TOO_BLURRY = "IMAGE_TOO_BLURRY"
@@ -105,11 +112,30 @@ class ImageFailure(BaseModel):
     reason: str = Field(..., description="Raw pipeline reason string, for logs — never shown to a user")
 
 
+class ColorReading(BaseModel):
+    """What one photo actually read, on a colour-disagreement rejection.
+
+    This is the context that makes the verdict actionable instead of merely
+    negative. "Your photos disagree, retake them" invites the officer to take
+    the same two photos again; "front_1 read BLACK, front_2 read WHITE" tells
+    them the far more likely truth — that the two photos are of different
+    animals — which is something they can actually fix.
+    """
+
+    slot: str
+    label: str = Field(..., description="Colour label this photo produced")
+    confidence: float = Field(..., description="The winning label's share of the sampled region, 0.0–1.0")
+
+
 class ImageQualityDetail(BaseModel):
     """Detail payload for every image-quality and colour-consistency code."""
 
     message: str = Field(..., description="Internal summary. The API server writes its own user-facing copy.")
     failures: list[ImageFailure]
+    readings: list[ColorReading] = Field(
+        default_factory=list,
+        description="Colour codes only: the per-photo readings that disagreed. Empty for quality failures.",
+    )
 
 
 class DuplicateDetail(BaseModel):
@@ -154,7 +180,9 @@ class CandidateInfo(BaseModel):
     # /register in main.py. Optional so a candidate registered before tag_no
     # existed can still be sent without one; the duplicate-check veto below
     # only fires when BOTH sides have a tag to compare.
-    cost: Optional[str] = Field(None, description="Stored tag_no, not a price")
+    tag_no: Optional[str] = Field(
+        None, description="This candidate's stored tag_no (CandidateInfo.cost), echoed back so it can be compared against the query's own tag_no."
+    )
 
 
 # ── Match ─────────────────────────────────────────────────────────────────────

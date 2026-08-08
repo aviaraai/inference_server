@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from schema import (
+    ColorReading,
     DuplicateDetail,
     ErrorCode,
     ImageFailure,
@@ -92,13 +93,14 @@ def classify_quality_reason(reason: str) -> ErrorCode:
 def classify_detection_status(status: str) -> ErrorCode:
     """Map a crop_cattle det_status to a code.
 
-    RECAPTURE_MULTI_CATTLE is deliberately flattened into NO_ANIMAL_DETECTED:
-    the API server has no code for "several animals in frame", and an unknown
-    code there degrades to a generic service error. Slightly-off advice ("step
-    back so the whole animal is in frame") beats no advice at all. Adding a
-    MULTI_CATTLE code to both sides is the real fix — the reason string below
-    preserves which one it actually was in the meantime.
+    The two outcomes need opposite advice, which is why they are separate
+    codes: NO_DETECTION means get more of the animal into frame, MULTI_CATTLE
+    means get less of everything else into it. Collapsing them — as this
+    briefly did while go-apiserver had no MULTI_CATTLE code — hands a goshala
+    officer the one instruction guaranteed to make their photo worse.
     """
+    if "MULTI_CATTLE" in status:
+        return ErrorCode.MULTI_CATTLE
     return ErrorCode.NO_ANIMAL_DETECTED
 
 
@@ -128,24 +130,47 @@ def image_quality_error(failures: list[ImageFailure]) -> DomainError:
     )
 
 
+def color_readings(slot_prefix: str, colors: list[dict]) -> list[ColorReading]:
+    """Turn the extractor's raw {label, confidence} dicts into readings,
+    numbering the slots the way the uploads were numbered (front_1, muzzle_2).
+    """
+    return [
+        ColorReading(
+            slot=f"{slot_prefix}_{i}",
+            label=c["label"],
+            confidence=round(float(c["confidence"]), 4),
+        )
+        for i, c in enumerate(colors, 1)
+    ]
+
+
 def color_inconsistency_error(
-    error_code: ErrorCode, slots: list[str], reason: str
+    error_code: ErrorCode, readings: list[ColorReading], summary: str
 ) -> DomainError:
     """422 for photos that are individually fine but disagree with each other.
 
     Carried in the same ImageQualityDetail shape as a quality failure so the
-    app has one branch for "these images need retaking", not two. Every
-    contributing slot is listed because no single one of them is at fault —
-    the disagreement is the defect.
+    app has one branch for "these images need retaking", not two — plus the
+    `readings` that explain the disagreement. Every contributing slot is
+    listed because no single one of them is at fault: the disagreement is the
+    defect, and the officer needs to see both sides of it to work out which
+    photo is the odd one out.
     """
     failures = [
-        ImageFailure(slot=slot, stage="color", error_code=error_code, reason=reason)
-        for slot in slots
+        ImageFailure(
+            slot=r.slot,
+            stage="color",
+            error_code=error_code,
+            reason=f"read {r.label} at {r.confidence:.2f}",
+        )
+        for r in readings
     ]
     return DomainError(
         status_code=422,
         error_code=error_code,
-        detail=ImageQualityDetail(message=reason, failures=failures),
+        detail=ImageQualityDetail(
+            message=summary, failures=failures, readings=readings
+        ),
     )
 
 

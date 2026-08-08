@@ -826,9 +826,21 @@ Built in `errors.py`. Raise via its constructors, never by hand:
 |---|---|---|
 | Duplicate muzzle (409) | `DUPLICATE_ANIMAL` | `matched_faiss_id`, `top_score`, `body_color`, `muzzle_color` |
 | Bad photo(s) (422) | `IMAGE_TOO_BLURRY` / `IMAGE_BAD_EXPOSURE` / `IMAGE_TOO_SMALL` / `IMAGE_UNREADABLE` / `NO_ANIMAL_DETECTED` | `message` + `failures[]` of `{slot, stage, error_code, reason}` |
+| Several animals, no clear subject (422) | `MULTI_CATTLE` | same |
 | Several photos failing for *different* reasons (422) | `POOR_IMAGE_QUALITY` | same; per-photo codes survive on each entry |
-| Front photos disagree on body colour (422) | `BODY_COLOR_INCONSISTENT` | same, slots `front_1`/`front_2` |
-| No muzzle-colour majority (422) | `MUZZLE_COLOR_INCONSISTENT` | same, slots `muzzle_1..3` |
+| Front photos disagree on body colour (422) | `BODY_COLOR_INCONSISTENT` | same + `readings[]`, slots `front_1`/`front_2` |
+| No muzzle-colour majority (422) | `MUZZLE_COLOR_INCONSISTENT` | same + `readings[]`, slots `muzzle_1..3` |
+
+`failures[]` names every bad slot in one response, so one retake cycle can fix
+all of them. go-apiserver attaches a short per-photo caption to each entry
+(`perImageMessages`) — necessary because under the `POOR_IMAGE_QUALITY`
+umbrella the envelope's own message describes the set, not any one thumbnail.
+
+`readings[]` (`{slot, label, confidence}`, colour codes only) is the reason
+the colour verdicts are worth returning at all. "Your two photos disagree"
+invites the officer to retake the same two photos of the same two animals and
+get the identical rejection; "front_1 read BLACK, front_2 read WHITE" points at
+the actual likely cause. It reaches the app as `details.color_readings`.
 
 **What must NOT get an envelope**, and why the handler is opt-in rather than
 blanket: failures that are not a verdict about this animal or these photos —
@@ -838,14 +850,23 @@ services being out of step, and go-apiserver is right to classify them as
 contract/transport faults. Stamping a code onto them would surface a renamed
 form field to a farmer as "retake your photos".
 
-Two known gaps, both on the go-apiserver side, neither breaking:
-- `decodeTypedDetail`'s switch omits the two colour codes, so `detail.failures`
-  is dropped for those (verdict and user copy are still correct; only the
-  `failed_images` hint is lost). Adding the two cases to that switch is the fix.
-- `RECAPTURE_MULTI_CATTLE` is flattened into `NO_ANIMAL_DETECTED` because
-  go-apiserver has no code for "several animals in frame", and an unrecognised
-  code there degrades to a generic service error. The real `det_status` survives
-  in `failures[].reason`. Adding a `MULTI_CATTLE` code to both sides is the fix.
+**`MULTI_CATTLE` is separate from `NO_ANIMAL_DETECTED` on purpose.** They need
+opposite instructions — get more of the animal in frame vs. get less of
+everything else in it — and in a goshala, where cattle stand shoulder to
+shoulder, multi-cattle is the *common* failure. Collapsing the two (which this
+briefly did, while go-apiserver had no code for it) hands the officer the one
+instruction guaranteed to make the next photo worse. `crop_cattle` only returns
+`RECAPTURE_MULTI_CATTLE` after `select_dominant_box` fails to find a subject,
+so it already means "two equally prominent animals", not merely "more than one".
+
+Changing a code, or adding one, is a **two-repo change**: `schema.ErrorCode`
+here, plus `domainCodes`, `domainResponses` and `perImageMessages` in
+go-apiserver. A code missing from those last two reaches the app with no copy
+attached and renders blank. go-apiserver has a test asserting the two tables
+agree; there is nothing checking them against this enum, so that direction is
+still manual. Deploy order does not matter — an unknown code degrades to a
+contract fault rather than being guessed at, so the verdict is lost but never
+misreported.
 
 ## Decision thresholds live in the API SERVER, not here
 

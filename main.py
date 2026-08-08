@@ -39,6 +39,7 @@ from errors import (
     classify_detection_status,
     classify_quality_reason,
     color_inconsistency_error,
+    color_readings,
     domain_error_handler,
     duplicate_animal_error,
     image_quality_error,
@@ -197,7 +198,7 @@ async def register(
     # it's visible on the wire instead of silently swallowed by FastAPI's
     # unknown-form-field handling — deliberately NOT persisted, matched, or
     # used in the duplicate check: go-apiserver owns storing the real tag_no.
-    cost: Optional[str] = Form(None),
+    tag_no: Optional[str] = Form(None),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
@@ -311,10 +312,10 @@ async def register(
                 # a candidate registered before tag_no existed, or a request
                 # sent with none, falls back to the embedding+color verdict
                 # unchanged rather than silently skipping the check.
-                if cost and stored.cost and cost != stored.cost:
+                if tag_no and stored.cost and tag_no != stored.cost:
                     log.info(
                         f"/register duplicate candidate cleared by tag_no mismatch | "
-                        f"score={match.score:.4f} | new_tag={cost} | "
+                        f"score={match.score:.4f} | new_tag={tag_no} | "
                         f"stored_tag={stored.cost} | matched_faiss_id={match.faiss_id}"
                     )
                     continue
@@ -428,8 +429,8 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
         )
         raise color_inconsistency_error(
             ErrorCode.BODY_COLOR_INCONSISTENT,
-            slots=["front_1", "front_2"],
-            reason=f"{detail} ({labels})",
+            readings=color_readings("front", body_colors),
+            summary=f"{detail} ({labels})",
         )
 
     winner = dict(confident[0])
@@ -573,8 +574,8 @@ def _run_registration_pipeline(
         else:
             raise color_inconsistency_error(
                 ErrorCode.MUZZLE_COLOR_INCONSISTENT,
-                slots=[f"muzzle_{i}" for i in range(1, len(muzzle_colors) + 1)],
-                reason=(
+                readings=color_readings("muzzle", muzzle_colors),
+                summary=(
                     f"muzzle_color_inconsistent: no majority among crops "
                     f"({', '.join(muzzle_labels)})"
                 ),
@@ -606,6 +607,7 @@ async def search(
     front: UploadFile = File(...),
     top_k: int = Form(5),
     candidate_json: str = Form(..., alias="candidates"),
+    tag_no: str | None = Form(None),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
@@ -647,7 +649,7 @@ async def search(
     candidate_lookup = {c.faiss_id: c for c in candidate_list}
     candidate_ids = [c.faiss_id for c in candidate_list]
 
-    log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)}")
+    log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)} tag_no={tag_no!r}")
 
     # ── Real async I/O: read uploads concurrently ──────────────────────────
     muzzle_bytes, front_bytes = await asyncio.gather(
@@ -670,8 +672,43 @@ async def search(
 
     # ── Restricted search: rank only the provided candidates ─────────────
     t_faiss_start = time.monotonic()
-    matches = await faiss_index.restricted_search(emb_np, candidate_ids=candidate_ids, top_k=top_k)
+    faiss_top_k = len(candidate_ids) if tag_no else top_k
+    matches = await faiss_index.restricted_search(emb_np, candidate_ids=candidate_ids, top_k=faiss_top_k)
     t_faiss = _ms_since(t_faiss_start)
+
+    if tag_no:
+        tag_match = None
+        remaining = []
+        for m in matches:
+            stored_tag = candidate_lookup[m["faiss_id"]].cost
+            if stored_tag and stored_tag == tag_no:
+                tag_match = m
+            elif stored_tag and stored_tag != tag_no:
+                log.info(
+                    f"[{request_id}] /search dropping candidate proven different by "
+                    f"tag_no | faiss_id={m['faiss_id']} score={m['score']:.4f} "
+                    f"query_tag={tag_no!r} stored_tag={stored_tag!r}"
+                )
+                continue
+            else:
+                remaining.append(m)
+        ordered = ([tag_match] if tag_match else []) + remaining
+        if tag_match:
+            log.info(
+                f"[{request_id}] /search promoted tag_no match to rank 1 | "
+                f"faiss_id={tag_match['faiss_id']} score={tag_match['score']:.4f}"
+            )
+        # Ranks/gaps were computed against the original FAISS order; both are
+        # meaningless after reordering/dropping entries, so recompute them
+        # the same way faiss_index._restricted_search_sync does.
+        matches = ordered[:top_k]
+        for idx, m in enumerate(matches):
+            m["rank"] = idx + 1
+            m["gap"] = (
+                m["score"] - matches[idx + 1]["score"]
+                if idx + 1 < len(matches)
+                else 0.0
+            )
 
     t_total = _ms_since(t_start)
     log.info(
