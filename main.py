@@ -67,6 +67,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("godhaar.server")
 
+# ── TEMPORARY: accept every offline registration regardless of quality ────────
+# Set True on the user's explicit instruction, 2026-08-08: officers are
+# registering cattle offline right now and every 422 (blur, exposure, no
+# detection, body/muzzle color inconsistency) is blocking real field data from
+# ever syncing. While this is True, every quality/consistency gate below still
+# RUNS and still LOGS what it would have rejected, but falls back to the best
+# available reading instead of raising -- nothing is silently skipped, it is
+# visibly downgraded to "accepted anyway".
+#
+# Deliberately NOT covering the 409 duplicate-animal check -- that stays
+# exactly as built (embedding + color, with the tag_no veto). Confirmed
+# explicitly: this flag is about image/consistency quality only.
+#
+# REVERT: set this back to False once officers are done bulk-capturing and
+# quality should matter again. Nothing else needs to change.
+BYPASS_QUALITY_GATES = True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -375,6 +392,15 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
         labels = " vs ".join(
             f"{c['label']}({c['confidence']:.2f})" for c in body_colors
         )
+        if BYPASS_QUALITY_GATES:
+            best = max(body_colors, key=lambda c: c["confidence"])
+            log.warning(
+                f"body_color: bypassing inconsistency ({labels}), "
+                f"accepting best-guess reading {best['label']}({best['confidence']:.2f})"
+            )
+            result = dict(best)
+            result["confidence"] = round(result["confidence"] / 2.0, 4)
+            return result
         detail = (
             "body_color_inconsistent: front images disagree and neither is "
             "decisive"
@@ -427,19 +453,35 @@ def _run_registration_pipeline(
     errors: list[str] = []
     cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     for i, mb in enumerate(muzzle_bytes, 1):
+        # Decoded unconditionally (not just after quality_check passes) so a
+        # BYPASS_QUALITY_GATES fallback always has raw pixels to fall back to,
+        # regardless of which check below is the one that would have failed.
+        img_bgr = _decode_image(mb)
+
         status, reason = quality_check(mb)
         if status != "GOOD":
+            if BYPASS_QUALITY_GATES:
+                log.warning(f"muzzle_{i}: bypassing quality failure ({reason}), using raw frame")
+                cropped_images[i - 1] = img_bgr
+                continue
             errors.append(f"muzzle_{i}: {reason}")
             continue
 
-        img_bgr = _decode_image(mb)
         crop, det_status, _det_conf = crop_cattle(img_bgr)
         if crop is None:
+            if BYPASS_QUALITY_GATES:
+                log.warning(f"muzzle_{i}: bypassing detection failure ({det_status}), using raw frame")
+                cropped_images[i - 1] = img_bgr
+                continue
             errors.append(f"muzzle_{i}: {det_status}")
             continue
 
         crop_status, crop_reason = quality_check_cv2(crop)
         if crop_status != "GOOD":
+            if BYPASS_QUALITY_GATES:
+                log.warning(f"muzzle_{i}_crop: bypassing crop-quality failure ({crop_reason})")
+                cropped_images[i - 1] = crop
+                continue
             errors.append(f"muzzle_{i}_crop: {crop_reason}")
             continue
 
@@ -479,17 +521,26 @@ def _run_registration_pipeline(
 
     if majority_count < 2:
         # All 3 different — no majority
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"muzzle_color_inconsistent: no majority among crops "
-                f"({', '.join(muzzle_labels)}), retake photos"
-            ),
-        )
-    # Majority found — use avg confidence of agreeing images
-    agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
-    avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
-    muzzle_color = {"label": majority_label, "confidence": avg_conf}
+        if BYPASS_QUALITY_GATES:
+            best = max(muzzle_colors, key=lambda c: c["confidence"])
+            log.warning(
+                f"muzzle_color: bypassing no-majority ({', '.join(muzzle_labels)}), "
+                f"accepting best-guess reading {best['label']}({best['confidence']:.2f})"
+            )
+            muzzle_color = {"label": best["label"], "confidence": round(best["confidence"] / 2.0, 4)}
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"muzzle_color_inconsistent: no majority among crops "
+                    f"({', '.join(muzzle_labels)}), retake photos"
+                ),
+            )
+    else:
+        # Majority found — use avg confidence of agreeing images
+        agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
+        avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
+        muzzle_color = {"label": majority_label, "confidence": avg_conf}
 
     # ── Morphology (horn/e ar proportions) — return-only, not a gate ───────
     # Unlike color, there's no majority/consistency check here: this is a
