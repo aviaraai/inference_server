@@ -20,7 +20,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import cv2
 import numpy as np
@@ -157,6 +157,13 @@ async def register(
     muzzle_images: list[UploadFile] = File(...),
     front_images: list[UploadFile] = File(...),
     candidate_json: str = Form(..., alias="candidates"),
+    # NOT a purchase price. The go-apiserver side is piggybacking the animal's
+    # physical ear-tag number (tag_no) through this existing field name rather
+    # than adding a new one to this leg of the contract. Received here only so
+    # it's visible on the wire instead of silently swallowed by FastAPI's
+    # unknown-form-field handling — deliberately NOT persisted, matched, or
+    # used in the duplicate check: go-apiserver owns storing the real tag_no.
+    cost: Optional[str] = Form(None),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
     faiss_index: FaissIndex = Depends(get_faiss_index),
@@ -167,6 +174,10 @@ async def register(
     Register a cattle animal.
 
     Expects exactly 3 muzzle images and 2 front images.
+
+    ``cost`` is NOT a price — see the parameter comment above. It carries the
+    tag_no go-apiserver sends under that field name and is accepted-and-
+    dropped here on purpose.
     Requires ``candidates`` — a JSON string of nearby cattle
     (pre-filtered by GPS) with their stored colors:
         [{"faiss_id": 123, "body_color": "BLACK", "muzzle_color": "PINK"}, ...]
