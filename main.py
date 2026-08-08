@@ -34,6 +34,15 @@ from dependency import (
     get_model,
     get_morphology_extractor,
 )
+from errors import (
+    DomainError,
+    classify_detection_status,
+    classify_quality_reason,
+    color_inconsistency_error,
+    domain_error_handler,
+    duplicate_animal_error,
+    image_quality_error,
+)
 from faiss_index import FaissIndex
 from godhaar.config import (
     BODY_COLOR_MAJORITY_CONFIDENCE,
@@ -52,8 +61,10 @@ from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
 from schema import (
     CandidateInfo,
     ColorResult,
+    ErrorCode,
     ExtractedColors,
     HealthResponse,
+    ImageFailure,
     MatchCandidate,
     RegisterResponse,
     SearchResponse,
@@ -167,6 +178,12 @@ app = FastAPI(
     description="Pure ML microservice for cattle muzzle re-identification.",
     lifespan=lifespan,
 )
+
+# Renders DomainError as {"error_code": ..., "detail": {...}}. Plain
+# HTTPExceptions are untouched and keep answering with FastAPI's bare
+# {"detail": ...} — see the module docstring in errors.py for why that split
+# matters.
+app.add_exception_handler(DomainError, domain_error_handler)
 
 
 @app.post("/register", response_model=RegisterResponse, status_code=201)
@@ -308,13 +325,14 @@ async def register(
                     f"body={new_body} muzzle={new_muzzle} | "
                     f"matched_faiss_id={match.faiss_id}"
                 )
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "duplicate_muzzle",
-                        "top_score": match.score,
-                        "matched_faiss_id": match.faiss_id,
-                    },
+                # body/muzzle colour ride along because they are WHY this is a
+                # duplicate — the embedding alone did not decide it — and the
+                # API server records the whole detail against the failure row.
+                raise duplicate_animal_error(
+                    matched_faiss_id=match.faiss_id,
+                    top_score=match.score,
+                    body_color=new_body,
+                    muzzle_color=new_muzzle,
                 )
 
     # ── Store in FAISS ────────────────────────────────────────────────────
@@ -408,7 +426,11 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
             else "body_color_inconsistent: front images give conflicting "
                  "confident readings"
         )
-        raise HTTPException(status_code=422, detail=f"{detail} ({labels}), retake photos")
+        raise color_inconsistency_error(
+            ErrorCode.BODY_COLOR_INCONSISTENT,
+            slots=["front_1", "front_2"],
+            reason=f"{detail} ({labels})",
+        )
 
     winner = dict(confident[0])
     loser = next(c for c in body_colors if c is not confident[0])
@@ -450,45 +472,62 @@ def _run_registration_pipeline(
     # one retake at a time (each retake is a full network round trip). Each
     # image still stops at its OWN first failure (quality, then detection,
     # then crop-quality) — only the across-images fail-fast was removed.
-    errors: list[str] = []
+    failures: list[ImageFailure] = []
     cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     for i, mb in enumerate(muzzle_bytes, 1):
+        slot = f"muzzle_{i}"
+
         # Decoded unconditionally (not just after quality_check passes) so a
         # BYPASS_QUALITY_GATES fallback always has raw pixels to fall back to,
         # regardless of which check below is the one that would have failed.
-        img_bgr = _decode_image(mb)
+        img_bgr = _decode_image(mb, slot)
 
         status, reason = quality_check(mb)
         if status != "GOOD":
             if BYPASS_QUALITY_GATES:
-                log.warning(f"muzzle_{i}: bypassing quality failure ({reason}), using raw frame")
+                log.warning(f"{slot}: bypassing quality failure ({reason}), using raw frame")
                 cropped_images[i - 1] = img_bgr
                 continue
-            errors.append(f"muzzle_{i}: {reason}")
+            failures.append(ImageFailure(
+                slot=slot,
+                stage="quality",
+                error_code=classify_quality_reason(reason),
+                reason=reason,
+            ))
             continue
 
         crop, det_status, _det_conf = crop_cattle(img_bgr)
         if crop is None:
             if BYPASS_QUALITY_GATES:
-                log.warning(f"muzzle_{i}: bypassing detection failure ({det_status}), using raw frame")
+                log.warning(f"{slot}: bypassing detection failure ({det_status}), using raw frame")
                 cropped_images[i - 1] = img_bgr
                 continue
-            errors.append(f"muzzle_{i}: {det_status}")
+            failures.append(ImageFailure(
+                slot=slot,
+                stage="detection",
+                error_code=classify_detection_status(det_status),
+                reason=det_status,
+            ))
             continue
 
         crop_status, crop_reason = quality_check_cv2(crop)
         if crop_status != "GOOD":
             if BYPASS_QUALITY_GATES:
-                log.warning(f"muzzle_{i}_crop: bypassing crop-quality failure ({crop_reason})")
+                log.warning(f"{slot}_crop: bypassing crop-quality failure ({crop_reason})")
                 cropped_images[i - 1] = crop
                 continue
-            errors.append(f"muzzle_{i}_crop: {crop_reason}")
+            failures.append(ImageFailure(
+                slot=slot,
+                stage="crop_quality",
+                error_code=classify_quality_reason(crop_reason),
+                reason=crop_reason,
+            ))
             continue
 
         cropped_images[i - 1] = crop
 
-    if errors:
-        raise HTTPException(status_code=422, detail="; ".join(errors))
+    if failures:
+        raise image_quality_error(failures)
 
     # ── Embed (batched forward pass) ─────────────────────────────────────
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
@@ -503,7 +542,10 @@ def _run_registration_pipeline(
     #   Majority found → accept majority label (avg confidence of agreeing images).
     #   All 3 different → 422, ask user to retake.
 
-    body_colors = [color_extractor.extract_body(_decode_image(fb)) for fb in front_bytes]
+    body_colors = [
+        color_extractor.extract_body(_decode_image(fb, f"front_{i}"))
+        for i, fb in enumerate(front_bytes, 1)
+    ]
     body_labels = [c["label"] for c in body_colors]
 
     if body_labels[0] == body_labels[1]:
@@ -529,11 +571,12 @@ def _run_registration_pipeline(
             )
             muzzle_color = {"label": best["label"], "confidence": round(best["confidence"] / 2.0, 4)}
         else:
-            raise HTTPException(
-                status_code=422,
-                detail=(
+            raise color_inconsistency_error(
+                ErrorCode.MUZZLE_COLOR_INCONSISTENT,
+                slots=[f"muzzle_{i}" for i in range(1, len(muzzle_colors) + 1)],
+                reason=(
                     f"muzzle_color_inconsistent: no majority among crops "
-                    f"({', '.join(muzzle_labels)}), retake photos"
+                    f"({', '.join(muzzle_labels)})"
                 ),
             )
     else:
@@ -549,7 +592,8 @@ def _run_registration_pipeline(
     # error the way a color mismatch is. Both readings are combined via a
     # confidence-weighted average instead.
     morphology_readings = [
-        morphology_extractor.extract(_decode_image(fb)) for fb in front_bytes
+        morphology_extractor.extract(_decode_image(fb, f"front_{i}"))
+        for i, fb in enumerate(front_bytes, 1)
     ]
     morphology = average_readings(morphology_readings)
 
@@ -677,25 +721,40 @@ def _run_search_pipeline(
     if q_status != "GOOD":
         log.error(f"Quality status: {q_status}")
         log.error(f"Quality reason: {q_reason}")
-        raise HTTPException(status_code=422, detail=q_reason)
+        raise image_quality_error([ImageFailure(
+            slot="muzzle",
+            stage="quality",
+            error_code=classify_quality_reason(q_reason),
+            reason=q_reason,
+        )])
 
-    img_bgr = _decode_image(muzzle_bytes)
+    img_bgr = _decode_image(muzzle_bytes, "muzzle")
     crop, det_status, _det_conf = crop_cattle(img_bgr)
     if crop is None:
         log.error(f"Crop: {crop} | Det Status: {det_status} | Det conf: {_det_conf}")
-        raise HTTPException(status_code=422, detail=det_status)
+        raise image_quality_error([ImageFailure(
+            slot="muzzle",
+            stage="detection",
+            error_code=classify_detection_status(det_status),
+            reason=det_status,
+        )])
 
     crop_status, crop_reason = quality_check_cv2(crop)
     if crop_status != "GOOD":
         log.error(f"Crop Status: {crop_status} | Crop reason: {crop_reason}")
-        raise HTTPException(status_code=422, detail=f"muzzle_crop: {crop_reason}")
+        raise image_quality_error([ImageFailure(
+            slot="muzzle",
+            stage="crop_quality",
+            error_code=classify_quality_reason(crop_reason),
+            reason=crop_reason,
+        )])
 
     crop_bytes = cv2.imencode(".jpg", crop)[1].tobytes()
     embedding = embed_batch([crop_bytes], model, device)  # (1, 256)
     emb_np = embedding.squeeze(0).numpy()  # (256,)
 
     muzzle_color = color_extractor.extract_muzzle(crop)
-    front_img = _decode_image(front_bytes)
+    front_img = _decode_image(front_bytes, "front")
     body_color = color_extractor.extract_body(front_img)
     morphology = morphology_extractor.extract(front_img)
 

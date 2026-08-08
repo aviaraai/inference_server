@@ -793,14 +793,59 @@ blur=8.9; muzzle_3: RECAPTURE_NO_DETECTION` instead of stopping at
 `muzzle_1` alone. One retake cycle can now fix every flagged photo instead
 of one at a time. Behavior is unchanged when all 3 images pass.
 
-**Deliberately scoped to this service only.** go-apiserver relays this
-`detail` string to the app as-is, so the app already surfaces the longer
-combined message — but nobody has reshaped it into a structured per-photo
-list on either go-apiserver or the app yet; the app's error handling still
-treats the whole thing as one opaque string (unlike the existing
-client-side blur guard, which already lists bad photo numbers cleanly). If
-that's wanted, it needs matching changes in go-apiserver's response and
-`src/api/animals.ts` — not done here.
+**Now structured** — see the next section. The combined `detail` string is
+still produced (as `detail.message`, for logs), but the per-photo list it was
+standing in for is now sent alongside it as `detail.failures`, so the app no
+longer has to parse prose to learn which slot to retake.
+
+Note the earlier claim here — that "go-apiserver relays this `detail` string
+to the app as-is" — was never true. go-apiserver deliberately never renders
+upstream prose into a user-facing message (`internal/inference/errors.go`:
+"there is no field holding a message intended for display"), and a 4xx body
+without an `error_code` was classified there as a *contract* failure and shown
+to the officer as a generic "our team has been notified". Every 422 in this
+loop, and every 409 duplicate, was being discarded at that boundary.
+
+## Error envelope: every 4xx verdict carries an `error_code`
+
+Deliberate rejections answer with
+
+```json
+{"error_code": "IMAGE_TOO_BLURRY", "detail": {...}}
+```
+
+not FastAPI's bare `{"detail": ...}`. This is a hard requirement, not a
+nicety: go-apiserver keys its entire user-facing response off `error_code`,
+and a body without one never reaches the officer as a real verdict (see
+above). `schema.ErrorCode` and `domainCodes` in go-apiserver's
+`internal/inference/errors.go` are **one contract and must change together**.
+
+Built in `errors.py`. Raise via its constructors, never by hand:
+
+| Situation | Code | `detail` shape |
+|---|---|---|
+| Duplicate muzzle (409) | `DUPLICATE_ANIMAL` | `matched_faiss_id`, `top_score`, `body_color`, `muzzle_color` |
+| Bad photo(s) (422) | `IMAGE_TOO_BLURRY` / `IMAGE_BAD_EXPOSURE` / `IMAGE_TOO_SMALL` / `IMAGE_UNREADABLE` / `NO_ANIMAL_DETECTED` | `message` + `failures[]` of `{slot, stage, error_code, reason}` |
+| Several photos failing for *different* reasons (422) | `POOR_IMAGE_QUALITY` | same; per-photo codes survive on each entry |
+| Front photos disagree on body colour (422) | `BODY_COLOR_INCONSISTENT` | same, slots `front_1`/`front_2` |
+| No muzzle-colour majority (422) | `MUZZLE_COLOR_INCONSISTENT` | same, slots `muzzle_1..3` |
+
+**What must NOT get an envelope**, and why the handler is opt-in rather than
+blanket: failures that are not a verdict about this animal or these photos —
+FastAPI request validation, wrong image count, malformed `candidates` JSON,
+FAISS errors — stay plain `HTTPException`. Those genuinely *are* the two
+services being out of step, and go-apiserver is right to classify them as
+contract/transport faults. Stamping a code onto them would surface a renamed
+form field to a farmer as "retake your photos".
+
+Two known gaps, both on the go-apiserver side, neither breaking:
+- `decodeTypedDetail`'s switch omits the two colour codes, so `detail.failures`
+  is dropped for those (verdict and user copy are still correct; only the
+  `failed_images` hint is lost). Adding the two cases to that switch is the fix.
+- `RECAPTURE_MULTI_CATTLE` is flattened into `NO_ANIMAL_DETECTED` because
+  go-apiserver has no code for "several animals in frame", and an unrecognised
+  code there degrades to a generic service error. The real `det_status` survives
+  in `failures[].reason`. Adding a `MULTI_CATTLE` code to both sides is the fix.
 
 ## Decision thresholds live in the API SERVER, not here
 

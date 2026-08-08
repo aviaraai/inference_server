@@ -5,7 +5,8 @@ Request parameters use Form() + File() directly in route signatures.
 These models define the response shape only.
 """
 
-from typing import Optional
+from enum import Enum
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +37,104 @@ HORN_SHAPE_DESCRIPTION = (
     "silhouette, or — register only — the 2 front photos disagreeing) "
     "also collapses to None here. See pipeline/morphology.py."
 )
+
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+#
+# Every deliberate 4xx verdict this server reaches is returned as
+#
+#     {"error_code": "<ErrorCode>", "detail": {...}}
+#
+# and NOT as FastAPI's bare {"detail": ...}. The envelope exists because the
+# API server keys its user-facing response off `error_code` alone: a body
+# without one is classified there as a contract violation ("the two services
+# are out of step") and shown to the farmer as a generic service error. So a
+# duplicate animal or a blurry photo returned without this envelope is not a
+# cosmetic difference — the verdict is thrown away.
+#
+# The flip side is the reason this is opt-in rather than a blanket handler:
+# failures that are NOT a verdict about the animal or the photos — FastAPI's
+# own request validation, a wrong image count, malformed candidates JSON — must
+# keep answering with the bare {"detail": ...}. Those genuinely ARE the two
+# services being out of step, and the API server is right to treat them that
+# way. See errors.py for the raise sites.
+
+
+class ErrorCode(str, Enum):
+    """Machine-readable verdicts. One contract, two implementations: this enum
+    and `domainCodes` in the API server's internal/inference/errors.go must be
+    changed together.
+
+    The API server degrades a code it does not recognise to a contract failure
+    rather than guessing at it, so a new code can be deployed here first and
+    taught to the API server afterwards — but until it is, the verdict does not
+    reach the user.
+    """
+
+    # Register only: this muzzle is already in the index.
+    DUPLICATE_ANIMAL = "DUPLICATE_ANIMAL"
+
+    # YOLO found nothing to crop.
+    NO_ANIMAL_DETECTED = "NO_ANIMAL_DETECTED"
+
+    # Single-image quality failures, split by cause because each one implies
+    # different advice to whoever is holding the phone.
+    IMAGE_TOO_BLURRY = "IMAGE_TOO_BLURRY"
+    IMAGE_BAD_EXPOSURE = "IMAGE_BAD_EXPOSURE"
+    IMAGE_TOO_SMALL = "IMAGE_TOO_SMALL"
+    IMAGE_UNREADABLE = "IMAGE_UNREADABLE"
+
+    # Cross-image disagreement: each photo is fine on its own but together they
+    # cannot describe one animal.
+    BODY_COLOR_INCONSISTENT = "BODY_COLOR_INCONSISTENT"
+    MUZZLE_COLOR_INCONSISTENT = "MUZZLE_COLOR_INCONSISTENT"
+
+    # Umbrella for a set of images that failed for more than one distinct
+    # reason; the per-image codes survive in the detail.
+    POOR_IMAGE_QUALITY = "POOR_IMAGE_QUALITY"
+
+
+class ImageFailure(BaseModel):
+    """One photo's rejection. `slot` is what makes this worth sending: the app
+    marks that specific image for retaking instead of asking for all five.
+    """
+
+    slot: str = Field(..., description="Which upload failed: muzzle_1..3, front_1..2, muzzle, front")
+    stage: str = Field(..., description="Where it failed: decode, quality, detection, crop_quality, color")
+    error_code: ErrorCode = Field(..., description="Per-image code; may differ from the envelope's code")
+    reason: str = Field(..., description="Raw pipeline reason string, for logs — never shown to a user")
+
+
+class ImageQualityDetail(BaseModel):
+    """Detail payload for every image-quality and colour-consistency code."""
+
+    message: str = Field(..., description="Internal summary. The API server writes its own user-facing copy.")
+    failures: list[ImageFailure]
+
+
+class DuplicateDetail(BaseModel):
+    """Detail payload for DUPLICATE_ANIMAL.
+
+    `matched_faiss_id` is the field that matters: this server knows only FAISS
+    ids, and the API server is the only side that can turn one back into the
+    godhaar_id the officer needs in order to go and look at the registration
+    they are duplicating.
+    """
+
+    matched_faiss_id: int
+    top_score: float
+    body_color: str = Field(..., description="Colour freshly extracted from this request, which matched the stored one")
+    muzzle_color: str
+
+
+class ErrorEnvelope(BaseModel):
+    """The wire shape of every domain rejection. Declared for the OpenAPI docs
+    and as the single written-down description of the contract; the responses
+    themselves are built in errors.py.
+    """
+
+    error_code: ErrorCode
+    detail: dict[str, Any]
 
 
 # ── Candidate input (register duplicate-check AND search) ─────────────────────
