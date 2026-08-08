@@ -268,6 +268,23 @@ async def register(
             )
 
             if color_match:
+                # tag_no veto: embedding + color say "same animal", but if the
+                # officer entered a tag that differs from this candidate's
+                # stored tag, that is a human-verified signal they are
+                # DIFFERENT physical animals (this is precisely the
+                # same-breed/same-color goshala case tag_no exists to fix).
+                # Only fires when BOTH sides actually have a tag to compare --
+                # a candidate registered before tag_no existed, or a request
+                # sent with none, falls back to the embedding+color verdict
+                # unchanged rather than silently skipping the check.
+                if cost and stored.cost and cost != stored.cost:
+                    log.info(
+                        f"/register duplicate candidate cleared by tag_no mismatch | "
+                        f"score={match.score:.4f} | new_tag={cost} | "
+                        f"stored_tag={stored.cost} | matched_faiss_id={match.faiss_id}"
+                    )
+                    continue
+
                 log.info(
                     f"/register 409 duplicate | "
                     f"score={match.score:.4f} | "
