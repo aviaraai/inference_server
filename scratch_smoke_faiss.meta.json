@@ -1,0 +1,6 @@
+{
+  "embedding_dim": 256,
+  "model_version": "dinov2_arcface_v1",
+  "total_vectors": 3,
+  "saved_at": "2026-08-06T17:01:23.983680+00:00"
+}
