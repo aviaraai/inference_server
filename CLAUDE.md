@@ -175,6 +175,40 @@ Two gotchas this caused (two different black cows wrongly merged):
   black cows still clear 0.80 — if so, this threshold (and/or the color gate)
   needs revisiting, not just the crop.
 
+**Update 2026-08-10 — the flat AND-gate described above is gone.**
+`feature/cctv-video-analytics`'s merge replaced it with a **tiered** verdict
+in `/register`: at or above `DUPLICATE_HIGH_CONFIDENCE_THRESHOLD` the
+embedding alone decides (color can no longer veto a genuinely correct
+muzzle match — the exact "black-cattle color gate" failure mode above was
+a live double-registration incident, not a hypothetical); below it, only
+`muzzle_color` needs to corroborate, deliberately **not** `body_color`
+(which comes from `detect_primary_animal()` and has no quality/multi-cattle
+gate the way muzzle photos do). `BYPASS_QUALITY_GATES` and
+`BYPASS_DUPLICATE_CHECK` (both `main.py`, added 2026-08-08/09 for the field
+bulk-registration push) are back to `False` as of 2026-08-10 — sync is
+done, both gates enforce for real again, now against this tiered verdict.
+Reverting was a clean two-value flip: `_run_registration_pipeline`, where
+`BYPASS_QUALITY_GATES` does its work, was untouched by the tiered-gate
+change. Also added, same date: per-stage `time.monotonic()` logging
+through `_run_registration_pipeline` (muzzle quality/crop gate,
+`embed_batch`, body/muzzle color, morphology, total, plus per-slot
+`crop_cattle` timing with which retry attempt fired) — purely additive,
+no behavior change, added because registration-latency complaints had no
+real breakdown to point at yet, only guesses.
+
+**A LightGlue keypoint-matching POC exists but is NOT wired into
+anything** (`experiments/lightglue_poc/match_muzzles.py`, gitignored,
+uses `kornia`'s DISK+LightGlue installed ad hoc, not in `pyproject.toml`).
+The idea: a second, independent signal alongside the embedding score —
+does the query and candidate muzzle actually share local keypoint
+structure — that could in principle guard the `DUPLICATE_HIGH_CONFIDENCE_THRESHOLD`
+tier above. Only smoke-tested (proves the plumbing runs, not that it
+helps) on two arbitrary unlabeled photos. Same rule as everywhere else in
+this file: do not wire this into a real accept/reject decision without
+validating on real different-animal photos first — an unvalidated second
+signal is exactly the kind of "expensive step that seems obviously right"
+this file's GrabCut story already warns about.
+
 ## ⚠️ Fixed: body color returned BLACK for white/brown animals (the "dominant color" was fabricated)
 
 Reported live twice: a **white Ongole-type bull** classified `BLACK`, and a
@@ -1177,3 +1211,93 @@ not a threshold left untuned. This generic COCO-pretrained model was never
 trained on this specific scene type. If more accuracy is needed here, the
 next lever is a model fine-tuned on genuinely crowded barn footage — a
 data/training problem, not a config change.
+
+### Two more correctness bugs found after the tuning history above — same-frame duplicate IDs, and static-position occlusion matching
+
+Found 2026-08-10, independently (validated first against a standalone
+copy of this same tracker, before discovering `feature/cctv-video-analytics`
+had already merged here — see "an abandoned parallel path" below), while
+chasing the same `unique_tracked_cattle` overcounting problem the tuning
+history above already spent real effort on. **These are not more
+threshold nudging on the axis that plateaued at ~50-51 above** — they're
+two actual logic bugs in `stable_id.py`'s matching, found by looking at
+*which* IDs were short-lived and clustered in tight frame windows, not by
+sweeping more numbers:
+
+1. **`StableIdMapper` could hand the same stable ID to two different
+   boxes in the same frame.** The direct `raw_id → stable_id` cache
+   (`_resolve`'s step 1) was trusted unconditionally, even when a
+   *different* raw ID had already claimed that same stable ID earlier in
+   the very same frame — which happens once BoT-SORT reassigns a fresh
+   raw ID mid-track and the old raw ID later reappears (exactly the
+   flicker this file's tuning history already describes). Verified on a
+   real 15s clip (9 cattle max in frame): **37 of 225 processed frames
+   had a stable ID stamped on two live boxes at once.** That's not a
+   counting error, it's misidentification — whichever ID got
+   double-booked has its speed/trajectory/isolation analytics silently
+   corrupted, jumping between two different animals' positions. Fixed
+   with a `claimed_this_frame` guard in `update()`: a stable ID already
+   taken this frame is never reused, a new one is minted instead. **0
+   duplicate-ID frames after the fix,** re-confirmed on every run since.
+
+2. **Matching compared a returning cow's box against its last known
+   STATIC position**, with no allowance for the animal having walked
+   during the gap. `stable_id_memory_frames=90` (already correctly set
+   in this branch's `config.py`, independently aligned to the tracker's
+   own `track_buffer`) makes the memory window long enough — but a cow
+   walking steadily for even ~1s moves far enough that IoU against its
+   *old* position drops under `stable_id_iou_thresh` regardless of how
+   long the memory lasts. Fixed by projecting each remembered box
+   forward using that ID's own last observed velocity before computing
+   IoU (`_project` in `stable_id.py`), rather than comparing against a
+   frozen coordinate. Verified with a synthetic case first (a cow
+   walking at constant velocity, occluded 42 raw frames, handed a new
+   raw ID — correctly resolves back to the same stable ID; confirmed it
+   would NOT have under the old static-position logic), then on real
+   footage: **`unique_tracked_cattle` on the same test clip went from 41
+   (after fix #1 alone) to 33**, `max_cattle_in_frame` unchanged at 9.
+
+**Neither fix changes what's shown as the primary number**
+(`total_animals`/peak-in-frame, per "both counts shown side by side"
+above) — they improve `unique_tracked_cattle`/`total_clear_animals`, the
+secondary figure. 33 is still not validated against a labeled
+ground-truth count — same caveat as everywhere else tracking numbers
+appear in this file.
+
+### `CATTLE_TERMS` only ever matched "cow"/"horse" — silently missing water buffalo
+
+Checked against the actual `yolo11s.pt` COCO class list: `"cattle"`,
+`"bull"`, `"calf"`, `"buffalo"`, `"bovine"`, `"ox"` match **nothing** —
+COCO (80 classes) has no such names, so those six entries in
+`CATTLE_TERMS` were dead vocabulary that never matched a real detection.
+Only `"cow"` (19) and `"horse"` (17) ever fired. That silently
+undercounts water buffalo, extremely common in Indian goshalas, since
+COCO has no buffalo class and a generic detector routinely misclassifies
+one as something else instead.
+
+**This exact problem was already found and fixed once in this repo** —
+`pipeline/yolo_crop.py` (the OTHER service, muzzle detection) matches
+classes `{17,18,19,20,21}` = horse/sheep/cow/elephant/bear specifically
+"to catch buffalo misclassifications" (see this file's earlier section on
+that fix). Applied the identical fix here — `CATTLE_TERMS` now also
+includes `sheep`/`elephant`/`bear` — rather than re-deriving it blind.
+Verified no regression on the real test clip (identical
+`max_cattle_in_frame=9`, `total_detections=1410`,
+`average_confidence=0.7328` before/after, since that clip has no
+buffalo/misclassified animals to trigger the difference) — this fix can't
+be proven to *help* without footage that actually contains buffalo, only
+proven not to hurt cow-only footage.
+
+### An abandoned parallel path, for context if it resurfaces
+
+Before discovering `feature/cctv-video-analytics` was already merged,
+this session built a **separate, standalone** copy of the same
+cattle-counting app (`cctv_service/`, copied from a now-stale
+`D:\Group Projects\cattle_ai_project`) as its own FastAPI process,
+including the same two `stable_id.py` fixes above, independently. That
+whole path was abandoned once the merge was found — the fixes were
+ported into the real, already-merged `cctv/` package instead (this
+section), and `cctv_service/` was deleted. If old references to
+`cctv_service/` or `cattle_ai_project` turn up anywhere (docs, chat
+history, stray local folders), they're describing this dead end, not the
+real running service.
