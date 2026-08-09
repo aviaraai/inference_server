@@ -312,11 +312,11 @@ async def register(
                 # a candidate registered before tag_no existed, or a request
                 # sent with none, falls back to the embedding+color verdict
                 # unchanged rather than silently skipping the check.
-                if tag_no and stored.cost and tag_no != stored.cost:
+                if tag_no and stored.tag_no and tag_no != stored.tag_no:
                     log.info(
                         f"/register duplicate candidate cleared by tag_no mismatch | "
                         f"score={match.score:.4f} | new_tag={tag_no} | "
-                        f"stored_tag={stored.cost} | matched_faiss_id={match.faiss_id}"
+                        f"stored_tag={stored.tag_no} | matched_faiss_id={match.faiss_id}"
                     )
                     continue
 
@@ -680,7 +680,7 @@ async def search(
         tag_match = None
         remaining = []
         for m in matches:
-            stored_tag = candidate_lookup[m["faiss_id"]].cost
+            stored_tag = candidate_lookup[m["faiss_id"]].tag_no
             if stored_tag and stored_tag == tag_no:
                 tag_match = m
             elif stored_tag and stored_tag != tag_no:
