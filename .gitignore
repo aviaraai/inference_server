@@ -23,3 +23,10 @@ cctv/cctv.db-shm
 # Never commit training code/data/artifacts here — this is a safety net in case
 # anything regenerates a cctv/training folder in this repo again.
 cctv/training/
+
+# Model weights left at repo root by ad hoc local runs (not the deployed
+# copies -- those live under appstorage/, already ignored above)
+*.pt
+
+# Scratch experiments/validation scripts (not part of the shipped service)
+experiments/

@@ -95,9 +95,8 @@ log = logging.getLogger("godhaar.server")
 # exactly as built (embedding + color, with the tag_no veto). Confirmed
 # explicitly: this flag is about image/consistency quality only.
 #
-# REVERT: set this back to False once officers are done bulk-capturing and
-# quality should matter again. Nothing else needs to change.
-BYPASS_QUALITY_GATES = True
+# REVERTED 2026-08-09: field sync is done, quality gates matter again.
+BYPASS_QUALITY_GATES = False
 
 # ── TEMPORARY: accept every registration regardless of duplicate match ────────
 # Set True on the user's explicit instruction, 2026-08-09: real field
@@ -115,9 +114,9 @@ BYPASS_QUALITY_GATES = True
 # (including the tag_no veto's own reasoning, when it has data to reason
 # with) -- it just never raises.
 #
-# REVERT: set this back to False once go-apiserver sends real tag_no data
-# and it's time to "organize it" for real. Nothing else needs to change.
-BYPASS_DUPLICATE_CHECK = True
+# REVERTED 2026-08-09: field sync is done, duplicate check runs for real
+# again (now against the tiered verdict above, not the old flat AND-gate).
+BYPASS_DUPLICATE_CHECK = False
 
 
 @asynccontextmanager
@@ -559,8 +558,10 @@ def _run_registration_pipeline(
     # then crop-quality) — only the across-images fail-fast was removed.
     failures: list[ImageFailure] = []
     cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
+    t_muzzle_gate = time.monotonic()
     for i, mb in enumerate(muzzle_bytes, 1):
         slot = f"muzzle_{i}"
+        t_slot = time.monotonic()
 
         # Decoded unconditionally (not just after quality_check passes) so a
         # BYPASS_QUALITY_GATES fallback always has raw pixels to fall back to,
@@ -582,6 +583,7 @@ def _run_registration_pipeline(
             continue
 
         crop, det_status, _det_conf = crop_cattle(img_bgr)
+        log.info(f"{slot}: crop_cattle took {_ms_since(t_slot)}ms (status={det_status})")
         if crop is None:
             if BYPASS_QUALITY_GATES:
                 log.warning(f"{slot}: bypassing detection failure ({det_status}), using raw frame")
@@ -611,12 +613,16 @@ def _run_registration_pipeline(
 
         cropped_images[i - 1] = crop
 
+    log.info(f"muzzle quality/crop gate (3 images): {_ms_since(t_muzzle_gate)}ms")
+
     if failures:
         raise image_quality_error(failures)
 
     # ── Embed (batched forward pass) ─────────────────────────────────────
+    t_embed = time.monotonic()
     jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
     embeddings = embed_batch(jpg_bytes, model, device)
+    log.info(f"embed_batch (3 images): {_ms_since(t_embed)}ms")
 
     # ── Color extraction with consistency check ──────────────────────────
     #
@@ -627,10 +633,12 @@ def _run_registration_pipeline(
     #   Majority found → accept majority label (avg confidence of agreeing images).
     #   All 3 different → 422, ask user to retake.
 
+    t_body_color = time.monotonic()
     body_colors = [
         color_extractor.extract_body(_decode_image(fb, f"front_{i}"))
         for i, fb in enumerate(front_bytes, 1)
     ]
+    log.info(f"body_color extraction (2 images): {_ms_since(t_body_color)}ms")
     body_labels = [c["label"] for c in body_colors]
 
     if body_labels[0] == body_labels[1]:
@@ -639,7 +647,9 @@ def _run_registration_pipeline(
     else:
         body_color = _resolve_disagreeing_body_colors(body_colors)
 
+    t_muzzle_color = time.monotonic()
     muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
+    log.info(f"muzzle_color extraction (3 images): {_ms_since(t_muzzle_color)}ms")
     muzzle_labels = [c["label"] for c in muzzle_colors]
 
     # Count votes per label
@@ -676,12 +686,15 @@ def _run_registration_pipeline(
     # categorical label, so "the 2 photos disagree" isn't a retake-worthy
     # error the way a color mismatch is. Both readings are combined via a
     # confidence-weighted average instead.
+    t_morphology = time.monotonic()
     morphology_readings = [
         morphology_extractor.extract(_decode_image(fb, f"front_{i}"))
         for i, fb in enumerate(front_bytes, 1)
     ]
+    log.info(f"morphology extraction (2 images): {_ms_since(t_morphology)}ms")
     morphology = average_readings(morphology_readings)
 
+    log.info(f"_run_registration_pipeline total: {_ms_since(t_muzzle_gate)}ms")
     return embeddings.numpy(), body_color, muzzle_color, morphology
 
 
