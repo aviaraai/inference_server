@@ -212,12 +212,10 @@ async def register(
     muzzle_images: list[UploadFile] = File(...),
     front_images: list[UploadFile] = File(...),
     candidate_json: str = Form(..., alias="candidates"),
-    # NOT a purchase price. The go-apiserver side is piggybacking the animal's
-    # physical ear-tag number (tag_no) through this existing field name rather
-    # than adding a new one to this leg of the contract. Received here only so
-    # it's visible on the wire instead of silently swallowed by FastAPI's
-    # unknown-form-field handling — deliberately NOT persisted, matched, or
-    # used in the duplicate check: go-apiserver owns storing the real tag_no.
+    # The animal's physical ear-tag number (not a purchase price). go-apiserver
+    # sends it as its own `tag_no` form field. NOT persisted here — go-apiserver
+    # owns storing the real tag_no — but IS used below as a veto signal against
+    # the embedding+color duplicate verdict.
     tag_no: Optional[str] = Form(None),
     model: Any = Depends(get_model),
     device: Any = Depends(get_device),
@@ -230,9 +228,8 @@ async def register(
 
     Expects exactly 3 muzzle images and 2 front images.
 
-    ``cost`` is NOT a price — see the parameter comment above. It carries the
-    tag_no go-apiserver sends under that field name and is accepted-and-
-    dropped here on purpose.
+    ``tag_no`` is the animal's physical ear-tag number (not a price) — see
+    the parameter comment above.
     Requires ``candidates`` — a JSON string of nearby cattle
     (pre-filtered by GPS) with their stored colors:
         [{"faiss_id": 123, "body_color": "BLACK", "muzzle_color": "PINK"}, ...]

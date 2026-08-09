@@ -175,13 +175,12 @@ class CandidateInfo(BaseModel):
     body_color: str = Field(..., description="Stored body color label (e.g. BLACK)")
     muzzle_color: str = Field(..., description="Stored muzzle color label (e.g. PINK)")
     horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
-    # NOT a price. This animal's tag_no, piggybacked on the `cost` field name
-    # end to end (app -> go-apiserver -> here) -- see the `cost` parameter on
+    # NOT a price. This animal's tag_no -- see the `tag_no` parameter on
     # /register in main.py. Optional so a candidate registered before tag_no
     # existed can still be sent without one; the duplicate-check veto below
     # only fires when BOTH sides have a tag to compare.
     tag_no: Optional[str] = Field(
-        None, description="This candidate's stored tag_no (CandidateInfo.cost), echoed back so it can be compared against the query's own tag_no."
+        None, description="This candidate's stored tag_no, echoed back so it can be compared against the query's own tag_no."
     )
 
 
