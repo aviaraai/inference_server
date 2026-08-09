@@ -96,6 +96,26 @@ log = logging.getLogger("godhaar.server")
 # quality should matter again. Nothing else needs to change.
 BYPASS_QUALITY_GATES = True
 
+# ── TEMPORARY: accept every registration regardless of duplicate match ────────
+# Set True on the user's explicit instruction, 2026-08-09: real field
+# registrations are still hitting 409 DUPLICATE_ANIMAL because go-apiserver
+# does not send tag_no on candidates yet (the veto above has nothing to
+# compare against, so it never fires and every color+embedding match still
+# rejects). Until that's wired up, disable the duplicate check outright
+# rather than block real data collection on a check that cannot currently
+# use its own escape hatch.
+#
+# A SEPARATE flag from BYPASS_QUALITY_GATES on purpose: once syncing is done
+# these need to be re-enabled independently, not as a pair.
+#
+# While True, the check still RUNS and LOGS what it would have rejected
+# (including the tag_no veto's own reasoning, when it has data to reason
+# with) -- it just never raises.
+#
+# REVERT: set this back to False once go-apiserver sends real tag_no data
+# and it's time to "organize it" for real. Nothing else needs to change.
+BYPASS_DUPLICATE_CHECK = True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -308,15 +328,32 @@ async def register(
                 # stored tag, that is a human-verified signal they are
                 # DIFFERENT physical animals (this is precisely the
                 # same-breed/same-color goshala case tag_no exists to fix).
-                # Only fires when BOTH sides actually have a tag to compare --
-                # a candidate registered before tag_no existed, or a request
-                # sent with none, falls back to the embedding+color verdict
-                # unchanged rather than silently skipping the check.
-                if tag_no and stored.tag_no and tag_no != stored.tag_no:
+                tags_differ = tag_no and stored.tag_no and tag_no != stored.tag_no
+
+                # FOR NOW (explicit instruction, 2026-08-08): only ONE side
+                # having a tag isn't enough to PROVE they're the same animal
+                # either, and not every animal is guaranteed to be tagged yet
+                # during this rollout -- so don't let that partial comparison
+                # block a registration. Revisit once every animal reliably
+                # carries a tag; today this just means "can't confirm from
+                # tags alone" gets the benefit of the doubt.
+                one_sided = bool(tag_no) != bool(stored.tag_no)
+
+                if tags_differ or one_sided:
                     log.info(
-                        f"/register duplicate candidate cleared by tag_no mismatch | "
-                        f"score={match.score:.4f} | new_tag={tag_no} | "
-                        f"stored_tag={stored.tag_no} | matched_faiss_id={match.faiss_id}"
+                        f"/register duplicate candidate cleared by tag_no "
+                        f"({'mismatch' if tags_differ else 'one-sided, FOR NOW'}) | "
+                        f"score={match.score:.4f} | new_tag={tag_no!r} | "
+                        f"stored_tag={stored.tag_no!r} | matched_faiss_id={match.faiss_id}"
+                    )
+                    continue
+
+                if BYPASS_DUPLICATE_CHECK:
+                    log.warning(
+                        f"/register bypassing duplicate (BYPASS_DUPLICATE_CHECK) | "
+                        f"score={match.score:.4f} | "
+                        f"body={new_body} muzzle={new_muzzle} | "
+                        f"matched_faiss_id={match.faiss_id}"
                     )
                     continue
 
