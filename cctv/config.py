@@ -73,7 +73,20 @@ class PipelineConfig:
     filter_cattle_classes: bool = True
 
     # stable-ID mapper
-    stable_id_iou_thresh: float = 0.15
+    # Lowered from 0.15 -- StableIdMapper only reconnects a reappearing
+    # animal by bounding-box IoU against its last-seen position, no
+    # appearance signal at all, so any occlusion long enough for the animal
+    # to shift position gets minted as a brand-new ID. Measured against 2
+    # real clips (scratch_stableid_tune.py): 0.15->0.08 cut the
+    # unique_tracked_cattle vs max_cattle_in_frame fragmentation gap 44%
+    # (dense goshala: 39->22) and 70% (moderate clip: 10->3), with
+    # max_cattle_in_frame IDENTICAL in every run -- this only affects ID
+    # reconciliation, never the peak/detection count. Extending
+    # memory_frames instead barely moved the gap by comparison, so left at
+    # 90. Not a full fix -- residual fragmentation remains (see the scratch
+    # script's results) and closing the rest needs real appearance-based
+    # re-identification, not another threshold tweak.
+    stable_id_iou_thresh: float = 0.08
     stable_id_memory_frames: int = 90
     min_frames_visible: int = 5              # drop flicker IDs seen in fewer frames than this
 
