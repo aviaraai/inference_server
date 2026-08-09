@@ -27,6 +27,8 @@ import numpy as np
 import torch
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 
+from cctv.database import init_db as init_cctv_db
+from cctv.routes import router as cctv_router
 from dependency import (
     get_color_extractor,
     get_device,
@@ -47,6 +49,7 @@ from errors import (
 from faiss_index import FaissIndex
 from godhaar.config import (
     BODY_COLOR_MAJORITY_CONFIDENCE,
+    DUPLICATE_HIGH_CONFIDENCE_THRESHOLD,
     DUPLICATE_THRESHOLD,
     EMB_DIM,
     MODEL_VERSION,
@@ -179,6 +182,10 @@ async def lifespan(app: FastAPI):
     warmup_muzzle_detector()
     log.info("Warmup complete.")
 
+    # 7. Init CCTV model's session DB (third model — video analytics)
+    init_cctv_db()
+    log.info("CCTV model ready — session DB initialised.")
+
     elapsed = time.monotonic() - start
     log.info(
         f"Server ready in {elapsed:.1f}s — FAISS={len(faiss_index)} vectors, model={MODEL_VERSION}"
@@ -200,10 +207,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Third model, alongside detection (pipeline/) and identification (godhaar/):
+# video-based cattle counting/tracking/analytics. Self-contained under /cctv.
+app.include_router(cctv_router)
+
 # Renders DomainError as {"error_code": ..., "detail": {...}}. Plain
 # HTTPExceptions are untouched and keep answering with FastAPI's bare
 # {"detail": ...} — see the module docstring in errors.py for why that split
 # matters.
+#
+# This supersedes the inline InferenceError handler the cctv branch carried:
+# both put the same envelope on the wire, and errors.py is the factored version
+# the /register and /search paths on this branch already raise through.
 app.add_exception_handler(DomainError, domain_error_handler)
 
 
@@ -249,6 +264,17 @@ async def register(
     409 — duplicate muzzle detected, not stored
     422 — bad input (wrong image count, quality failure, no detection)
     500 — FAISS or internal system failure
+
+    Error bodies
+    ------------
+    Rejections this server decides on (409, and 422s about the photos) carry
+    {"error_code": ..., "detail": {...}} — see schema.ErrorCode. A 409 always
+    includes detail.matched_faiss_id so the caller can name the animal being
+    duplicated.
+
+    Failures caused by the caller sending the wrong thing — image counts,
+    malformed candidates — keep FastAPI's plain {"detail": ...} with no
+    error_code, which is how the API server tells the two cases apart.
     """
     if len(muzzle_images) != 3:
         raise HTTPException(
@@ -314,13 +340,37 @@ async def register(
                 break  # sorted descending — no point checking further
 
             stored = candidate_colors[match.faiss_id]
-            color_match = (
-                stored.body_color == new_body
-                and stored.muzzle_color == new_muzzle
-            )
+            body_match = stored.body_color == new_body
+            muzzle_match = stored.muzzle_color == new_muzzle
 
-            if color_match:
-                # tag_no veto: embedding + color say "same animal", but if the
+            # Tiered, not a flat AND-gate. body_color comes from
+            # detect_primary_animal() (pipeline/yolo_crop.py), which has NO
+            # quality/multi-cattle gate — unlike muzzle_color, which only
+            # ever comes from photos that already passed one. Requiring both
+            # to agree let one bad body_color read (a crowded goshala front
+            # photo picking a neighbour's coat) silently defeat a genuinely
+            # correct muzzle-embedding match — reported live as a real
+            # double-registration. See DUPLICATE_HIGH_CONFIDENCE_THRESHOLD's
+            # comment in godhaar/config.py for the full incident.
+            if match.score >= DUPLICATE_HIGH_CONFIDENCE_THRESHOLD:
+                # Embedding alone is decisive at this similarity — color
+                # cannot veto it, only corroborate/contradict for the log.
+                is_duplicate = True
+                if not (body_match and muzzle_match):
+                    log.warning(
+                        f"/register duplicate at score={match.score:.4f} "
+                        f"(>= {DUPLICATE_HIGH_CONFIDENCE_THRESHOLD}) despite "
+                        f"color mismatch — body_match={body_match} "
+                        f"muzzle_match={muzzle_match}; rejecting anyway"
+                    )
+            else:
+                # Ambiguous band: require the more trustworthy signal
+                # (muzzle_color) to corroborate. body_color is deliberately
+                # NOT required here — see comment above.
+                is_duplicate = muzzle_match
+
+            if is_duplicate:
+                # tag_no veto: the signals above say "same animal", but if the
                 # officer entered a tag that differs from this candidate's
                 # stored tag, that is a human-verified signal they are
                 # DIFFERENT physical animals (this is precisely the
@@ -360,9 +410,9 @@ async def register(
                     f"body={new_body} muzzle={new_muzzle} | "
                     f"matched_faiss_id={match.faiss_id}"
                 )
-                # body/muzzle colour ride along because they are WHY this is a
-                # duplicate — the embedding alone did not decide it — and the
-                # API server records the whole detail against the failure row.
+                # body/muzzle colour ride along because they are part of WHY
+                # this is a duplicate, and the API server records the whole
+                # detail against the failure row.
                 raise duplicate_animal_error(
                     matched_faiss_id=match.faiss_id,
                     top_score=match.score,

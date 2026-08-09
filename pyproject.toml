@@ -20,6 +20,7 @@ dependencies = [
     # a writable env — neither is guaranteed in the container, so pin it here.
     "ai-edge-litert==2.1.6",
     "python-multipart==0.0.32",
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [[tool.uv.index]]

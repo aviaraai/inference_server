@@ -5,6 +5,52 @@ muzzles. It is called only by the API server (never the app directly), returns
 raw similarity scores, and knows nothing about farmers/ownership. Endpoints:
 `POST /register` (201), `POST /search`, `GET /health`. Port 9050.
 
+There is now a **third model**, `cctv/` — video-based cattle counting/
+tracking/analytics, mounted under `/cctv` in `main.py`. It is fully
+self-contained (own config, SQLite session DB, in-memory background job
+queue) and independent of the register/search decision chain — no GPS,
+no farmer context, no FAISS. See the README's "Video Analytics (CCTV
+Model)" section for the endpoint list. Ported from a standalone prototype
+(`D:\Group Projects\cattle_ai_project`) that had already been built and
+verified against real sample video before the port.
+
+### Tracker YAML compatibility: `cmc_method` → `gmc_method` (ultralytics renamed the key)
+
+Porting the CCTV model's BoT-SORT tracker configs
+(`cctv/trackers/botsort_cattle_fast.yaml` / `botsort_cattle.yaml`) verbatim
+from the source prototype caused every `/cctv/analyze` job to fail
+mid-processing with `'IterableSimpleNamespace' object has no attribute
+'gmc_method'`. The prototype was built against `ultralytics>=8.3` (loose);
+this repo pins `ultralytics==8.4.83`. Between those versions ultralytics
+renamed BoT-SORT's camera-motion-compensation key from `cmc_method` to
+`gmc_method` (confirmed by reading the installed package's own
+`ultralytics/cfg/trackers/botsort.yaml`) — the old key is now silently
+ignored by YAML parsing (not a KeyError) and the code that reads
+`args.gmc_method` finds nothing, so the failure only surfaces once BoT-SORT
+actually runs, not at config-load time. Fixed by renaming the key in both
+YAMLs and adding `model: auto` (the installed default's value, needed once
+`with_reid: true` is set for the accurate preset). **Verified end-to-end
+after the fix**: ran a real sample video through `/cctv/analyze` on this
+machine's GPU — 16 unique cattle tracked, full analytics (density grid,
+per-cow speed/activity, isolation) computed, session persisted to SQLite,
+annotated video downloadable via `/cctv/jobs/{id}/video`.
+
+**Lesson: never trust a bundled tracker/model YAML to survive a version
+bump untouched — diff it against the currently-installed library's own
+default config before assuming it will load.** This is the same class of
+mistake as pinning a numeric threshold across two codebases without
+checking they mean the same thing (see the Telangana app's CLAUDE.md for
+other examples of this pattern) — here it was a config *key name*, not a
+value, but the failure mode (silently wrong until the code path actually
+runs) is identical.
+
+Also fixed while porting: the prototype's `cattle_ai/analytics.py` called
+`cv2.applyColorMap`/`cv2.line` in `_render_heatmap`/`draw_trajectories`
+without ever importing `cv2` — a `NameError` waiting to happen on the very
+first `compute()` call with `enable_analytics=True` (which is the default).
+Never triggered in the prototype because whatever testing it got apparently
+didn't exercise that path end-to-end. Added the import in `cctv/analytics.py`.
+
 ## The pipeline embeds the whole animal, NOT an isolated muzzle
 
 This is the single most important thing to understand about matching quality.
@@ -68,10 +114,12 @@ photos; 4 real non-close-up photos showed **identical** behaviour (no
 regression), and the one over-threshold photo now crops instead of passing the
 full frame through.
 
-**Status: local working-tree change only — NOT committed, NOT deployed.** The
-running GPU server is unaffected until someone pulls this and restarts the
-inference container. **This fix removes the catastrophic case but has NOT been
-confirmed to fully fix matching** — see "Still open" below.
+**Status: committed** (`1db86da`, on `feature/cctv-video-analytics` — this was
+still an uncommitted working-tree change when this note was first written).
+Not yet confirmed deployed — a running GPU server only picks this up once
+someone pulls the branch and restarts the inference container. **This fix
+removes the catastrophic case but has NOT been confirmed to fully fix
+matching** — see "Still open" below.
 
 ### Still open: is the crop fix ENOUGH? (needs a real different-animal test)
 
@@ -897,3 +945,235 @@ REVIEW, which the app still surfaces as a result.
   its lifespan). To embed: `crop_cattle(img)` → `cv2.imencode(".jpg", crop)` →
   `embed_batch([jpg], model, device)`. Cosine = dot product of unit-norm 256-d
   vectors.
+- To run locally outside Docker, `MODEL_PATH`/`FAISS_INDEX_PATH` env vars are
+  required (lifespan raises if unset). `MODEL_PATH` must point at a real file
+  (`for_aditya/best_top1.pt` works); `FaissIndex.load()` tolerates a
+  non-existent `FAISS_INDEX_PATH` — just logs a warning and starts empty, so
+  any placeholder path is fine for testing anything that isn't `/register`/
+  `/search`. `YOLO_MODEL_PATH` is optional, defaults to a bundled name.
+
+## CCTV counting was unreliable on real footage — full tuning history
+
+Everything below happened on `feature/cctv-video-analytics`, on top of the
+`0f2b312` CCTV commit, across several rounds. The branch is pushed — confirm
+`git log --oneline -6` matches before assuming any of this is still pending.
+
+**The original problem, on a real 48.8s field clip (herder + small herd,
+never more than ~10 cattle visible in any frame):** `final_cattle_count`
+(then = unique tracked IDs) read **81** — it grew almost linearly with video
+duration (34 on a 15s trim, 56 on 30s, 81 on 48.8s) regardless of how many
+animals were actually ever on screen at once. Root cause, confirmed
+**visually** by extracting annotated frames, not just from the numbers: the
+tracker was minting a new ID for the same physical animal repeatedly
+(flicker), and — separately — the detector itself sometimes fires two
+overlapping boxes on one animal in a single frame.
+
+Fixes tried, each verified against the same clip before moving to the next
+(diminishing but real returns — 81 → 51 unique-ID count across all of them):
+1. `stable_id_iou_thresh` 0.25→0.15, `stable_id_memory_frames` 30→90
+   (`PipelineConfig` dataclass defaults — these are **not** per-preset, no
+   `PRESETS` entry overrides them, so this affects every preset equally).
+2. New `min_frames_visible=5` config knob — drop any stable ID seen in fewer
+   frames from the final count (kills pure flicker).
+3. `fast` preset switched from `botsort_cattle_fast.yaml` (`with_reid:
+   false`) to `botsort_cattle.yaml` (`with_reid: true`) — appearance ReID
+   re-identifies cattle after occlusion. Barely moved the number (53→51) and
+   barely changed processing time either — the earlier "accurate preset is
+   slower" difference was mostly the higher `img_size`/no frame-skip, not
+   ReID itself.
+4. NMS/confidence: added `nms_iou=0.45` (new field, passed as `iou=` to
+   `model.track()`/`.predict()` — wasn't wired at all before), raised
+   `confidence` 0.25→0.35. Reduced the **same-frame duplicate-box** artifact
+   from 3 overlapping boxes on one cow down to 2 — did not eliminate it, and
+   the count plateaued around 50, not the 15-20 range a genuinely-fixed
+   count should land in on this footage. **Conclusion at the time: the
+   remaining inflation looks like the model itself sometimes double-detecting
+   or under-segmenting close-together cattle at some angles — a real
+   detection-quality question, not a threshold to keep nudging.**
+
+**Given that, the counting methodology itself changed** rather than chasing
+the detector further: `/result`'s `final_cattle_count` and `/analytics`'s
+`total_cattle` were both switched to report `max_cattle_in_frame` (peak
+simultaneous count — visually countable against the video) instead of the
+unique-tracked-ID count, which is what all the tuning above was trying to
+stabilize. `unique_tracked_cattle` stays exposed separately for whoever wants
+the tracking-based figure. On the same clip this reads **9** — the tuning
+work above is still real (it's what the tracker/analytics internals use to
+build `unique_tracked_cattle` and the per-cow list), it's just no longer
+what gets surfaced as *the* number.
+
+**`analytics.py`'s per-cow count and `pipeline.py`'s final count can silently
+disagree if you touch one without the other** — this bit twice. First
+`VideoAnalytics` computed `total_cattle=len(per_cow)` completely
+independently of `pipeline.py`'s flicker filter (fixed by adding the same
+`min_frames_visible` filter to `_compute_per_cow`, threaded through from
+`cfg.min_frames_visible` via `routes.py`'s `VideoAnalytics(...)` call). Then
+the max-in-frame switch above had to touch **both** `routes.py` (`/result`)
+and `analytics.py`'s `compute()` (`total_cattle=peak_count` from
+`max(self._frame_counts)`) for the same reason — one file's number without
+the other just moves the disagreement around instead of closing it.
+
+**Fixed, in a follow-up commit:** `GET /history`/`GET /trends` read straight
+from the `sessions` table, and `database.py`'s `save_session()` was
+persisting `summary.final_cattle_count` — the pipeline-level, tracked-ID
+field — while `/result`/`/analytics` had already moved to peak-in-frame.
+Same job showed 9 live and 50 in `/history`/`/trends`, confirmed not
+theoretical. Fix: `save_session()` now writes `summary.max_cattle_in_frame`
+into the `final_cattle_count` column too (same value already going into the
+`max_in_frame` column — both columns are redundant now, left as-is rather
+than restructuring the schema for this). Verified end-to-end: submitted a
+video, got 9/9/9/9 across `/result`, `/analytics`, `/history`, and `/trends`
+for the same job.
+
+### The annotated video was never actually playable in a browser
+
+`pipeline.py` wrote `annotated.mp4` via `cv2.VideoWriter(fourcc=mp4v)` —
+confirmed via `CAP_PROP_FOURCC` readback the file was really tagged `FMP4`
+(MPEG-4 Part 2). No mainstream browser decodes that in a `<video>` tag —
+confirmed directly, not just from the codec name: loaded a real output file
+in Chrome, `readyState` stayed `0` forever, `canPlayType('...mp4v...')` came
+back `""` while `canPlayType('...avc1...')` said `"probably"`.
+
+The fix is not "pass a different fourcc to `cv2.VideoWriter`" — tried
+`avc1`/`h264`/`H264`/`x264`, all fail identically on this machine:
+```
+Failed to load OpenH264 library: openh264-1.8.0-win64.dll
+Could not open codec libopenh264, error: Unspecified error (-22)
+```
+OpenCV's bundled FFmpeg needs Cisco's OpenH264 DLL for H.264 encoding and it
+won't load here — `cv2.VideoWriter.isOpened()` still reports `True` and
+writes a non-empty file regardless, which is a trap: that file **also**
+never leaves `readyState 0` in a real browser. Don't trust `isOpened()` or
+"cv2 can read back its own file" as evidence a browser can play it — verify
+in an actual `<video>` tag.
+
+**Actual fix:** added `imageio-ffmpeg` (real, self-contained ffmpeg binary,
+bundled via pip — independent of whatever codecs the host has) to
+`pyproject.toml` (this repo is uv-managed, there is no `requirements.txt`).
+`process_video()` now re-encodes the raw `cv2.VideoWriter` output to real
+H.264 immediately after `writer.release()`:
+```python
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+subprocess.run([ffmpeg_path, "-y", "-i", raw_path, "-vcodec", "libx264",
+                 "-preset", "fast", "-crf", "23", "-movflags", "+faststart",
+                 h264_path], check=True, capture_output=True)
+os.replace(h264_path, raw_path)
+```
+Verified via ffmpeg's own stream probe afterward: `Video: h264 (High) (avc1
+/ 0x31637661), yuv420p`. Range-request support (needed for browser
+seeking/scrubbing) needed **no code change** — Starlette's `FileResponse`
+(used by `GET /jobs/{id}/video`) already answers `Range` headers with a
+correct `206 Partial Content` + `Content-Range`.
+
+**One caveat that's environmental, not a code problem:** could not get a
+`<video>` element to actually reach `playing` in this session's browser-
+automation tooling. Before concluding the fix was broken, ran a control
+experiment — generated a trivially tiny, freshly-encoded H.264 file via the
+exact same `imageio-ffmpeg`/libx264 path, served it through the same
+`FileResponse` mechanism, zero cross-origin variables. **It also never left
+`readyState 0`.** That means this specific automated Chrome instance can't
+decode H.264 at all right now, independent of anything about this fix —
+every other independently-checkable signal (container structure, codec
+probe via ffmpeg itself, `Content-Length` matching disk size, correct Range
+handling) came back correct. Get a real visual confirmation from an actual
+desktop browser before fully trusting this — the automation environment
+could not provide one.
+
+### Both counts shown side by side, not one picked as "the" answer
+
+Reported live: a panning shot down a long goshala feeding-trough row read
+`final_cattle_count: 22` when the herd visibly looked far larger than that.
+The full report had a second number that wasn't being surfaced anywhere
+except `/result`: `unique_tracked_cattle: 62`. Both are real, honestly
+computed, and biased in *opposite* directions depending on whether the
+camera is static or panning — max-in-frame (the original tuning history
+above) undercounts a panning shot across a herd bigger than any single
+frame ever holds; the tracked-ID count over-counts a static scene via
+tracker churn (the original 81-vs-~10 problem this file already documents).
+Rather than pick one as authoritative, `/analytics`, `/history`, and
+`/trends` now all expose both — `total_cattle`/`final_cattle_count` (peak)
+alongside `unique_tracked_cattle` (tracking) — and the goshala manager
+picks whichever fits their camera setup. `AnalyticsResult.unique_tracked_cattle`
+is free to compute: it's just `len(per_cow)`, already filtered by the same
+`min_frames_visible` fix `pipeline.py`'s peak/tracking numbers use, so the
+two stay in sync automatically rather than needing separately-maintained
+logic. Session rows created before this column existed read back as `null`
+for the new field via a migration (`PRAGMA table_info` + `ALTER TABLE` —
+`CREATE TABLE IF NOT EXISTS` alone doesn't add a column to an existing
+table) rather than erroring.
+
+Also fixed while surfacing counts: `JobResult.output_video` and the
+`sessions` DB row's `output_video` were both raw server filesystem paths
+(`D:\...\annotated.mp4`) — useless to any client. Renamed to `video_url`,
+set to the actual `GET /jobs/{id}/video` route. This surfaced a real latent
+bug: that endpoint only ever read from the in-memory `_jobs` tracker, which
+is never persisted, so a `/history` video link for any session older than
+the current server process's uptime would 404 even though the DB row and
+on-disk file both survive a restart. Fixed by falling back to
+`db.get_session(job_id)` when the job isn't in memory. Verified by actually
+downloading the video through the real endpoint (not just checking the file
+exists on disk) both immediately after processing and again after clearing
+`_jobs` to simulate a restart — same URL, same file, both times.
+
+### `crowded` preset — FAST's thresholds badly undercount a packed goshala row
+
+Reported live, on the same panning-shot clip above: even `max_cattle_in_frame`
+(22) looked low against the actual video — a wide shot down a long feeding
+trough visibly holds far more cattle at once than that. Confirmed by
+extracting frames and counting by eye: single frames in this clip show
+roughly 35-55+ cattle simultaneously, well above what `FAST` was reporting
+even as its *peak*.
+
+Root cause, confirmed empirically rather than guessed (raw-YOLO test across
+3 of the densest frames, then re-verified through the full detect+track
+pipeline on the whole clip — scratch scripts, not committed, results below
+are what matters): `FAST`'s `confidence=0.35` (raised from 0.25 earlier in
+this file's own history, but tuned against a *sparse* open-field herd to
+kill duplicate-box artifacts on a single animal) was filtering out genuine,
+lower-confidence detections of small/rear-view/heavily-occluded animals
+further back in a packed row — **not** a false-positive problem, so
+loosening it doesn't reintroduce the noise the original fix was guarding
+against:
+
+- Raw YOLO on 3 dense frames: `conf=0.35/iou=0.45` (current) found 10-13
+  boxes each. `conf=0.15/iou=0.45` nearly doubled that (18-26). Adding
+  `iou=0.6` pushed further (20-31).
+- Full pipeline, whole clip: baseline `peak=22/tracked=62`. `conf=0.15,
+  iou=0.45` reached `peak=26` but tripped ultralytics' *"NMS time limit
+  exceeded"* warning on this clip — a real reliability risk, not just a
+  number. `conf=0.15, iou=0.6` and `conf=0.20, iou=0.55` both reached the
+  same `peak=26` without that warning; picked `0.20/0.55` as the safer of
+  the two equally-good options.
+- Checked for regression on a second, less-crowded clip before trusting
+  this: `peak=14→16`, `tracked=20→26` — same direction, much smaller
+  magnitude, no false-positive blow-up. Total detections and average
+  confidence scaled proportionately with the count increase on both clips
+  (not exploding independently), consistent with recovering real missed
+  animals rather than adding noise.
+- Tried `yolo11m` (what `BALANCED`/`ACCURATE` already use) at the same
+  tuned thresholds, expecting a further gain. It didn't help —
+  `peak=23`, slightly *worse* than `yolo11s`'s 26, at the same processing
+  cost. Model size isn't the bottleneck here; this preset stays on
+  `yolo11s`.
+
+**Deliberately shipped as a new opt-in `Preset.CROWDED`
+(`confidence=0.20, nms_iou=0.55`, otherwise identical to `FAST`), not a
+change to `FAST`'s defaults.** The original `0.35/0.45` was tuned against a
+genuinely different clip (the sparse open-field herd earlier in this file)
+that is no longer available to re-verify against — changing the global
+default risks silently undoing that fix for the case it was built for.
+Same principle as showing peak vs. tracked side by side above: let the
+caller pick the tool for their camera setup instead of guessing one
+answer fits every scene. `nms_iou` is now also exposed as a per-request
+`/analyze` override (`img_size`/`confidence`/`vid_stride` already were;
+this closed the inconsistency), independent of the new preset.
+
+**Still an honest gap, not a full fix.** `peak=26` against a ~35-55 visual
+estimate on the same clip means real animals are still being missed even
+after this tuning — the gains plateaued at the same `peak=26` across three
+different confidence/IoU combinations, which looks like `yolo11s` approaching
+its real detection ceiling on this level of shoulder-to-shoulder occlusion,
+not a threshold left untuned. This generic COCO-pretrained model was never
+trained on this specific scene type. If more accuracy is needed here, the
+next lever is a model fine-tuned on genuinely crowded barn footage — a
+data/training problem, not a config change.

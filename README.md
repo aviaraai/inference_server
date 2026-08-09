@@ -33,6 +33,47 @@ This pipeline intentionally does not make the final decision. It simply returns 
 
 The main backend API takes these results, calculates the GPS distance, applies any color penalties, and uses the final thresholds to decide if it is a MATCH or if it needs MANUAL REVIEW.
 
+## Video Analytics (CCTV Model)
+
+A third model lives alongside detection (YOLO crop) and identification
+(DINOv2/GodhaarModel): **`cctv/`** — video-based cattle counting, tracking,
+and herd analytics from an uploaded CCTV/handheld clip. It is self-contained
+(its own config, SQLite session DB, background job queue) and mounted under
+the `/cctv` prefix in `main.py`.
+
+Pipeline: read frames (OpenCV, frame-stride sampling) → YOLO detect
+(`ultralytics`, cattle-class filter) → BoT-SORT track → `StableIdMapper`
+rewrites volatile tracker IDs into stable, monotonic "Cow ID N" labels
+(IoU-matched against a short memory window, so brief occlusion doesn't
+mint a new ID) → annotated MP4 + per-frame CSV + analytics (movement
+speed/distance, an N×N density heatmap, isolation flags, activity
+classification, dwell zones). The final cattle count is always the number
+of unique stable IDs minted — never raw detection count or max-per-frame.
+
+Endpoints (all under `/cctv`, upload is multipart form data):
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/cctv/health` | Liveness + active job / session counts |
+| POST | `/cctv/analyze` | Upload a video, start a background job → `job_id` |
+| GET | `/cctv/jobs/{id}/status` | Poll progress |
+| GET | `/cctv/jobs/{id}/result` | Final counts/throughput once done |
+| GET | `/cctv/jobs/{id}/analytics` | Movement/density/isolation/activity |
+| GET | `/cctv/jobs/{id}/video` | Download the annotated MP4 |
+| GET | `/cctv/history` | Past sessions, optionally filtered by `location` |
+| GET | `/cctv/trends` | Cross-video count/speed/isolation trend series |
+| DELETE | `/cctv/jobs/{id}` | Remove a job's outputs |
+
+`POST /cctv/analyze` accepts `preset` (`fast`/`balanced`/`accurate`/
+`live_cpu`/`live_gpu`), `location_tag`, `enable_analytics`, and optional
+`img_size`/`confidence`/`vid_stride` overrides. Processing runs in a
+background thread; poll `/cctv/jobs/{id}/status` until `status == "done"`,
+then fetch `/result` and `/analytics`.
+
+This model needs no GPS/candidate wiring and no farmer/ownership context —
+unlike `/register` and `/search`, it's a standalone counting/analytics tool,
+not part of the muzzle re-identification decision chain.
+
 ## Running the Pipeline
 
 You can run the entire pipeline locally using Docker. The Docker container expects a few external files to be mounted:

@@ -1,0 +1,21 @@
+# BoT-SORT — accurate preset (ReID on, better identity preservation)
+tracker_type: botsort
+
+track_high_thresh: 0.2
+track_low_thresh: 0.05
+new_track_thresh: 0.35
+track_buffer: 120
+match_thresh: 0.75
+
+# appearance / ReID
+with_reid: true
+model: auto
+
+# global motion compensation (renamed from cmc_method in newer ultralytics)
+gmc_method: none
+
+# Kalman filter
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+
+fuse_score: true
