@@ -35,9 +35,22 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 # ── YOLO cattle class filter ──────────────────────────────────────
 # COCO class names that count as "cattle". The pipeline maps these
 # to class-IDs at runtime so they survive model swaps.
+#
+# Checked against the actual yolo11s.pt COCO class list: "cattle", "bull",
+# "calf", "buffalo", "bovine", "ox" match NOTHING -- COCO (80 classes) has
+# no such names, so those six entries were dead vocabulary that never
+# matched any real detection. Only "cow" (19) and "horse" (17) ever fired.
+#
+# That silently undercounts water buffalo -- extremely common in Indian
+# goshalas -- since COCO has no buffalo class and a generic detector
+# routinely misclassifies one as a visually-similar animal instead. The
+# OTHER service in this repo (pipeline/yolo_crop.py) hit and fixed the
+# exact same problem already: it matches classes {17,18,19,20,21} =
+# horse/sheep/cow/elephant/bear specifically "to catch buffalo
+# misclassifications" (see CLAUDE.md). Applying the same, already-
+# validated fix here rather than re-deriving it blind.
 CATTLE_TERMS: set[str] = {
-    "cow", "cattle", "bull", "calf", "buffalo",
-    "bovine", "ox", "horse",           # horse kept for COCO compat
+    "cow", "horse", "sheep", "elephant", "bear",
 }
 
 
