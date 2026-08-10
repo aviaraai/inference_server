@@ -62,6 +62,7 @@ class Preset(str, Enum):
     LIVE_CPU = "live_cpu"
     LIVE_GPU = "live_gpu"
     CROWDED = "crowded"                      # dense goshala/shed footage -- see PRESETS comment
+    CROWDED_HD = "crowded_hd"                # CROWDED, but inferring at the source's own resolution band
 
 
 @dataclass
@@ -182,6 +183,56 @@ PRESETS: dict[Preset, dict] = {
     Preset.CROWDED: dict(
         model_path="yolo11s.pt",
         img_size=640,
+        vid_stride=2,
+        confidence=0.20,
+        nms_iou=0.55,
+        tracker_yaml=str(BASE_DIR / "trackers" / "botsort_cattle.yaml"),
+        half=False,
+    ),
+    # CROWDED's thresholds, but inferring at 1920 instead of 640. Use this for
+    # any source above ~1080p -- i.e. every real government CCTV feed we have.
+    #
+    # The "honest gap" recorded on Preset.CROWDED above (peak=26 against a
+    # ~35-55 visual estimate) was diagnosed there as yolo11s approaching its
+    # detection ceiling. That diagnosis was WRONG, and this preset is the
+    # correction. The ceiling was never the model -- it was that a 2560x1440
+    # frame is scaled to 640 before inference, a 4x reduction, which drops a
+    # background animal from ~120px tall to ~30px, under what the detector can
+    # resolve. Every knob tuned on CROWDED (confidence, nms_iou, model size)
+    # was tuned downstream of that loss, which is why they all plateaued
+    # together at the same peak=26.
+    #
+    # Measured 2026-08-10 on 23 real government goshala clips (2560x1440 @
+    # 25fps, CP Plus IP cameras, 4 distinct sheds incl. one 02:00 night scene):
+    #   - Raw detections, 60 frames spanning 20 clips of shed 1: +25.4% at
+    #     1920 vs 640, EVERY clip positive, extra boxes landing at a median
+    #     0.80 confidence -- recovered animals, not scraped-barrel noise.
+    #   - Full pipeline peak_cattle_in_frame, the 3 wider-angle sheds:
+    #     23->46, 20->43, 21->28. The two wide sheds literally DOUBLE.
+    #   - Hand count on one night frame: ~50 animals visible; 640 found 17
+    #     (34%), 1920 found 37 (74%).
+    #   - average_confidence rises too (0.45->0.56, 0.48->0.53, 0.51->0.64):
+    #     more detections AND more certain, which is not what adding false
+    #     positives looks like.
+    #
+    # The gain scales with how WIDE the camera is: a narrow shed where animals
+    # already fill the frame gains only 1.3x, a wide shed covering a whole
+    # feeding row gains 2.2x. That is the tell that this is a pixels-on-target
+    # problem, not a threshold problem.
+    #
+    # Cost is small because a 4060-class GPU is idling at 640: inference
+    # 45ms -> 64ms (1.4x), end-to-end throughput ~12.5 -> ~9.5 fps, still
+    # comfortably faster than real time for a 25fps source.
+    #
+    # Deliberately opt-in rather than a change to CROWDED's img_size, for the
+    # same reason CROWDED itself was added opt-in rather than retuning FAST:
+    # CROWDED's numbers were tuned against a clip that is no longer available
+    # to re-verify against. Callers on genuinely low-resolution feeds should
+    # stay on CROWDED -- inferring at 1920 on a 640x480 sub-stream only
+    # upscales pixels that were never recorded and wastes the compute.
+    Preset.CROWDED_HD: dict(
+        model_path="yolo11s.pt",
+        img_size=1920,
         vid_stride=2,
         confidence=0.20,
         nms_iou=0.55,
