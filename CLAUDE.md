@@ -853,6 +853,73 @@ calibrated against **is no longer in the repo**, so a change cannot be checked
 for regressions. Needs that photo set (or a new labeled one) before either
 threshold moves.
 
+### Still open: `SUBJECT_DOMINANCE_RATIO` (2.0) doesn't clear on all real photos
+
+Found while investigating an unrelated question (a LightGlue keypoint-matching
+experiment for search false-positives, see the Telangana frontend repo's
+CLAUDE.md) that needed clean muzzle crops for 9 real registered animals from a
+Dehradun goshala. Running those photos through the *current, already-fixed*
+`crop_cattle` surfaced two that still hit `RECAPTURE_MULTI_CATTLE` today:
+
+- **`UKDEJS189273/muzzle3.jpg`** — two real animals, comparably sized and
+  centered: dominance scores **0.4458** vs **0.2342**, ratio **1.90** (needs
+  ≥2.0 per `SUBJECT_DOMINANCE_RATIO`). Reproducible every run — both
+  detections are comfortably above `YOLO_CONF` (0.568, 0.500), so this is a
+  genuine near-miss on the ratio itself, not a detection-threshold flicker.
+- **`UKDEJS852420/muzzle2.jpg`** — same failure mode, ratio **1.18**
+  (0.2998 vs 0.2536) *when the second animal's box clears `YOLO_CONF=0.30`
+  at all* (observed 0.330 in a full-batch run, alongside 39 other images).
+  Run in isolation (fresh process, this photo only), the same second
+  detection scored **0.285** — just under the 0.30 cutoff — and the image
+  failed as `RECAPTURE_NO_DETECTION` instead of `RECAPTURE_MULTI_CATTLE`.
+  Repeated 3x in isolation, always 0.285/`RECAPTURE_NO_DETECTION`; repeated
+  as part of the full 40-image batch, always 0.330/`RECAPTURE_MULTI_CATTLE`.
+  So **this specific photo's YOLO confidence is not perfectly reproducible
+  across execution contexts** — something about batching position, prior GPU
+  state, or CUDA algorithm selection shifts a borderline (~0.28–0.33)
+  detection across the 0.30 accept boundary. The end result is the same
+  either way (rejected, no usable crop), but which rejection reason fires is
+  not stable, which matters if anything downstream ever branches on the
+  specific status string.
+
+Both are real, current-production field photos — not the synthetic
+equal-pair test the original fix was verified against, and not the 5 photos
+`SUBJECT_DOMINANCE_RATIO=2.0` was calibrated on (documented above: those
+scored 5.9x–42x, nowhere near this boundary). So the goshala-crowding problem
+the original fix targeted is **not fully solved**: photos exist today where
+two animals are close enough in size/centering that registration or search
+would still hit `RECAPTURE_MULTI_CATTLE` (or a flickering
+`RECAPTURE_NO_DETECTION`) with no retake that fixes it — the exact complaint
+the original fix exists to resolve, just at a harder margin than the
+calibration set covered.
+
+**Downstream effect worth flagging, not just the rejection itself:** in a
+strictly-gated `/register` or `/search` call this photo 422s and blocks that
+slot outright — visible, not silent. But `_run_registration_pipeline`'s
+`BYPASS_QUALITY_GATES` fallback for a detection failure is the **raw,
+uncropped frame** (background, other cattle, and all) going straight into the
+DINOv2 embedding (`main.py`, the `if crop is None: ... cropped_images[i-1] =
+img_bgr` branch). If that flag is ever active again during a bulk-capture
+push, a multi-cattle photo like these two would silently embed a
+diluted, multi-animal frame instead of failing loudly — worse than the
+rejection this fix was built to avoid. (`/search`'s pipeline has no such
+fallback at any time — see the flag's own history — so this specific risk is
+`/register`-only.)
+
+**Not fixed here — flagged for its own investigation, per explicit
+instruction not to touch `crop_cattle` while this was still being
+diagnosed.** Options worth considering later, none decided: lowering
+`SUBJECT_DOMINANCE_RATIO` (real headroom may exist — the original calibration
+margin was 5.9x+, far above 2.0 — but re-verify against the original 5-photo
+set first so this doesn't regress the case the threshold was built for);
+making the ambiguous-multi-cattle fallback smarter than "use the whole raw
+frame" (e.g. crop to the union of the competing boxes, or to the
+higher-scoring one anyway, rather than returning `None`); investigating the
+run-to-run confidence non-determinism near `YOLO_CONF` directly (fixed seed?
+disabled cuDNN autotune?); or simply treating both as genuine retake cases
+and improving the officer-facing message. Needs a larger real-photo sample
+before any of these are decided.
+
 ## Registration quality gate now checks all 3 muzzle photos before failing, not just the first
 
 `_run_registration_pipeline`'s quality/detection loop used to `raise` the
@@ -957,6 +1024,190 @@ candidate filter are the API server's job (`decide()`: MATCH ≥ 0.82 with
 rank1−rank2 gap ≥ 0.08; REVIEW ≥ 0.72; else UNKNOWN). A single candidate in
 range means gap = 0, so it can never be a clean MATCH — a score ≥ 0.72 becomes
 REVIEW, which the app still surfaces as a result.
+
+## `/search` fusion tiebreaker: LightGlue as an additive, inert signal
+
+Built on the validation in the LightGlue POC section above (13 real Dehradun
+`/search` false-positive incidents, re-run against production crops — see the
+Telangana frontend repo's CLAUDE.md for the full experiment). This wires that
+validated signal into `/search` for real, as three new response fields that
+**nothing reads yet**.
+
+**What it does.** After `/search` computes its normal ranked `matches` (no
+change to that computation), if the top-1 candidate is ambiguous —
+`REVIEW_THRESHOLD ≤ score ≤ MATCH_THRESHOLD`, OR `gap < GAP_THRESHOLD` — and a
+cached crop exists for that candidate, it runs DISK+LightGlue keypoint
+matching between the query's own muzzle crop and the candidate's cached crop,
+and attaches the result:
+
+```
+lightglue_checked: bool                                   # did the tiebreaker actually run
+lightglue_num_matches: int | None                          # raw LightGlue match count
+lightglue_zone: "likely_same" | "likely_different" | "ambiguous" | None
+```
+
+**Why this is safe to ship with zero go-apiserver changes.** Confirmed by
+reading `go-apiserver/internal/inference/client.go:155` — it decodes this
+server's JSON with plain `json.Unmarshal`, no `DisallowUnknownFields()`, so Go
+silently ignores fields its `SearchResponse`/`SearchMatch` structs don't
+declare. The three fields above are live and totally inert until someone adds
+matching struct fields on the Go side and chooses to read them. Fields are
+top-level on `SearchResponse`, not on `MatchCandidate` — they describe "query
+vs. top_matches[0]" specifically, not a property of any one ranked row.
+
+**This server still makes no decision.** `_SEARCH_MATCH_THRESHOLD_MIRROR` /
+`_SEARCH_REVIEW_THRESHOLD_MIRROR` / `_SEARCH_GAP_THRESHOLD_MIRROR` (`main.py`,
+values 0.82/0.72/0.08) are a hand-maintained **mirror** of go-apiserver's
+`decision.go`, used only to decide whether it's worth spending GPU time on an
+optional signal — not a copy of business logic living here (the rule in
+`godhaar/config.py`'s docstring against that still holds; these three
+constants deliberately live in `main.py`, not there). They're also applied to
+this server's own raw per-embedding `top_matches` ranking, computed *before*
+go-apiserver aggregates multiple embeddings per animal and applies its
+attribute-agreement adjustment — an approximation of what go-apiserver will
+decide, not identical to it. There is no shared source between the two repos;
+if `decision.go`'s thresholds move, these need updating by hand.
+
+**Where the query and candidate crops come from.**
+- Query crop: free — `_run_search_pipeline` already computes it for the
+  embedding, now also returns it.
+- Candidate crop: `pipeline/muzzle_crop_cache.py`, a local file cache at
+  `MUZZLE_CROP_CACHE_DIR` (default `/appstorage/muzzle_crops/<faiss_id>.jpg`
+  — the same host-mounted volume `FAISS_INDEX_PATH` already lives on, so no
+  new infrastructure). Written by `/register` right after `faiss_ids` are
+  assigned, keyed by `faiss_id` — which is 1:1 with a specific muzzle crop,
+  so the cache always holds exactly the crop that produced whichever
+  embedding scored highest, no "which of the 3 photos" ambiguity.
+  **This was the deciding factor over fetching from GCS at search time**:
+  inference_server has no GCS credentials and no DB connection to resolve
+  `faiss_id → image_key` (that mapping lives in go-apiserver's Postgres
+  `embeddings`+`images` tables) — either GCS route would have meant a
+  go-apiserver change or a new, larger coupling. The local cache needs
+  neither.
+- **Known gap, accepted deliberately: no backfill.** Only animals registered
+  *after* this shipped have a cached crop. Every animal already in the FAISS
+  index (139 Dehradun animals as of this writing) gets `lightglue_checked:
+  false` on an ambiguous search until re-registered. A one-time backfill
+  (fetch each existing animal's muzzle image from GCS once, with temporary
+  credentials, populate the cache) is a real but bounded task — not
+  attempted here, not needed to ship this.
+
+**Zone thresholds — derived from data, not guessed.** From
+`lightglue_fp_results_cropped.csv` (the production-crop LightGlue
+validation), restricted to the 48 pairs whose *both* images actually cleared
+production's quality/detection gates — the only population a live `/search`
+call can ever present this function with (a gate-failing query 422s before
+reaching here; a gate-failing registered image was never cached in the first
+place, register-only `BYPASS_QUALITY_GATES` history aside):
+
+- 25 clean false-positive pairs: `num_matches` 6..96 (max 96, 2nd-highest 84)
+- 23 clean true-positive pairs: `num_matches` 96..647 (min 96, 2nd-lowest 119)
+
+The two populations **tie exactly at 96** — one real false positive
+(Animal-11), one real true positive (Animal-1's own muzzle1-vs-muzzle2) —
+an irreducible ambiguity in this data, not a threshold-tuning failure. Zones
+(`pipeline/lightglue_verify.py`) are set to name that tie honestly rather
+than resolve it by fiat:
+
+```
+< 85       likely_different    (24/25 clean FPs; excludes the tie)
+85 .. 120  ambiguous           (the tie itself: FP=96, TP=96, TP=119)
+> 120      likely_same         (21/23 clean TPs; next value after the
+                                 tie's neighbours jumps to 190)
+```
+
+This is 48 pairs from 9-10 real animals — revisit once more incidents
+accumulate, not a large-sample calibration.
+
+**Round 1 latency finding (superseded below, kept for the story): did NOT
+meet a ~1-second budget.** Tested directly against real production crops from
+the validation dataset (GPU, CUDA available, `cudnn.benchmark=False` — ruled
+out as the cause since repeated calls on the identical pair stayed
+consistently slow, not a one-time warmup cost):
+
+- Small crops (~130K–550K px each side): ~400–600ms — comfortably inside budget.
+- Large crops (~800K–1.7M px each side — a `crop_cattle` box that covers most
+  of the frame, which a correctly-composed close-up muzzle photo routinely
+  produces, since the capture UI tells officers to fill the frame): **3–5
+  seconds** — well over it.
+
+Root cause: DISK's forward pass cost scales with input pixel count, and
+`crop_cattle` crops are NOT a fixed size, unlike the embedding model (always
+518×518). This was flagged and deliberately NOT fixed in that pass — kept
+out of the live path (`LIGHTGLUE_TIEBREAKER_ENABLED` shipped OFF) pending a
+proper fix and re-validation, per this file's repeated rule about not
+shipping a quality-gate/threshold change without measuring it against real
+data first.
+
+### Round 2: fixed the latency, re-validated together, now live
+
+Two changes, made together and re-validated together — not shipped on
+assumption that either one alone would be enough:
+
+1. **Resize cap before DISK** (`pipeline/lightglue_verify.py`,
+   `LIGHTGLUE_MAX_DIM`, default 512, longest side, aspect-preserving, never
+   upscales). Applied inside `extract_features()`, the single place both a
+   fresh (query-side) extraction and a to-be-cached (registration-side)
+   extraction go through — guarantees a cached candidate's features are
+   extracted exactly the way a live one would be, so there's no drift between
+   the two code paths.
+2. **Candidate-side feature cache** (`pipeline/muzzle_crop_cache.py`,
+   `save_features`/`load_features`, alongside the existing crop cache).
+   `/register` now extracts DISK features once per accepted muzzle crop
+   (right after `save_crop`, same fail-open contract, skipped if the
+   verifier didn't load) and caches keypoints/descriptors/image_size keyed by
+   `faiss_id`. `/search`'s tiebreaker (`main._run_lightglue_tiebreaker`) tries
+   `load_features()` first — on a hit, the candidate side skips DISK entirely
+   and only the query is extracted live; on a miss (pre-existing registration
+   before this shipped, or a past write failure) it falls back to
+   `load_crop()` + live extraction on both sides, same as round 1.
+
+**Re-validated together against the same 40-image / 57-pair dataset**, this
+time running the ACTUAL production functions (`extract_features_np`,
+`save_features`/`load_features`, `verify_with_cached_candidate`) rather than
+a hand-rolled match function, with an explicit assertion that every pair hit
+the feature cache (`cache_misses == 0`) — this benchmark is not measuring the
+live-extraction fallback path. Restricted to the same "clean" population rule
+as round 1 (both images pass production's quality/detection gates) for a
+fair before/after comparison:
+
+|  | round 1 (no resize, no cache) | round 2 (512px cap + feature cache) |
+|---|---|---|
+| clean FP `num_matches` | 25 pairs, 6..96 | 28 pairs, 28..139 |
+| clean TP `num_matches` | 23 pairs, 96..647 | 23 pairs, 150..833 |
+| separation | **exact tie at 96** | **clean gap, zero overlap** (max FP 139 < min TP 150) |
+| latency, worst case | 3-5s | **172ms** |
+| latency, overall range | 400ms-5s | 78-172ms |
+
+Both re-validation gates passed: worst-case latency (172ms) is comfortably
+under the ~1s budget, and zone separation did not regress in exchange for
+speed — it *improved*, from an exact tie to a clean gap. (Plausible reason,
+not proven: resizing to 512px discards some of the high-frequency texture
+detail that was producing spurious keypoint matches specifically on the
+false-positive pairs, while the true-positive pairs' structural agreement
+survives the resize fine.) **`LIGHTGLUE_TIEBREAKER_ENABLED` now defaults to
+`true`** — kept as an env var so it can still be killed fast without a
+redeploy, not because it's provisional. Zone thresholds moved to **`<140`
+likely_different, `140–150` ambiguous, `>150` likely_same** (see
+`pipeline/lightglue_verify.py` for the full derivation) — the old 85/120/96
+numbers are pre-resize and no longer apply; don't mix them with a 512px-capped
+`num_matches` value.
+
+**Still true from round 1, unchanged by round 2:** no backfill for the
+existing FAISS index (only animals registered after round 2 shipped have
+cached features *and* a cached crop — the fallback chips in for anyone
+registered between the crop-cache and feature-cache shipping, everyone
+before that gets no tiebreaker at all until re-registered), and this is 51-57
+pairs from 9-10 real animals — revisit both the resize cap and the zone
+thresholds once more incidents accumulate.
+
+**Explicitly untouched, both rounds:** `/register`'s core logic (quality
+gates, duplicate check), the 409 duplicate-check path, and every existing
+`/search` field (`request_id`, `query_colors`, `horn_shape`, `top_matches`,
+`versions`) — confirmed unchanged field-for-field via a direct Pydantic
+`model_dump()` comparison, not just by inspection. `matches`/`top_matches`
+construction was never touched; the tiebreaker reads `matches` after it's
+finalized and only appends three new fields to the response.
 
 ## Config values worth knowing (`godhaar/config.py`)
 

@@ -61,6 +61,22 @@ from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
 from pipeline.quality import quality_check, quality_check_cv2
 from pipeline.muzzle_detect import load_muzzle_detector, warmup_muzzle_detector
+from pipeline.muzzle_crop_cache import (
+    load_crop as load_cached_muzzle_crop,
+    load_features as load_cached_muzzle_features,
+    save_crop as save_muzzle_crop,
+    save_features as save_muzzle_features,
+)
+from pipeline.lightglue_verify import (
+    LIGHTGLUE_TIEBREAKER_ENABLED,
+    available as lightglue_available,
+    classify_zone as lightglue_classify_zone,
+    extract_features_np as lightglue_extract_features_np,
+    load_lightglue,
+    verify as lightglue_verify,
+    verify_with_cached_candidate as lightglue_verify_with_cached_candidate,
+    warmup_lightglue,
+)
 from pipeline.yolo_crop import crop_cattle, load_yolo, warmup_yolo
 from schema import (
     CandidateInfo,
@@ -118,6 +134,23 @@ BYPASS_QUALITY_GATES = False
 # again (now against the tiered verdict above, not the old flat AND-gate).
 BYPASS_DUPLICATE_CHECK = False
 
+# ── /search fusion tiebreaker: LightGlue as an additive, inert signal ────────
+# These mirror go-apiserver's decision.go thresholds (matchThreshold=0.82,
+# reviewThreshold=0.72, gapThreshold=0.08) — NOT a copy of business logic
+# living here (godhaar/config.py's docstring rule against that still holds).
+# inference_server never decides MATCH/REVIEW/UNKNOWN; this is used only to
+# decide whether it's worth spending the extra GPU time to compute an optional
+# signal that go-apiserver may or may not ever read. Applied to
+# inference_server's OWN top_matches ranking — raw per-embedding FAISS scores,
+# before go-apiserver aggregates multiple embeddings per animal and applies
+# its attribute-agreement adjustment — so this is an approximation of what
+# go-apiserver will ultimately decide, not identical to it. There is no
+# shared source between the two repos: if decision.go's thresholds change,
+# these need updating by hand. See CLAUDE.md.
+_SEARCH_MATCH_THRESHOLD_MIRROR = 0.82
+_SEARCH_REVIEW_THRESHOLD_MIRROR = 0.72
+_SEARCH_GAP_THRESHOLD_MIRROR = 0.08
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -172,6 +205,12 @@ async def lifespan(app: FastAPI):
     #     service still serves. See pipeline/muzzle_detect.py.
     load_muzzle_detector()
 
+    # 5c. Load the LightGlue /search fusion tiebreaker. Optional, same
+    #     fail-open contract as the muzzle detector: if absent (no network to
+    #     fetch cached weights on first boot, see CLAUDE.md), /search just
+    #     never runs the tiebreaker — lightglue_checked stays False.
+    load_lightglue()
+
     # 6. Warmup — run dummy inference through both models
     log.info("Running warmup inference...")
     dummy = torch.randn(1, 3, 518, 518, device=device)
@@ -179,6 +218,7 @@ async def lifespan(app: FastAPI):
         model(dummy)
     warmup_yolo()
     warmup_muzzle_detector()
+    warmup_lightglue()
     log.info("Warmup complete.")
 
     # 7. Init CCTV model's session DB (third model — video analytics)
@@ -304,7 +344,7 @@ async def register(
     )
 
     # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
-    embeddings_np, body_color, muzzle_color, morphology = await asyncio.to_thread(
+    embeddings_np, body_color, muzzle_color, morphology, cropped_images = await asyncio.to_thread(
         _run_registration_pipeline,
         muzzle_bytes,
         front_bytes,
@@ -426,6 +466,34 @@ async def register(
         log.error(f"FAISS write failed: {e}")
         raise HTTPException(status_code=500, detail=f"faiss_error: {e}")
 
+    # ── Cache each crop locally, keyed by its faiss_id, for /search's
+    #    LightGlue tiebreaker (see pipeline/muzzle_crop_cache.py). Runs AFTER
+    #    the FAISS write succeeds, and a cache-write failure is fail-open
+    #    (logged, not raised) — registration must not fail over an optional
+    #    signal for a feature that isn't the embedding index itself.
+    try:
+        await asyncio.to_thread(
+            lambda: [save_muzzle_crop(fid, crop) for fid, crop in zip(faiss_ids, cropped_images)]
+        )
+    except Exception as e:
+        log.warning(f"muzzle crop cache write failed (non-fatal): {e}")
+
+    # ── Also pre-extract and cache DISK features for the same crops, so
+    #    /search's tiebreaker can skip live extraction on the candidate side
+    #    entirely (see pipeline/lightglue_verify.py's "latency optimization,
+    #    round 2" note and CLAUDE.md). Same fail-open contract; skipped
+    #    outright if the verifier never loaded.
+    if lightglue_available():
+        try:
+            await asyncio.to_thread(
+                lambda: [
+                    save_muzzle_features(fid, **lightglue_extract_features_np(crop))
+                    for fid, crop in zip(faiss_ids, cropped_images)
+                ]
+            )
+        except Exception as e:
+            log.warning(f"muzzle feature cache write failed (non-fatal): {e}")
+
     t_total = _ms_since(t_start)
     log.info(f"/register 201 | faiss_ids={faiss_ids} | {t_total}ms")
 
@@ -538,7 +606,7 @@ def _run_registration_pipeline(
     device: torch.device,
     color_extractor: Any,
     morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict]:
+) -> tuple[np.ndarray, dict, dict, dict, list[np.ndarray]]:
     """
     Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
     embedding, and color extraction. Executed entirely inside a single
@@ -695,7 +763,81 @@ def _run_registration_pipeline(
     morphology = average_readings(morphology_readings)
 
     log.info(f"_run_registration_pipeline total: {_ms_since(t_muzzle_gate)}ms")
-    return embeddings.numpy(), body_color, muzzle_color, morphology
+    return embeddings.numpy(), body_color, muzzle_color, morphology, cropped_images
+
+
+async def _run_lightglue_tiebreaker(
+    matches: list[dict], query_crop: np.ndarray, request_id: str
+) -> tuple[bool, Optional[int], Optional[str]]:
+    """The /search fusion tiebreaker: additive only, computed only when the
+    top-1 embedding score is ambiguous. Never touches `matches` itself or any
+    existing SearchResponse field — see CLAUDE.md.
+
+    Pulled out of the /search handler as its own function specifically so it
+    can be exercised directly in tests without booting the full FastAPI app
+    (which needs a real GodhaarModel checkpoint this function has nothing to
+    do with).
+
+    Returns (lightglue_checked, lightglue_num_matches, lightglue_zone) —
+    (False, None, None) whenever the tiebreaker didn't run, for any reason
+    (disabled, not ambiguous, verifier unavailable, no cached crop, or any
+    internal failure — this is a fail-open signal, never allowed to raise).
+
+    Gated on LIGHTGLUE_TIEBREAKER_ENABLED (pipeline/lightglue_verify.py,
+    defaults on — the resize cap + feature cache were re-validated against
+    real data before this shipped, see CLAUDE.md, "/search fusion
+    tiebreaker, round 2"). Kept as an env-var kill switch for a fast disable
+    without a redeploy, not as a "not ready yet" gate.
+    """
+    if not LIGHTGLUE_TIEBREAKER_ENABLED:
+        return False, None, None
+
+    if not matches:
+        return False, None, None
+
+    top1 = matches[0]
+    ambiguous = (
+        _SEARCH_REVIEW_THRESHOLD_MIRROR <= top1["score"] <= _SEARCH_MATCH_THRESHOLD_MIRROR
+        or top1["gap"] < _SEARCH_GAP_THRESHOLD_MIRROR
+    )
+    if not (ambiguous and lightglue_available()):
+        return False, None, None
+
+    try:
+        # Fast path: candidate's DISK features were pre-extracted at
+        # registration time — skip live extraction on that side entirely.
+        candidate_features = await asyncio.to_thread(load_cached_muzzle_features, top1["faiss_id"])
+        if candidate_features is not None:
+            lg_result = await asyncio.to_thread(
+                lightglue_verify_with_cached_candidate, query_crop, candidate_features
+            )
+            num_matches = lg_result["num_matches"]
+            return True, num_matches, lightglue_classify_zone(num_matches)
+
+        # Fallback: no cached features (pre-existing registration, or a past
+        # write failure) — fall back to the cached crop and extract live on
+        # both sides, same as before feature caching existed.
+        candidate_crop = await asyncio.to_thread(load_cached_muzzle_crop, top1["faiss_id"])
+        if candidate_crop is None:
+            log.info(
+                f"[{request_id}] lightglue tiebreaker skipped: no cached crop "
+                f"or features for top1 faiss_id={top1['faiss_id']} (registered "
+                f"before either cache existed, or its registration-time write failed)"
+            )
+            return False, None, None
+
+        log.info(
+            f"[{request_id}] lightglue tiebreaker: feature cache miss for "
+            f"faiss_id={top1['faiss_id']}, falling back to live extraction"
+        )
+        lg_result = await asyncio.to_thread(lightglue_verify, query_crop, candidate_crop)
+        num_matches = lg_result["num_matches"]
+        return True, num_matches, lightglue_classify_zone(num_matches)
+    except Exception as e:
+        # Fail-open: an inert additive signal must never break a search the
+        # embedding pipeline already answered.
+        log.warning(f"[{request_id}] lightglue tiebreaker failed (non-fatal): {e}")
+        return False, None, None
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -756,7 +898,7 @@ async def search(
 
     # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
     t_embed_start = time.monotonic()
-    emb_np, muzzle_color, body_color, morphology = await asyncio.to_thread(
+    emb_np, muzzle_color, body_color, morphology, query_crop = await asyncio.to_thread(
         _run_search_pipeline,
         muzzle_bytes,
         front_bytes,
@@ -807,12 +949,20 @@ async def search(
                 else 0.0
             )
 
+    # ── LightGlue fusion tiebreaker — additive only; see _run_lightglue_tiebreaker.
+    t_lightglue_start = time.monotonic()
+    lightglue_checked, lightglue_num_matches, lightglue_zone = await _run_lightglue_tiebreaker(
+        matches, query_crop, request_id
+    )
+    t_lightglue = _ms_since(t_lightglue_start)
+
     t_total = _ms_since(t_start)
     log.info(
         f"[{request_id}] /search done | matches={len(matches)} | "
-        f"{t_total}ms (embed={t_embed} faiss={t_faiss}) | "
+        f"{t_total}ms (embed={t_embed} faiss={t_faiss} lightglue={t_lightglue}) | "
         f"top1_faiss_id={matches[0]['faiss_id'] if matches else 'none'} "
-        f"score={matches[0]['score'] if matches else 0}"
+        f"score={matches[0]['score'] if matches else 0} | "
+        f"lightglue_checked={lightglue_checked} lightglue_zone={lightglue_zone}"
     )
 
     return SearchResponse(
@@ -831,6 +981,9 @@ async def search(
             )
             for m in matches
         ],
+        lightglue_checked=lightglue_checked,
+        lightglue_num_matches=lightglue_num_matches,
+        lightglue_zone=lightglue_zone,
         versions=VersionInfo(
             model=MODEL_VERSION,
             faiss=faiss_index.faiss_version_label,
@@ -846,10 +999,14 @@ def _run_search_pipeline(
     device: torch.device,
     color_extractor: Any,
     morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict]:
+) -> tuple[np.ndarray, dict, dict, dict, np.ndarray]:
     """
     Synchronous CPU/GPU pipeline for /search: quality gate, crop, embed,
     color extraction. Runs entirely inside asyncio.to_thread.
+
+    Also returns the query's own muzzle `crop` (not just its embedding) —
+    needed by the /search route handler for the LightGlue fusion tiebreaker,
+    which compares raw pixels, not embeddings.
     """
     q_status, q_reason = quality_check(muzzle_bytes)
     if q_status != "GOOD":
@@ -892,7 +1049,7 @@ def _run_search_pipeline(
     body_color = color_extractor.extract_body(front_img)
     morphology = morphology_extractor.extract(front_img)
 
-    return emb_np, muzzle_color, body_color, morphology
+    return emb_np, muzzle_color, body_color, morphology, crop
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────

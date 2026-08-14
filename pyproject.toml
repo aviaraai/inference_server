@@ -21,6 +21,11 @@ dependencies = [
     "ai-edge-litert==2.1.6",
     "python-multipart==0.0.32",
     "imageio-ffmpeg>=0.6.0",
+    # DISK + LightGlue keypoint matcher for the /search fusion tiebreaker
+    # (pipeline/lightglue_verify.py). Was ad hoc in experiments/lightglue_poc/
+    # (see CLAUDE.md — "promote it here only if this pans out"); the FP/TP
+    # validation on real Dehradun search incidents is what justified this.
+    "kornia==0.8.3",
 ]
 
 [[tool.uv.index]]

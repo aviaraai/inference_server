@@ -6,7 +6,7 @@ These models define the response shape only.
 """
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -225,6 +225,25 @@ class SearchResponse(BaseModel):
     query_colors: ExtractedColors
     horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
     top_matches: list[MatchCandidate]
+
+    # ── Fusion tiebreaker (additive, inert) ──────────────────────────────────
+    # Describes query vs. top_matches[0] specifically, not any individual
+    # match row — hence top-level, not on MatchCandidate. Populated only when
+    # the top-1 embedding score was ambiguous (near go-apiserver's
+    # MATCH/REVIEW/GAP thresholds) AND a cached crop existed for the top
+    # candidate; otherwise lightglue_checked is False and the other two stay
+    # None. Nothing here is consumed by this server or by go-apiserver today
+    # — see CLAUDE.md.
+    lightglue_checked: bool = Field(
+        False, description="Whether the LightGlue keypoint-matching tiebreaker actually ran for this search."
+    )
+    lightglue_num_matches: Optional[int] = Field(
+        None, description="Raw LightGlue match count between the query crop and top_matches[0]'s cached crop. None if lightglue_checked is False."
+    )
+    lightglue_zone: Optional[Literal["likely_same", "likely_different", "ambiguous"]] = Field(
+        None, description="Calibrated zone for lightglue_num_matches (see pipeline/lightglue_verify.py). None if lightglue_checked is False."
+    )
+
     versions: VersionInfo
 
 

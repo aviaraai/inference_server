@@ -116,6 +116,22 @@ DUPLICATE_THRESHOLD = 0.80                      # cosine similarity above which
 # show this is too tight/loose once more same-animal score data exists.
 DUPLICATE_HIGH_CONFIDENCE_THRESHOLD = 0.90
 
+# ── Muzzle crop cache (search fusion tiebreaker) ─────────────────────────────
+# Local, on-disk cache of each registered muzzle's accepted crop, written at
+# /register time and read at /search time by the LightGlue tiebreaker (see
+# pipeline/lightglue_verify.py and main.py's /search handler). Keyed by
+# faiss_id, which is 1:1 with a specific muzzle crop -- exactly the crop that
+# produced whichever embedding scored highest, so no "which of the 3 photos"
+# ambiguity. Lives under the same host-mounted volume as FAISS_INDEX_PATH
+# (docker-compose.yaml's /appstorage mount), so it survives restarts/redeploys
+# the same way the index does, with no new infrastructure.
+#
+# Only covers animals registered AFTER this shipped -- there is no backfill
+# for the existing FAISS index. A search whose top-1 candidate has no cached
+# crop just skips the tiebreaker (lightglue_checked=False); this is expected
+# and not an error. See CLAUDE.md.
+MUZZLE_CROP_CACHE_DIR = os.getenv("MUZZLE_CROP_CACHE_DIR", "/appstorage/muzzle_crops")
+
 IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp"}
 
 # ── Versioning ────────────────────────────────────────────────────────────────
