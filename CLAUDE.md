@@ -1855,8 +1855,44 @@ setting actually clears both checks.
 
 **Where this leaves the ~20-count peak-density gap**: neither of the two
 cheap, obvious post-processing levers (NMS, confidence) closes it
-without a corresponding real cost elsewhere. Untested and worth knowing
-about before reaching for either again: a confidence value BETWEEN 0.25
-and 0.40 might find a point that helps the crowded case more than 0.20
-while still keeping clip 3's second animal above the floor — not
-verified, a real gap in this investigation, not a recommendation.
+without a corresponding real cost elsewhere.
+
+### Closed, for now: parameter tuning is done on this, mitigation is camera placement
+
+Deliberate decision, not an oversight: **not chasing the untested
+0.25-0.40 confidence gap noted above, or any further NMS/confidence
+sweep.** Both parameters this crowded-cluster investigation had reason
+to try are now tested, with real ground truth and real safety checks,
+not guessed at:
+
+- **`nms_iou`**: safe (no adjacent-animal merging, no clip 3 regression)
+  but ineffective (closed 2 of ~20 count gap). Not worth further sweeping
+  — the 0.55->0.35 range already covers the plausible space and it
+  flattened out by 0.40.
+- **`confidence`**: effective on the crowded case (43->27, close to
+  ground truth) but fails the clean-case check outright (0/575 vs
+  207/575 frames detecting both real animals in clip 3) — a real animal
+  suppressed for an entire clip, not a marginal cost. Disqualified, not
+  marginal.
+
+Both were tested at CROWDED_HD's resolution — the actual ~20-count gap
+at extreme peak density (43 vs ~23 ground truth) does not have a cheap
+post-processing fix in this pipeline as it exists today. That's a real
+finding, not a gap in the search: two different mechanisms (box overlap
+suppression, confidence filtering) were tried, one failed to help, the
+other helped by breaking something else — consistent with the remaining
+error being neither "duplicate boxes on one animal" (NMS's job) nor
+"real animals scored too low" alone (confidence's job), but genuine
+model uncertainty at extreme density that a threshold can't sort
+correctly either direction.
+
+**The practical mitigation is camera placement, not more parameter
+search**: multiple cameras giving narrower coverage of a dense cluster
+(e.g. two angles on a crowded feeding trough instead of one wide shot
+trying to cover the whole thing) reduces how many animals any single
+camera ever has to resolve at once, which is the actual constraint this
+investigation ran into — not a tunable one. `LOCATION_PRESET_OVERRIDES`
+(`cctv/config.py`) is still the right mechanism for the resolution
+question (CROWDED_HD vs FAST per camera) — this doesn't change that,
+it just closes out NMS/confidence as dead ends for anything beyond
+what's already shipped.
