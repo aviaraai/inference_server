@@ -1729,3 +1729,71 @@ no location_tag is flagged yet, since no real camera/location naming
 convention was available to populate it correctly rather than guess. Add
 entries there once specific crowded feeds (feeding troughs, entry gates
 during herding) are identified by `location_tag`.
+
+### Ground truth at peak density, and why NMS tuning turned out not to be the fix
+
+The FAST-vs-CROWDED_HD numbers above (17 vs 43 peak-in-frame) were never
+checked against real ground truth — just against each other. Worth doing
+before trusting either: manually counted a raw, unannotated frame from
+clip 2 (frame 704, the source frame that actually produced CROWDED_HD's
+peak of 43 — NOT the same frame FAST peaked on; FAST's own peak of 17
+happens at frame 222, ~19s earlier in the clip, a genuinely different
+moment). Counted twice independently, region by region, specifically
+checking for occlusion/cut-off animals: **21 and 25**, converging on
+**~21-25 (midpoint ~23)**. At that same frame 704, FAST itself reads only
+13 (not its own clip-wide peak of 17 — this is FAST's reading at the
+literal same moment CROWDED_HD peaked).
+
+**The correct reading of these three numbers is NOT "CROWDED_HD (43) is
+closer to ground truth than FAST (13)."** It isn't — CROWDED_HD's error
+(~87% over ~23) is roughly DOUBLE FAST's error (~43% under ~23). An
+earlier pass at this got that comparison wrong by treating "same side of
+a threshold" as "better," which doesn't hold once you look at the actual
+percentages. The real reason to start any fix from CROWDED_HD rather than
+FAST is structural, not "closer": NMS and confidence filtering can only
+REMOVE boxes a detector already proposed. FAST's lower-resolution pass
+never proposes the boxes needed to close its 43%-under gap — there's
+nothing to tune upward. CROWDED_HD's 87%-over gap, by contrast, is at
+least the right kind of error to attack with post-processing, since the
+boxes already exist and the question is which of them are real.
+
+**Tested that hypothesis directly — swept `nms_iou` from the CROWDED_HD
+default (0.55) down to 0.35, all else held at CROWDED_HD's settings,
+same frame 704 each time:**
+
+| nms_iou | count @ frame 704 | vs. ground truth (~23) |
+|---|---|---|
+| 0.55 (baseline) | 43 | +87% |
+| 0.50 | 42 | +83% |
+| 0.45 | 42 | +83% |
+| 0.40 | 41 | +78% |
+| 0.35 | 41 | +78% |
+
+**Result: NMS tightening is not the fix.** The sweep closed only 2 of the
+~20-count gap and flattened out by 0.40 — going tighter did nothing
+further. Checked for the failure mode this could plausibly cause instead
+(genuinely adjacent, distinct animals getting merged into one box at the
+tighter setting) — not observed; isolated animals stayed isolated at
+0.35, same as baseline. So tightening this far is *safe*, just
+ineffective. Also re-ran the clean daytime clip (clip 3) at
+`nms_iou=0.35`: results came back byte-identical to its 0.55 baseline (2
+peak, 4 tracked, 0.7418 confidence, 782 detections) — no regression, but
+also because that clip has too few overlapping detections for NMS
+threshold to matter either way.
+
+**Why NMS specifically doesn't help**: IoU-based NMS only suppresses a
+box that geometrically overlaps enough with another surviving box.
+Barely moving the count when swept this hard suggests the ~20-count gap
+at peak density isn't classic duplicate-box-on-one-animal (which NMS
+targets) — it's more likely spatially distinct, low-confidence phantom
+detections in the dark, dense cluster (background/shadow/hay misread as
+cattle) that never overlap enough with a real box to be NMS's problem at
+all. That points at `confidence` (currently 0.20, quite permissive) as
+the more plausible next lever — **not yet tested, a hypothesis only,
+flagged here so it isn't re-derived from scratch, not a recommendation**.
+
+**Not shipped as a result of this investigation: no `nms_iou` default
+change.** The evidence doesn't support one. If someone reads the
+box-stacking symptom in a `CROWDED_HD` frame and reaches for NMS as the
+obvious fix, this section is why that specific fix was already tried and
+didn't work.
