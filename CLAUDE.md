@@ -1797,3 +1797,66 @@ change.** The evidence doesn't support one. If someone reads the
 box-stacking symptom in a `CROWDED_HD` frame and reaches for NMS as the
 obvious fix, this section is why that specific fix was already tried and
 didn't work.
+
+### `confidence` threshold: much more effective on the crowded case, but fails the clean-case check outright
+
+The flagged next hypothesis above (raise `confidence` from `CROWDED_HD`'s
+0.20, since NMS couldn't touch the gap) — tested the same way, same
+frame 704, `nms_iou` held at CROWDED_HD's own default (0.55) throughout:
+
+| confidence | count @ frame 704 | vs. ground truth (~23) |
+|---|---|---|
+| 0.20 (baseline) | 43 | +87% |
+| 0.25 | 39 | +70% |
+| 0.30 | 34 | +48% |
+| 0.35 | 31 | +35% |
+| 0.40 | 27 | +17-29% |
+
+Far more effective than NMS — 0.40 gets close to ground truth, closing
+most of the gap NMS couldn't move at all.
+
+**Visual safety check at 0.40** (comparing the same frame, baseline vs.
+0.40, by spatial position rather than trusting tracker IDs, which aren't
+stable across separate runs): the clear, confident animals (isolated
+walking cow 65%, isolated resting cow 82%, the bottom-left pair 88%/83%)
+were completely untouched. What disappeared was concentrated almost
+entirely in the 22-39% confidence band, in the darkest/most ambiguous
+part of the cluster. One borderline 26% detection at the frame edge
+mapped to the exact spot where this investigation's own two independent
+ground-truth counting passes had disagreed — the model's uncertainty
+matched a real human's uncertainty there, not a confident miss. On this
+check alone, 0.40 looked safe.
+
+**Then the clip 3 (clean daytime) regression check failed decisively —
+not marginally.** Checked frame-by-frame, not spot-checked:
+
+| | FAST | CROWDED_HD (0.20) | CROWDED_HD (0.40) |
+|---|---|---|---|
+| Peak-in-frame | 2 | 2 | **1** |
+| Frames with 2+ cattle detected (of 575) | - | **207 (36%)** | **0 (0%)** |
+
+At `confidence=0.40`, the model never detects both real cattle together
+in a single frame anywhere in the entire clip — not an edge case, the
+whole clip. One of the two animals (visually confirmed real earlier in
+this investigation) is systematically suppressed throughout a
+well-lit, low-density scene, the exact failure mode this check existed
+to catch: a real animal whose confidence is genuinely, persistently
+below the raised floor.
+
+**Not shipping any `confidence` default change either.** Same
+disqualifying criterion as the NMS result: a setting that fixes the
+crowded case by breaking the clean case outright isn't a fix. Had this
+passed both checks it would have become another parameter on the same
+`LOCATION_PRESET_OVERRIDES` per-camera system already built (`cctv/
+config.py`) — not a new mechanism — but it didn't pass, so nothing was
+wired in. `LOCATION_PRESET_OVERRIDES` still only selects a `Preset`, not
+individual `confidence`/`nms_iou` values, and stays that way until a
+setting actually clears both checks.
+
+**Where this leaves the ~20-count peak-density gap**: neither of the two
+cheap, obvious post-processing levers (NMS, confidence) closes it
+without a corresponding real cost elsewhere. Untested and worth knowing
+about before reaching for either again: a confidence value BETWEEN 0.25
+and 0.40 might find a point that helps the crowded case more than 0.20
+while still keeping clip 3's second animal above the floor — not
+verified, a real gap in this investigation, not a recommendation.
