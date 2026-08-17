@@ -2078,3 +2078,195 @@ MATCH rate (gap suppression) while not obviously biasing the WRONG_ANIMAL
 rate either direction. If a true 3-independent-photo comparison is ever
 needed, it requires either a 4th real photo per animal or a change to
 `/register`'s hard 3-image requirement — neither was in scope here.
+
+## Correction: the leave-one-out test above under-measured recall — the FULL production stack gives a materially better number
+
+The test above deliberately excluded `decision.go`'s attribute (color/horn)
+term. Replicating it and re-bucketing the same 161 leave-one-out searches
+found something more important than the attribute term's own effect: **the
+original test's score+gap replica itself didn't match production**, and
+correcting that alone — before the attribute term does anything — moves
+strict recall from 12/161 (7.5%) to 40/161 (24.8%).
+
+**Root cause of the discrepancy:** the original replica computed each
+search's gap from `inference_server`'s raw response field
+(`top_matches[0].gap`), which is a **per-embedding** pairwise gap —
+rank-1-embedding-score minus rank-2-embedding-score, with no notion of which
+embeddings belong to the same animal. `decision.go`'s real
+`decideOnRawScores()` never does this: it first aggregates every returned
+embedding to **per-animal max score** (`cattleScores[gid] = max(...)`, in
+`routes.go`), and only computes the gap between the top two *animals* after
+that aggregation. The leave-one-out registration compromise (muzzle1
+duplicated into the 3rd slot — see above) means every animal has two
+byte-identical embeddings, which are near-guaranteed to land at rank 1 and
+rank 2 of the SAME animal's own results. The original replica measured the
+gap between those two near-duplicate embeddings — near zero, by
+construction — and called it the animal's confidence gap. Production never
+does this: aggregating to one max score per animal *before* computing the
+gap means a duplicate embedding of the correct animal can never suppress its
+own gap, because it collapses into the same single entry its sibling
+embedding already occupies. The muzzle1-duplication compromise is still real
+and still limits what this test can prove about true 3-independent-photo
+registration (see the caveats above, unchanged) — but the specific "gap
+suppression tanks strict recall" effect reported earlier was **mostly a bug
+in the test's decision replica, not a property of the real system.**
+Confirmed directly: cases like `UKDEHF533712` had `old_gap=0.0` under the
+flawed per-embedding replica and `new_gap=0.249` under correct per-animal
+aggregation — nowhere close to the same number.
+
+Lesson, worth generalizing: **when replicating a decision engine for a test,
+replicate its literal aggregation order, not just its final threshold
+constants.** Getting `matchThreshold`/`gapThreshold` numerically right was
+not enough — the *shape* of what those thresholds are applied to (embedding
+scores vs. per-animal max scores) changed the answer by more than the
+attribute/LightGlue layers combined.
+
+### The full stack, correctly replicated: score+gap (animal-aggregated) → attribute nudge → LightGlue demotion
+
+`full_stack_replay.py` (scratchpad) re-derives everything offline from the
+already-captured `register_log.json`/`search_log.json` — no new API calls —
+using `go-apiserver`'s exact `rankCandidates`/`decide`/
+`applyLightglueDisagreement` (`decision.go`): per-animal max-score
+aggregation, `attributeWeight=0.03` color/horn/muzzle-color agreement
+(`[-1,1]`, only over attributes present on both sides), the real
+adjusted-vs-raw "take the less confident" merge (and the reported animal is
+always the **attribute-adjusted** top candidate, even when the *decision
+level* falls back to the raw one), then LightGlue's demote-only step on top.
+`searchTopK=5` (routes.go) is production's own limit, not a shortcut this
+test introduced — the captured `top_matches` already match what
+go-apiserver itself receives.
+
+**Full-stack bucket breakdown (161 searches, same data as before):**
+
+| Bucket | Count |
+|---|---|
+| `TRUE_MATCH` | 38 |
+| `TRUE_REVIEW` | 61 |
+| `CORRECT_ANIMAL_BUT_UNKNOWN` | 9 |
+| `WRONG_ANIMAL` | 41 |
+| `REJECTED_PRE_MATCH` | 12 |
+
+**Recall, the real complete-system numbers:**
+- **Strict (auto-MATCH): 38/161 = 23.6%** — up from the partial replica's
+  7.5%, mostly the aggregation fix, not the attribute term.
+- **Robust (MATCH+REVIEW correct): 99/161 = 61.5%** — close to the earlier
+  60.2%, because the earlier number's REVIEW-inclusive recall was already
+  fairly forgiving of the gap-suppression bug; the fix mainly moves cases
+  from REVIEW to MATCH, not from UNKNOWN to REVIEW.
+
+**Precision, the real complete-system numbers:**
+- **At auto-MATCH: 38/38 = 100%.** No wrong-animal case reached MATCH
+  anywhere in this run, at any stage of the stack.
+- **At REVIEW: 61/64 = 95.3%** (3 wrong-animal cases still reach REVIEW even
+  after the full stack — see below).
+- **Combined, everything an officer is ever shown (MATCH+REVIEW): 99/102 =
+  97.1%.**
+
+### Isolating each layer's real contribution — not just the combined number
+
+Re-bucketing the SAME 161 searches at each stage (raw score+gap only, then
++attribute, then +LightGlue = the table above) separates what each signal
+actually does, rather than reporting only the end state:
+
+| Stage | MATCH | REVIEW | UNKNOWN (correct) | WRONG | REJECTED |
+|---|---|---|---|---|---|
+| A: raw score+gap (animal-aggregated) | 40 | 61 | 1 | 47 | 12 |
+| B: + attribute nudge | 38 | 68 | 2 | 41 | 12 |
+| C: + LightGlue (full stack) | 38 | 61 | 9 | 41 | 12 |
+
+**Attribute layer (A→B) — net positive, small and bounded cost:**
+- **Fixed 6 wrong-top-1 cases to the correct animal** by reordering on full
+  color+muzzle+horn agreement (`agreement=1.0` in every case:
+  `UKDEJS155191`, `UKDEJS211897`, `UKDEJS698982`, `UKDEJS791332`,
+  `UKDEOT569293`, `UKDESH004551`) — this is the direct explanation for
+  `WRONG_ANIMAL` dropping 47→41.
+- **Cost: 2 true positives demoted MATCH→REVIEW** (`UKDEGR942545`,
+  `UKDEJS137483`) — never lost, still correctly flagged for a human to
+  confirm, just less confidently.
+- **Cost: 0 identity losses, 0 additional UNKNOWNs.** The stage-A→B
+  UNKNOWN count going 1→2 is not a new loss — it's `UKDEOT569293` being one
+  of the 6 reordering fixes above (its identity became correct, but its
+  decision level was already going to be UNKNOWN regardless).
+- Net: attribute agreement only ever helped or was neutral for true
+  positives in this run; its only real cost is confidence-level, never
+  identity.
+
+**LightGlue layer (B→C) — the one signal that costs real true positives:**
+- **Caught (further suppressed) 35 of the 41 wrong-animal cases** that
+  survived score+gap+attribute.
+- **3 wrong-animal cases were already UNKNOWN before LightGlue ran** —
+  score+attribute alone was enough, LightGlue moot for these.
+- **3 wrong-animal cases are NOT caught by anything in the full stack** —
+  these still reach REVIEW and would need a human to reject them:
+
+  | Query animal | Wrongly matched to | `lightglue_zone` | agreement | score |
+  |---|---|---|---|---|
+  | UKDEGR827871 | UKDEGR455918 | likely_same | -0.33 | 0.771 |
+  | UKDEJS014531 | UKDEJS424252 | likely_same | 1.0 | 0.855 |
+  | UKDEJS987250 | UKDEJS250469 | likely_same | 0.0 | 0.8435 |
+
+  Two of these (`UKDEJS014531`, `UKDEJS987250`) have LightGlue actively
+  confirming the wrong candidate (`likely_same`), not just failing to
+  object — the same pattern the first report already flagged.
+
+- **Cost: 7 true positives demoted REVIEW→UNKNOWN** — up from the 4/102
+  reported in the first pass, because the corrected stack has a larger true
+  REVIEW population (68 vs. 44) exposed to a possible LightGlue demotion in
+  the first place. Same mechanism, bigger sample, real cost:
+
+  | Query animal | score | gap | `lightglue_zone` |
+  |---|---|---|---|
+  | UKDEJS211897 | 0.8651 | 0.0101 | likely_different |
+  | UKDEJS280448 | 0.8081 | 0.0402 | likely_different |
+  | UKDEJS725951 | 0.8718 | 0.0072 | likely_different |
+  | UKDEJS791332 | 0.8436 | 0.0202 | likely_different |
+  | UKDEOT336574 | 0.7834 | 0.0136 | likely_different |
+  | UKDESH004551 | 0.81 | 0.0003 | likely_different |
+  | UKDESH010833 | 0.8246 | 0.0674 | likely_different |
+
+  Two of these (`UKDEJS211897`, `UKDESH004551`) are cases the attribute
+  layer had *just fixed* (see the 6-case list above) — LightGlue then
+  independently pulled them back down to UNKNOWN. The signals aren't
+  additive-only; they can partially cancel on the same case.
+
+### Direct answer to "does the attribute nudge catch any of the 5 survivors from the first report"
+
+Of the first report's 5 wrong-animal cases that survived score+gap+LightGlue
+(`UKDEGR827871`, `UKDEJS014531`, `UKDEJS155191`, `UKDEJS698982`,
+`UKDEJS987250`) — under the fully-corrected stack, **2 are fixed**
+(`UKDEJS155191`, `UKDEJS698982`, both via attribute agreement reordering the
+top-1 pick to the correct animal) and **3 persist**
+(`UKDEGR827871`, `UKDEJS014531`, `UKDEJS987250` — the same 3 in the table
+above). The comparison is apples-to-oranges in one sense — the underlying
+population changed once the aggregation bug was fixed — but the 3 remaining
+codes are the same physical failure mode either way: an impostor animal
+whose embedding score, color/horn attributes, AND LightGlue keypoint zone
+(2 of 3 are `likely_same`) all agree with the query. No signal currently in
+the stack has independent evidence against these 3.
+
+### This is the real, complete "how good is it right now" answer
+
+**23.6% of genuinely-unseen queries get a hands-free MATCH. 61.5% get the
+correct animal put in front of an officer (MATCH or REVIEW). Of everything
+shown to an officer, 97.1% is the right animal — the other 2.9% (3 cases)
+needs a human's own judgment to reject, same as the first report already
+found for the (smaller, pre-correction) REVIEW population. 5.6% of correct
+matches (9/161) never reach a human at all, silently reading as "not
+registered"; 7 of those 9 are LightGlue's own false calls on genuinely
+correct matches, not a limitation of the embedding itself. 7.5% of queries
+(12/161) never get to the matching stage because the query photo itself
+failed a quality/detection gate.**
+
+The muzzle-duplication caveat from the first report still applies
+unchanged — this remains a lower bound on true 3-independent-photo
+registration, not an exact prediction of it — but the earlier report's
+specific "the strict-recall number is dragged down mainly by gap
+suppression from the registration compromise" explanation was wrong. It's
+now clear that most of that drag was a test-script bug that has nothing to
+do with the registration compromise at all, and the real
+attribute/LightGlue layers' costs and benefits are smaller and more
+precisely bounded than the first pass suggested. A genuine, quantified gap
+remains: **3/161 (1.9%) wrong-animal cases reach an officer with no signal
+objecting, and 7/161 (4.3%) correct matches are silently lost specifically
+to LightGlue's own false "likely_different" calls** — both real, both
+small, and both the actual target for anything built next.
