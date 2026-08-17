@@ -2358,3 +2358,145 @@ remaining 3/161 gap from Step 1 stays open; closing it would need a signal
 actually trained to discriminate identity from the photo type in question —
 this checkpoint is not that signal for front/body photos, and no amount of
 threshold tuning changes that.
+
+
+## Cheap feasibility check before building anything: horn/eye/ear geometry, and a narrower look at LightGlue's cost
+
+Two follow-ups to the Step 1/Step 2 findings above, both checked before
+writing any new code — same discipline as Step 2 (calibrate on real data,
+report honestly, only build if the number justifies it).
+
+### 1-2. Is there any real landmark geometry anywhere in the current pipeline? No.
+
+**`horn_shape` (`pipeline/morphology.py`) is a pure classical-CV silhouette
+heuristic, not a keypoint model, and exposes no reusable geometry.** Read
+the actual code rather than assuming: `RuleBasedMorphologyExtractor.extract()`
+takes `crop_cattle`'s whole-animal crop, cuts a fixed top-35% "head band"
+(`HEAD_BAND_FRACTION`, not detected — a constant fraction of the crop),
+runs Canny edge detection + finds the largest contour in that band, and
+derives two categorical outputs from it: `has_horns` (is there a protrusion
+above a pixel-fraction threshold) and `horn_shape` (is that protrusion's
+edge straighter or more curved than a threshold, via `cv2.fitLine` residual
+on the contour points). The module's own docstring says this directly:
+*"There is no labeled horn dataset and no trained keypoint/shape model
+anywhere in this project (checked both this repo's bundled wildlife/ and
+the full Godhaar/Wildlife source — neither has one)."* The only
+"geometry" that exists even internally (`top_y`, `horn_px`, the fitted-line
+residuals) is a coarse silhouette measurement scoped to classifying one
+enum value, never returned, and not eye/ear/horn coordinates in any
+reusable sense.
+
+**Nothing on the front-photo path detects eyes or ears, coarsely or
+otherwise.** Grepped the whole repo for `eye|ear_|keypoint|landmark|facial`
+— every real hit is either LightGlue/DISK's generic image keypoints
+(muzzle-matching only, not facial landmarks — already documented above)
+or a plain-English comment (`roi.py`: *"Top 20% (often contains
+background, sky, ears, horns)"* — a fixed-fraction crop region to
+*exclude*, not a detected ear). `crop_cattle` (`pipeline/yolo_crop.py`) is
+a stock COCO YOLO (`yolov8s.pt`) doing whole-animal bounding boxes only —
+one box per animal, the same detector already documented elsewhere in this
+file, with no facial-part output of any kind.
+
+**Conclusion: no real landmark coordinates exist anywhere in this pipeline
+to calibrate against — the Step 3 calibration this task asked for cannot
+be run, there is nothing to feed it.** This is a "don't build the
+calibration test" finding by inspection, not a negative test result like
+Step 2's front-similarity check — there was no live signal available to
+even measure.
+
+**Honest cost estimate for building one (Step 4):** this would be a new
+model, not a config change or a reused embedding. Concretely: (a) no
+existing cattle facial-landmark dataset is a standard off-the-shelf
+resource the way COCO or ImageNet are — human/dog/cat facial-landmark
+datasets exist, cattle-specific ones don't, so labeled data collection
+starts from zero; (b) keypoint models are typically more annotation-hungry
+per image than classification (each image needs multiple precise point
+labels, not one), so a usable eye/ear/horn keypoint regressor likely needs
+several hundred to low-thousands of hand-annotated photos across breeds,
+angles, and lighting — a real annotation-tooling + labeling-labor project,
+not an afternoon; (c) `GodhaarModel`'s architecture (DINOv2 → GeM pool →
+projection head, trained for ArcFace metric learning) has no keypoint/
+heatmap output head — this needs a genuinely different model design and
+training loop, evaluated with different metrics (PCK, not top-1/recall);
+(d) separately, Step 2 already showed that even a *well-trained*,
+muzzle-specific embedding model didn't transfer to a different photo type
+(front/body) with zero extra work — there's no guarantee a coarse
+inter-eye/ear-span ratio would be individually discriminative even once
+built, since that kind of gross anatomical proportion is more a function
+of breed/age/pose than individual identity. Realistic estimate: weeks of
+data collection, annotation, and training, not a cheap addition — and the
+payoff is unproven until that investment is made. Not recommended to start
+without a stronger reason than closing this specific 3/161 gap.
+
+### 5. LightGlue's true-positive cost — a small, real, partial win exists; most of the cost doesn't have one
+
+Pulled `lightglue_num_matches` (the raw keypoint-match count the
+`likely_different`/`ambiguous`/`likely_same` zones are computed from —
+`pipeline/lightglue_verify.py`'s `classify_zone()`) for every leave-one-out
+search where LightGlue actually ran, split by same-animal vs
+different-animal, and compared against the zone boundaries currently
+shipped (`LIKELY_DIFFERENT_MAX = 140`, `LIKELY_SAME_MIN = 150`):
+
+| Zone (current boundaries) | SAME-animal (n=96) | DIFFERENT-animal (n=41) |
+|---|---|---|
+| `< 140` (likely_different — triggers demotion) | 9 | 38 |
+| `140–150` (ambiguous — no-op) | 2 | 0 |
+| `>= 150` (likely_same — no-op today) | 85 | 3 |
+
+**Two things worth separating here:**
+
+**(a) The bulk of the signal genuinely holds up at this larger scale.** 85/96
+(88.5%) of same-animal pairs land at `>= 150`, and 38/41 (92.7%) of
+different-animal pairs land at `< 140` — directionally the same clean
+separation the original 51-pair/9-10-animal calibration found (see
+`lightglue_verify.py`'s own comment: *"28 clean FPs num_matches 28..139,
+23 clean TPs 150..833, zero overlap"*), just not perfectly zero-overlap
+once tested on ~3x more animals. Precision of the demotion trigger itself,
+measured directly: **38/47 = 80.9%** of everything that lands in the `<140`
+zone is a genuine impostor — the other 19.1% (9 cases) is exactly Step 1's
+LightGlue cost.
+
+**(b) Within that 9-vs-38 population, a small, real, boundary-only win
+exists.** Sorted by `num_matches`: the 38 real impostor cases top out at
+**117**. Two of the 9 same-animal cases sit clearly above that —
+`UKDEJS725951` at **119** and `UKDESH010833` at **136** — with zero overlap
+between them and the entire impostor distribution. Sweeping the boundary
+down from 140 confirms this precisely:
+
+| Candidate `LIKELY_DIFFERENT_MAX` | True positives saved | Real catches lost |
+|---|---|---|
+| 140 (current) | 0/9 | 0/38 |
+| 130 | 2/9 | 0/38 |
+| **118–119** | **3/9** | **0/38** |
+| 115 | 3/9 | 1/38 |
+| 110 | 3/9 | 3/38 |
+| 100 | 3/9 | 4/38 |
+| 80 | 4/9 | 8/38 |
+| 60 | 4/9 | 18/38 |
+| 40 | 6/9 | 27/38 |
+
+Lowering `LIKELY_DIFFERENT_MAX` from 140 to **~118** recovers **2 of the 7
+visible true-positive costs from Step 1** (`UKDEJS725951`, `UKDESH010833`
+— a 3rd, `UKDEOT691947` at 137, is also pulled out of the zone but was
+already `UNKNOWN` regardless of LightGlue, from the attribute layer alone,
+so it has no visible effect either way) **at zero measured cost** — no real
+impostor in this 161-animal set has a `num_matches` anywhere near that
+range. Below ~110 the trade reverses fast: every further step down costs
+more real catches than it recovers true positives (e.g. 100→80 trades 1
+saved TP for 4 more lost catches). **This is a genuine, cheap,
+config-only recommendation** (one constant in `lightglue_verify.py`, no
+new code) that recovers ~29% of LightGlue's measured true-positive cost
+for free — but it is not a fix for the other ~71% (5–7 of the 7 cases):
+their `num_matches` values (34, 36, 39, 50, 95) sit thoroughly inside the
+impostor distribution's own range, so no single-variable threshold on this
+signal can separate them without also losing real catches.
+
+**Caveat, stated with the same honesty as the original calibration's own
+comment about its small sample:** the "clean gap" this recommendation
+rests on is thin — 2 same-animal points (119, 136) against a same-population
+impostor ceiling of 117, a 2-count margin. That's a real, measured gap in
+this specific 161-animal dataset, not a coin flip, but it's also not a
+large-sample, wide-margin result — a different or larger dataset could
+plausibly shift it. Worth taking (it's free and reversible, a one-line
+constant), not worth treating as a fully validated new threshold the way
+`matchThreshold`/`reviewThreshold` are.
