@@ -241,9 +241,70 @@ PRESETS: dict[Preset, dict] = {
     ),
 }
 
+DEFAULT_PRESET = Preset.FAST
 
-def make_config(preset: Preset = Preset.CROWDED_HD, **overrides) -> PipelineConfig:
+
+def make_config(preset: Preset = DEFAULT_PRESET, **overrides) -> PipelineConfig:
     """Build a PipelineConfig from a preset + any per-job overrides."""
     base = PRESETS.get(preset, {})
     merged = {**base, **overrides}
     return PipelineConfig(**merged)
+
+
+# ── Per-location preset override ──────────────────────────────────
+#
+# CROWDED_HD is NOT a safe global default (CLAUDE.md, "CROWDED_HD narrowed
+# to flagged crowded feeds only" — 2026-08-17). Tested head-to-head against
+# FAST on 2 real clips from the same goshala:
+#   - A dense night feeding-trough scene genuinely improved: peak count
+#     17->43, confirmed visually that CROWDED_HD recovers real animals FAST
+#     missed outright, not just extra noise.
+#   - A clean, low-density daytime corridor scene REGRESSED: same 2-in-frame
+#     peak count either way, but average detection confidence dropped
+#     0.86->0.74 and total detections rose 30% for that same answer --
+#     CROWDED_HD's lower confidence threshold (0.20) and looser NMS (0.55)
+#     produce more, noisier, lower-confidence boxes even in a scene with
+#     nothing to gain from the extra resolution. The peak count only
+#     survived by luck (the extra boxes never coincided in one frame).
+#
+# So the choice is genuinely per-camera, not a single global answer for
+# every feed at a goshala: a fixed camera on a crowded feeding trough or
+# entry gate during herding benefits from CROWDED_HD; the same setting on
+# an open, low-density area actively hurts detection quality. This map is
+# how a specific, already-confirmed-crowded camera opts in -- everything
+# else stays on DEFAULT_PRESET (FAST) unless and until someone has evidence
+# (like the comparison above) that a given feed needs it.
+#
+# Empty by default: no location_tag is flagged yet. Populate with real
+# location_tag strings as the team identifies specific crowded feeds, e.g.:
+#   LOCATION_PRESET_OVERRIDES = {
+#       "goshala_A_feeding_trough": Preset.CROWDED_HD,
+#       "goshala_A_entry_gate": Preset.CROWDED_HD,
+#   }
+# Matching is exact on the location_tag string as sent by the caller --
+# normalize casing/whitespace upstream if that's not already guaranteed.
+LOCATION_PRESET_OVERRIDES: dict[str, Preset] = {}
+
+
+def resolve_preset(
+    location_tag: Optional[str], explicit_preset: Optional[str] = None
+) -> Preset:
+    """Decide which preset a /analyze call should use.
+
+    An explicit `preset` from the caller always wins -- this is what lets
+    someone manually re-run a specific job at a different preset (exactly
+    how the FAST-vs-CROWDED_HD comparison above was produced) without
+    touching this map. Only when the caller doesn't specify does
+    location_tag get consulted; an unrecognised or missing location_tag
+    falls through to DEFAULT_PRESET, never to CROWDED_HD.
+    """
+    if explicit_preset:
+        try:
+            return Preset(explicit_preset)
+        except ValueError:
+            return DEFAULT_PRESET
+
+    if location_tag and location_tag in LOCATION_PRESET_OVERRIDES:
+        return LOCATION_PRESET_OVERRIDES[location_tag]
+
+    return DEFAULT_PRESET

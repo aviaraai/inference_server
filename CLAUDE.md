@@ -1678,3 +1678,54 @@ section), and `cctv_service/` was deleted. If old references to
 `cctv_service/` or `cattle_ai_project` turn up anywhere (docs, chat
 history, stray local folders), they're describing this dead end, not the
 real running service.
+
+## `CROWDED_HD` is opt-in per camera, not a safe global default — tested, not assumed
+
+2026-08-17: `CROWDED_HD` (1920px) had briefly become the system-wide
+default (both `make_config()`'s default arg and `/analyze`'s `preset`
+Form default) as part of the decoupled classify/count pipeline change
+above. That was wrong, and reverted — back to `Preset.FAST` as the
+default, with `CROWDED_HD` now only reachable per-camera via
+`cctv/config.py`'s `LOCATION_PRESET_OVERRIDES` map (keyed by
+`location_tag`) or an explicit `preset` override on a single `/analyze`
+call.
+
+**Why, with real evidence, not intuition** — 2 real goshala clips run
+head-to-head at `FAST` vs `CROWDED_HD`, same clips, same day:
+
+- **Dense night feeding-trough scene: genuine improvement.** Peak count
+  17 → 43. Confirmed visually (annotated frame at the same timestamp,
+  both resolutions) that `CROWDED_HD` recovers real animals `FAST`
+  misses outright in the crowded cluster — not just more boxes, actual
+  previously-undetected cattle. Confidence also rose slightly (0.53 →
+  0.57). Cost: 2.1x processing time (46s → 97s for a 48s clip).
+- **Clean, low-density daytime corridor scene: regressed.** Peak count
+  held at 2 either way, but that's misleading on its own — average
+  detection confidence DROPPED 0.86 → 0.74, and total detections rose
+  30% (600 → 782) for the identical answer. `CROWDED_HD`'s lower
+  confidence threshold (0.20 vs `FAST`'s implicit higher operating
+  point) and looser NMS (0.55) generate more, noisier, lower-confidence
+  boxes even in a scene with nothing to gain from the extra resolution
+  — the peak count only survived because those extra boxes never
+  coincided in a single frame. A busier or slightly-worse-lit version of
+  the same clean scene could easily have inflated the peak count on
+  nothing.
+
+Same pattern the panning-detection section above already found for a
+different symptom (`CROWDED_HD`'s confidence/NMS corrupting the panning
+signal) — this is the general case: `CROWDED_HD`'s settings are tuned
+for density, and applying them to a scene that isn't dense doesn't just
+"waste compute," it measurably degrades detection quality. **Don't
+re-promote `CROWDED_HD` to a global default on the strength of the
+crowded-scene win alone — the clean-scene loss is just as real,
+measured the same way, same day, same method.**
+
+`cctv/config.py::resolve_preset(location_tag, explicit_preset)` is the
+one place this decision gets made: explicit `preset` always wins (manual
+re-runs, testing); otherwise `location_tag` is looked up in
+`LOCATION_PRESET_OVERRIDES`; anything not flagged there falls through to
+`DEFAULT_PRESET` (`FAST`), never to `CROWDED_HD`. The map ships empty —
+no location_tag is flagged yet, since no real camera/location naming
+convention was available to populate it correctly rather than guess. Add
+entries there once specific crowded feeds (feeding troughs, entry gates
+during herding) are identified by `location_tag`.

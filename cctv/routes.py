@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse
 
 from cctv import database as db
 from cctv.analytics import VideoAnalytics
-from cctv.config import RUNS_DIR, UPLOADS_DIR, Preset, make_config
+from cctv.config import RUNS_DIR, UPLOADS_DIR, make_config, resolve_preset
 from cctv.pipeline import run_classify_and_count
 from cctv.schema import (
     AnalyticsSummary,
@@ -144,7 +144,12 @@ async def cctv_health():
 @router.post("/analyze", response_model=JobStatus)
 async def analyze_video(
     video: UploadFile = File(...),
-    preset: str = Form("crowded_hd"),
+    # None, not a baked-in default: an explicit value here always wins (for
+    # ad hoc re-runs/testing), but the common case is the caller only sends
+    # location_tag and lets resolve_preset() decide -- see cctv/config.py's
+    # LOCATION_PRESET_OVERRIDES for why CROWDED_HD is opt-in per camera, not
+    # a global default.
+    preset: Optional[str] = Form(None),
     location_tag: Optional[str] = Form(None),
     enable_analytics: bool = Form(True),
     img_size: Optional[int] = Form(None),
@@ -171,10 +176,7 @@ async def analyze_video(
     if vid_stride:
         overrides["vid_stride"] = vid_stride
 
-    try:
-        preset_enum = Preset(preset)
-    except ValueError:
-        preset_enum = Preset.CROWDED_HD
+    preset_enum = resolve_preset(location_tag, preset)
 
     cfg = make_config(preset_enum, **overrides)
 
