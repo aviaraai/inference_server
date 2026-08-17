@@ -1896,3 +1896,185 @@ investigation ran into — not a tunable one. `LOCATION_PRESET_OVERRIDES`
 question (CROWDED_HD vs FAST per camera) — this doesn't change that,
 it just closes out NMS/confidence as dead ends for anything beyond
 what's already shipped.
+
+## The real leave-one-out recall test — 218 real animals, genuinely held-out query photo
+
+Every recall/precision number in this file up to this point came from either
+a small WhatsApp sample or was inferred rather than measured end-to-end
+against a photo the system had never seen. This is the first real
+leave-one-out test: register each of the 218 real Uttarakhand animals, then
+search using a muzzle photo (`muzzle3.jpg`) that was **never embedded during
+registration** — a genuinely unseen query, not a re-submission of a
+registered photo. `LIGHTGLUE_TIEBREAKER_ENABLED=true` for the whole run, so
+this measures the actual current system, not the pre-LightGlue baseline.
+Script: `uk_leave_one_out.py`; raw logs (`register_log.json`,
+`search_log.json`, 161 entries each) kept in the scratchpad, not committed.
+
+**Unavoidable compromise, stated up front:** `/register` hard-requires
+exactly 3 muzzle images (`len(muzzle_images) != 3` → 422) — there is no way
+to submit 2. So the 3rd slot was filled with a **duplicate of muzzle1**
+(`muzzle1, muzzle2, muzzle1`), never muzzle3 — the held-out photo's bytes are
+never sent anywhere during registration, which is the actual requirement.
+Two downstream effects of this, both real and both accounted for below
+rather than hidden:
+- The muzzle-color majority-vote gate sees muzzle1 twice, so muzzle1's own
+  color reading auto-wins any 2-of-3 vote regardless of muzzle2 — likely
+  passes MORE animals through registration's color-consistency check than
+  true independent 3-photo registration would. (In practice this run's 30
+  `body_color_inconsistent` rejections were all **front1/front2**
+  disagreements, a separate gate the duplication doesn't touch — see below.)
+- Two embeddings per animal are byte-identical (muzzle1 = muzzle1), so any
+  search that ranks back into its own animal has a guaranteed rank1/rank2 (or
+  rank2/rank3) tie at identical score, artificially shrinking the measured
+  gap between an animal's own top match and its next-best. Confirmed directly
+  in a smoke test before the full run: two identical scores
+  (0.8549675941467285) at gap=0.0. This likely suppresses the MATCH-vs-REVIEW
+  split (MATCH requires `gap >= 0.08`) below what true independent triplicate
+  photos would produce — so the 12/161 strict-MATCH count below is plausibly
+  a **lower bound** on what independently-photographed registration would
+  achieve, not an exact prediction of it.
+
+**Decision replication, also stated up front:** `inference_server` itself
+only returns raw `top_matches` (faiss_id/score/rank/gap) — MATCH/REVIEW/
+UNKNOWN is decided in go-apiserver's `decision.go`, a separate repo. The
+test script replicates it exactly for score+gap
+(`matchThreshold=0.82, reviewThreshold=0.72, gapThreshold=0.08`) and for the
+LightGlue demotion (`applyLightglueDisagreement`: MATCH→REVIEW or REVIEW→
+UNKNOWN when `lightglue_zone == "likely_different"`, never a promotion).
+**Deliberately NOT replicated:** `decision.go`'s color/horn attribute
+nudge (`attributeWeight=0.03`) — that's a separate, already-tested piece of
+the decision, and this test is scoped to raw embedding recall and
+LightGlue's effect specifically. `lightglue_checked`/`lightglue_zone` are
+read directly from the real server response for each search, not simulated.
+
+### Registration: 161/218 succeeded (73.9%), all 57 failures are real 422 quality gates
+
+No forced/assumed pass rate — this is what the real 218-photo set actually
+did against the real registration pipeline, cold:
+
+| Failure reason | Count |
+|---|---|
+| `body_color_inconsistent` (front1 vs front2 disagree) | 30 |
+| `RECAPTURE_NO_DETECTION` (muzzle not found) | 10 |
+| `RECAPTURE_MULTI_CATTLE` (more than one animal in a muzzle frame) | 9 |
+| `bad_quality` (blur) | 8 |
+| **Total failures** | **57** |
+
+All 57 are genuine `422`s from real gates — nothing failed for an
+infrastructure reason. `body_color_inconsistent` alone is over half of all
+failures and is **not** an artifact of the muzzle-duplication workaround
+(see above) — it's a front1/front2 color-classifier disagreement, a
+pre-existing gate this test didn't touch. The 161 successful registrations
+are what the leave-one-out search below runs against.
+
+### Search: 161 leave-one-out queries against the held-out muzzle3.jpg
+
+Every one of the 161 registered animals was searched with its own held-out
+`muzzle3.jpg` + `front1.jpg`, against the full 161-animal candidate pool.
+Bucketed by whether the top-1 match was the animal's own record and what the
+replicated decision (score+gap, then LightGlue demotion) landed on:
+
+| Bucket | Count | Meaning |
+|---|---|---|
+| `TRUE_MATCH` | 12 | Correct animal, auto-confirmed MATCH |
+| `TRUE_REVIEW` | 85 | Correct animal, surfaced as REVIEW for an officer to confirm |
+| `CORRECT_ANIMAL_BUT_UNKNOWN` | 5 | Correct animal was top-1, but decision fell to UNKNOWN — lost, would read as "not registered" |
+| `WRONG_ANIMAL` | 47 | Top-1 was a different animal (any decision level) |
+| `REJECTED_PRE_MATCH` | 12 | Query itself failed a quality/detection gate before any match was attempted |
+| `NO_CANDIDATES_RETURNED` | 0 | — |
+| **Total** | **161** | |
+
+**Recall — two honest numbers, not one rounded story:**
+- **Strict (auto-MATCH only): 12/161 = 7.5%.** This is the fraction where the
+  system would confirm a match with zero human involvement.
+- **Robust (correct animal surfaced at all, MATCH or REVIEW): 97/161 = 60.2%.**
+  This is the fraction where an officer reviewing the REVIEW queue would see
+  the *correct* animal as the candidate to confirm — the number that matters
+  if REVIEW is actually staffed and used as intended, not rubber-stamped.
+- The gap between these two is exactly the muzzle-duplication artifact's
+  predicted effect (suppressed gap → most correct top-1 matches land as
+  REVIEW, not MATCH) — expected given the compromise above, not a surprise
+  finding.
+
+### Precision: LightGlue's actual effect on the 47 wrong-animal cases, measured, not assumed
+
+Before LightGlue's demotion is applied, the raw score+gap classifier alone
+already put most wrong-animal cases at REVIEW, not MATCH — go-apiserver's
+threshold design already does a lot of the work:
+
+| | Count |
+|---|---|
+| Wrong-animal cases classified REVIEW by score+gap alone (before LightGlue) | 44 |
+| Wrong-animal cases already UNKNOWN by score+gap alone (LightGlue irrelevant) | 3 |
+| Wrong-animal cases where LightGlue demoted REVIEW→UNKNOWN | 39 |
+| Wrong-animal cases LightGlue did **not** catch — still REVIEW after demotion | 5 |
+
+So of 47 wrong-animal cases: **42 end up UNKNOWN (never shown to an officer
+as a candidate at all)**, and **5 still reach REVIEW** — meaning an officer
+would see a wrong candidate offered for manual confirm/reject in those 5
+cases. All 5 are listed here for the record (`lg_zone` is what LightGlue
+itself measured — 4 came back `likely_same`, i.e. LightGlue was actively
+wrong, not just cautious; 1 was `ambiguous`):
+
+| Query animal | Wrongly matched to | `lightglue_zone` |
+|---|---|---|
+| UKDEGR827871 | UKDEGR455918 | likely_same |
+| UKDEJS014531 | UKDEJS424252 | likely_same |
+| UKDEJS155191 | UKDEJS240379 | ambiguous |
+| UKDEJS698982 | UKDEJS219566 | likely_same |
+| UKDEJS987250 | UKDEJS250469 | likely_same |
+
+**LightGlue does cost true positives, measured exactly: 4/102 correct-animal
+cases (3.9%)** were demoted from REVIEW to UNKNOWN because LightGlue called
+`likely_different` on a photo pair that was, in fact, the same animal:
+
+| Query animal | score | gap |
+|---|---|---|
+| UKDEJS280448 | 0.8081 | 0.0000 |
+| UKDEJS725951 | 0.8718 | 0.0272 |
+| UKDEOT336574 | 0.7834 | 0.0236 |
+| UKDESH010833 | 0.8246 | 0.0021 |
+
+These 4 are exactly what the `CORRECT_ANIMAL_BUT_UNKNOWN` bucket (5) is made
+of, minus 1 case that was already UNKNOWN before LightGlue ran regardless
+(so LightGlue's net cost to recall in this run is these 4, not all 5).
+
+**Precision, at the level an officer actually experiences it:**
+- **At auto-MATCH: 12/12 = 100% in this run** — no wrong-animal case survived
+  score+gap+LightGlue all the way to auto-MATCH. Small N (12), so this is
+  encouraging, not proof of a hard ceiling.
+- **At REVIEW: 85 correct / 90 total REVIEW (85 true + 5 wrong) = 94.4%.** An
+  officer working the REVIEW queue sees the right animal roughly 19 times out
+  of 20; the other 1 in 20 needs the officer's own judgment to reject
+  (both visually-checked highest-confidence wrong-match examples in an
+  earlier pass this session were confirmed genuinely different animals by
+  eye, not dataset duplicates — this system is not just tie-breaking on
+  near-identical photos of the same animal under a different code).
+
+### Combined picture
+
+Of 161 genuinely-unseen queries: **97 correctly point an officer at the
+right animal (12 hands-free, 85 needing a human nod), 47 point at the wrong
+animal (42 of those silently filtered to UNKNOWN before anyone sees them, 5
+surfaced and needing a human to catch the error), 12 never got a match
+attempt at all (query itself failed a quality gate), and 5 correct matches
+were lost to UNKNOWN (4 by LightGlue's own false call, 1 by score+gap
+alone).**
+
+This supersedes the earlier "2/5 false positives" precision figure quoted
+elsewhere in this session's history — that number was measured **before**
+LightGlue's demotion existed in go-apiserver. Both of those original false
+positives had `lightglue_zone=likely_different` when re-checked, so the
+current full system's effective precision on that exact sample is 0/5, not
+2/5. Raw-embedding precision and full-current-system precision are different
+numbers; always state which one is being reported.
+
+**What this does and doesn't prove:** this is real data run through the real
+pipeline end-to-end with a genuinely held-out photo — not a projection. The
+one caveat that should travel with every number above is the
+muzzle-duplication compromise: registration here used 2 independent photos +
+1 duplicate, not 3 independent photos, which plausibly understates the true
+MATCH rate (gap suppression) while not obviously biasing the WRONG_ANIMAL
+rate either direction. If a true 3-independent-photo comparison is ever
+needed, it requires either a 4th real photo per animal or a change to
+`/register`'s hard 3-image requirement — neither was in scope here.
