@@ -2270,3 +2270,91 @@ remains: **3/161 (1.9%) wrong-animal cases reach an officer with no signal
 objecting, and 7/161 (4.3%) correct matches are silently lost specifically
 to LightGlue's own false "likely_different" calls** — both real, both
 small, and both the actual target for anything built next.
+
+
+## Step 2: front/body-photo similarity as a fourth demote-only signal — tested, and NOT worth building
+
+The full-stack result above leaves a small, real gap: 3/161 wrong-animal
+cases reach REVIEW with no signal currently objecting, and separately
+LightGlue costs 7/161 true positives. Before writing any production code,
+tested whether a front-photo similarity signal — same demote-only pattern
+as color/horn attributes and LightGlue, same trigger zone — could close
+either gap. It cannot, and this was checked with real numbers before
+building anything, not assumed.
+
+**Feasibility: yes, mechanically trivial, confirmed by reading the actual
+code before running anything.** `pipeline/muzzle.py`'s `embed_batch(images,
+model, device)` is a generic function — raw image bytes in
+(`preprocess_batch`: PIL decode → 518×518 resize → ImageNet normalize),
+`(B, 256)` unit-norm `GodhaarModel` embeddings out. Nothing about it is
+muzzle-specific; it has no crop/detection step baked in. Feeding it
+`front1.jpg`/`front2.jpg` instead of a muzzle crop is a valid call through
+the exact same code path — no new model, no retraining, no new
+infrastructure.
+
+**Calibration, before building anything:** loaded the real checkpoint
+(`d:\Group Projects\Godhaar\Wildlifeor_adityaest_top1.pt`, the same one
+used earlier this session for the direct cosine-similarity check) and
+embedded every registered animal's `front2.jpg` (gallery side) and every
+query's `front1.jpg` (query side — literally the same photo the real
+leave-one-out `/search` calls already sent, so this measures what
+production would actually see, not a synthetic setup). Two real
+distributions, script `front_similarity_test.py` (scratchpad):
+
+- **SAME-animal** (genuine pairs, n=161): `cos(query front1, own front2)` —
+  mean **0.8727**, min **0.5658**, 5th-percentile **0.6854**.
+- **DIFFERENT-animal** (hardest real negatives — the 41 `WRONG_ANIMAL` cases
+  from the full-stack replay, n=41): `cos(query front1, wrongly-matched
+  candidate's front2)` — mean **0.7501**, max **0.9112**.
+
+**The two distributions overlap almost completely — this signal does not
+discriminate identity for front/body photos.** Every single one of the 41
+wrong-animal cases (100%) scores above the lowest genuine same-animal score
+in the entire dataset (0.5658). There is no threshold that catches any real
+impostor without also being low enough to never fire — a threshold at the
+genuine-pair minimum catches 0/41 impostors by construction. Sweeping
+looser thresholds confirms it's not just a bad cutoff choice, it's a
+missing signal — false-positive risk on genuine pairs tracks catch rate on
+impostors almost 1:1, the signature of no real separation, not a tuning
+problem:
+
+| Threshold (percentile of genuine distribution) | Impostors caught | Genuine pairs falsely flagged |
+|---|---|---|
+| 0th (0.5658) | 0/41 | 0/161 |
+| 1st (0.5807) | 1/41 | 1/161 |
+| 5th (0.6854) | 12/41 | 8/161 |
+| 10th (0.7361) | 19/41 | 16/161 |
+| 20th (0.7893) | 26/41 | 32/161 |
+
+**Directly on the 3 remaining wrong-animal cases from Step 1** (the actual
+target): `UKDEGR827871` scores 0.7647, `UKDEJS014531` scores 0.6735,
+`UKDEJS987250` scores 0.6834 — all three sit at or above the genuine
+distribution's 5th-to-95th-percentile bulk, indistinguishable from a normal
+same-animal pair on this signal. None of them would be caught by any
+threshold that doesn't also risk a meaningful fraction of all genuine
+same-animal pairs in the ambiguous zone.
+
+**Why it doesn't work, not just that it doesn't:** the checkpoint's own
+saved metrics (`genuine_mean=0.7054, impostor_mean=0.0064, gap=0.699`) show
+excellent separation — but that gap was earned by ArcFace fine-tuning
+specifically on **muzzle crops**. The DINOv2 backbone underneath is generic,
+but the projection head's decision boundary was trained to discriminate
+muzzle texture/pattern, not whole-animal front-on appearance. Two more
+effects compound against it for this specific use: front/body photos of
+different animals from the same breed and region look broadly similar
+(pose, background, coat pattern class), inflating cross-animal similarity,
+while `front1` vs `front2` of the *same* animal can differ enough in
+angle/lighting/pose to pull genuine similarity down — both push the two
+distributions toward each other instead of apart.
+
+**Conclusion: do not build this.** Not "needs tuning" — the ROC-like sweep
+above shows no operating point exists where catch rate meaningfully
+exceeds false-demotion rate on true positives, and the 3 specific cases
+this was meant to catch score squarely inside the normal genuine-pair
+range. Building the demote-only wiring (a real, cheap task, same shape as
+`applyLightglueDisagreement`) would add a fourth signal that helps nothing
+and risks new true-positive loss on top of LightGlue's existing 7. The
+remaining 3/161 gap from Step 1 stays open; closing it would need a signal
+actually trained to discriminate identity from the photo type in question —
+this checkpoint is not that signal for front/body photos, and no amount of
+threshold tuning changes that.
