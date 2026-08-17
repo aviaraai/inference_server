@@ -242,7 +242,7 @@ PRESETS: dict[Preset, dict] = {
 }
 
 
-def make_config(preset: Preset = Preset.FAST, **overrides) -> PipelineConfig:
+def make_config(preset: Preset = Preset.CROWDED_HD, **overrides) -> PipelineConfig:
     """Build a PipelineConfig from a preset + any per-job overrides."""
     base = PRESETS.get(preset, {})
     merged = {**base, **overrides}

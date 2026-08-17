@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse
 from cctv import database as db
 from cctv.analytics import VideoAnalytics
 from cctv.config import RUNS_DIR, UPLOADS_DIR, Preset, make_config
-from cctv.pipeline import run_pipeline
+from cctv.pipeline import run_classify_and_count
 from cctv.schema import (
     AnalyticsSummary,
     CctvHealthResponse,
@@ -96,7 +96,7 @@ def _run_job(job_id: str, video_path: Path, cfg, location_tag: str | None, filen
                 cattle_so_far=len(set(fr.stable_ids)),
             )
 
-        summary = run_pipeline(video_path, cfg, job_id=job_id, on_frame=on_frame)
+        summary = run_classify_and_count(video_path, cfg, job_id=job_id, on_frame=on_frame)
 
         # compute analytics
         analytics_result = va.compute() if cfg.enable_analytics else None
@@ -144,7 +144,7 @@ async def cctv_health():
 @router.post("/analyze", response_model=JobStatus)
 async def analyze_video(
     video: UploadFile = File(...),
-    preset: str = Form("fast"),
+    preset: str = Form("crowded_hd"),
     location_tag: Optional[str] = Form(None),
     enable_analytics: bool = Form(True),
     img_size: Optional[int] = Form(None),
@@ -174,7 +174,7 @@ async def analyze_video(
     try:
         preset_enum = Preset(preset)
     except ValueError:
-        preset_enum = Preset.FAST
+        preset_enum = Preset.CROWDED_HD
 
     cfg = make_config(preset_enum, **overrides)
 
@@ -216,19 +216,29 @@ async def get_job_result(job_id: str):
     s = job["summary"]
     return JobResult(
         job_id=s.job_id,
-        # Primary displayed count is the peak simultaneous-in-frame count,
-        # not the unique-tracked-ID count — visually verifiable against the
-        # video, unlike unique_tracked_cattle which is sensitive to tracker
-        # ID churn. See unique_tracked_cattle below for the tracking-based
-        # figure.
-        final_cattle_count=s.max_cattle_in_frame,
+        # Automatic peak-vs-tracking selection (cctv/panning.py), replacing
+        # the old unconditional "always max_cattle_in_frame". Peak-in-frame
+        # is visually verifiable and correct for a static/fixed camera —
+        # that was true and stays true here — but it structurally
+        # undercounts a camera panning across a herd it never sees all at
+        # once (confirmed real case: max_cattle_in_frame=22 vs
+        # unique_tracked_cattle=62 on the same clip, see CLAUDE.md). For a
+        # clip classified as panning, unique_tracked_cattle (already
+        # filtered for min_frames_visible flicker) is the more accurate
+        # single number instead. count_method_used says which happened,
+        # so this is inspectable without re-deriving it from the ratio.
+        final_cattle_count=(
+            s.unique_tracked_cattle if s.is_panning else s.max_cattle_in_frame
+        ),
         count_method=s.count_method,
+        count_method_used=s.count_method_used,
         unique_tracked_cattle=s.unique_tracked_cattle,
         max_cattle_in_frame=s.max_cattle_in_frame,
         average_confidence=s.average_confidence,
         total_detections=s.total_detections,
         throughput_fps=s.throughput_fps,
         processing_seconds=s.processing_seconds,
+        classify_seconds=s.classify_seconds,
         frames_processed=s.frames_processed,
         frames_with_cattle=s.frames_with_cattle,
         video_url=f"/cctv/jobs/{job_id}/video",
@@ -309,6 +319,7 @@ async def list_history(
             video_filename=r.get("video_filename"),
             final_cattle_count=r["final_cattle_count"],
             unique_tracked_cattle=r.get("unique_tracked_cattle"),
+            count_method_used=r.get("count_method_used"),
             avg_herd_speed=r.get("avg_herd_speed"),
             processing_sec=r.get("processing_sec"),
             video_url=f"/cctv/jobs/{r['job_id']}/video",

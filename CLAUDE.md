@@ -1463,6 +1463,132 @@ trained on this specific scene type. If more accuracy is needed here, the
 next lever is a model fine-tuned on genuinely crowded barn footage — a
 data/training problem, not a config change.
 
+### Automatic peak-vs-tracking metric selection — `final_cattle_count` picks the right one instead of always showing peak-in-frame
+
+Follow-up to "Both counts shown side by side" above. Showing both numbers
+and letting the goshala manager pick was the right call when this file
+didn't yet know how to tell a static camera from a panning one — but
+`/jobs/{id}/result` still had to put **one** number in
+`final_cattle_count`, and it hardcoded that to `max_cattle_in_frame`
+unconditionally. That's correct for a static/fixed camera (peak-in-frame
+is visually verifiable, and immune to tracker-ID churn) and systematically
+wrong for a panning shot, which by construction never has the whole herd
+in one frame — that's the exact `22` vs `62` gap on the feeding-trough
+clip above.
+
+Preceded by a real investigation (not assumed): the two originally-suspected
+causes of goshala undercounting — low-contrast dark-coated cattle/Murrah
+buffalo detection failure, and wide/panning-camera coverage — were checked
+against real footage before any fix was proposed. A quantitative
+brightness-vs-detection-confidence correlation across ~1,350 real detections
+found no dark-cattle detection problem (darkest third of detections actually
+averaged slightly *higher* confidence than the lightest third — 0.610 vs
+0.568 — the opposite of what a genuine low-contrast failure would look
+like). The panning/counting-metric hypothesis was the one that held up,
+confirmed both by the `unique_ids_so_far` growth-rate shape (see
+`cctv/panning.py` below) and by directly inspecting extracted frames from
+the clip in question. That result is why this section exists and the
+dark-cattle path doesn't.
+
+**Detector** (`cctv/panning.py`, `detect_panning()`): every processed frame
+already logs a running `unique_ids_so_far` count to `metrics.csv` (existing
+field, not new). A static camera's version of that curve rises fast while
+new animals first walk into frame, then flattens once everything visible has
+been seen once. A panning camera's version keeps discovering new animals
+throughout, because it keeps revealing new ground. So the signal is the
+*ratio* of the late-clip growth rate to the early-clip growth rate:
+
+```
+first_half_rate  = (series[n//2]      - series[0])       / (n//2)
+final_qtr_rate   = (series[-1]        - series[int(.75n)]) / (n - 1 - int(.75n))
+ratio            = final_qtr_rate / first_half_rate
+is_panning       = ratio >= PANNING_RATIO_THRESHOLD   # 1.0
+```
+
+A ratio near or below 1 means the back quarter is growing no faster than
+the first half already did (flattening — static). A ratio meaningfully
+above 1 means it's still climbing at the same or a higher rate right to the
+end (never flattens — panning). `PANNING_RATIO_THRESHOLD = 1.0` was picked
+from real archived runs, not guessed: the confirmed-panning feeding-trough
+clip (visually verified — camera visibly at a different position in frames
+sampled from four different points in the clip) scored **2.19**; a
+confirmed-static clip (fixed close-up on a feeding trough, same background
+railing structure start to end) scored **0.51**; a third, visually-confirmed
+panning clip in open pasture (camera position genuinely shifts between the
+first and last sampled frame) scored **1.61**. `1.0` sits in the gap between
+the static case and both panning cases with real margin on each side, not
+splitting the difference between two close numbers. Two guard conditions
+(`MIN_FRAMES_FOR_DETECTION = 20`, `MIN_UNIQUE_IDS_FOR_DETECTION = 4`) default
+to "not panning" on a clip too short or too sparse to say anything — an
+unclear signal should never flip the metric away from the visually-checkable
+default.
+
+**Wiring** (`cctv/pipeline.py`, `cctv/routes.py`): `VideoSummary` gained
+`is_panning`, `panning_ratio`, `count_method_used` as new fields, computed
+alongside (not replacing) the existing `final_cattle_count`/`count_method`
+pair, which keep their pre-existing, unrelated meaning (`cfg.use_tracking`
+driven) — nothing about the old computation changed. The actual selection
+happens only where the API response is built, in `/jobs/{id}/result`:
+
+```python
+final_cattle_count=(
+    s.unique_tracked_cattle if s.is_panning else s.max_cattle_in_frame
+),
+```
+
+`unique_tracked_cattle` was already the right panning-case number and
+already had its own flicker filter (`min_frames_visible`, from the tracking
+fix earlier in this file) — this doesn't add a second counting method, it
+just decides which of the two already-computed, already-validated numbers
+to report as *the* number. `count_method_used` (`"peak_in_frame"` |
+`"tracking_estimate"`) rides alongside so which one fired is inspectable
+without re-deriving it from `panning_ratio` — additive, diagnostic, not
+surfaced in the dashboard UI. `max_cattle_in_frame`/`unique_tracked_cattle`
+are both still returned too, so nothing that reads the old side-by-side
+fields breaks.
+
+**This is entirely additive and entirely inside `inference_server`.**
+`JobResult`/`SessionInfo` gained fields, nothing was removed or renamed;
+`sessions` got 3 new nullable columns via the same `PRAGMA table_info` +
+`ALTER TABLE` migration pattern used for the peak/tracking columns above, so
+old rows read back as `NULL`/`None` rather than erroring.
+`godhaar_analytics_dashboard` and `go-apiserver` need zero changes for this
+to be correct — go-apiserver's Go client reads `max_cattle_in_frame` by
+field name today and never touches `final_cattle_count` at all, so this
+fix's correctness doesn't yet reach the dashboard until that client is
+updated to prefer `final_cattle_count`/`count_method_used`; flagged, not
+fixed, since touching go-apiserver was out of scope for this change.
+
+Unit tests in `cctv/tests/test_panning.py` pin the three real-data ratios
+above as regression cases (via a helper that reconstructs just the 4 index
+values `detect_panning()` actually reads — `cctv/runs/` is gitignored, so
+the fixtures don't depend on those files existing) plus synthetic edge
+cases (too-short clip, too-few-IDs, exact-threshold boundary, flat-then-late
+growth). Full real-clip validation (all 23 clips in `cctv/clips/`, plus a
+`CROWDED_HD` vs `FAST` cost/latency comparison) — see the note directly
+below.
+
+### Still open: does low inference resolution look like panning on a wide static shot?
+
+One real clip in the 23-clip validation batch (`clip_01.mp4`) — visually
+confirmed static (same background structure across sampled frames, no
+camera motion) during the dark-cattle/panning investigation above — came
+back `is_panning=True` (ratio 1.234) when run through the actual
+`detect_panning()` pipeline at `FAST`'s 640px inference size. Not yet
+resolved at the time of writing: the working hypothesis is that small/
+far-from-camera animals in a wide static shot get inconsistent
+frame-to-frame detections at low resolution (flicker in, flicker out),
+which mints new stable IDs steadily throughout the clip and mimics the same
+"never flattens" curve shape genuine panning produces — a resolution
+confound, not a wrong classification of real camera motion. `clip_01` is
+also in the `CROWDED_HD` (1920px) comparison subset for the same batch, so
+this will be checked directly: if `clip_01` classifies as static at
+`CROWDED_HD` and panning only at `FAST`, that confirms the resolution
+hypothesis and is worth knowing before trusting `is_panning` blindly on
+low-res wide shots. If it's still `True` at `CROWDED_HD` too, the clip
+likely has some real camera adjustment that wasn't visible in the sampled
+frames, and the classification is probably correct after all.
+
 ### Two more correctness bugs found after the tuning history above — same-frame duplicate IDs, and static-position occlusion matching
 
 Found 2026-08-10, independently (validated first against a standalone

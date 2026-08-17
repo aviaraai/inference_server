@@ -70,6 +70,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 total_frames    INTEGER,
                 frames_processed INTEGER,
                 frames_with_cattle INTEGER,
+                is_panning      INTEGER,
+                panning_ratio   REAL,
+                count_method_used TEXT,
                 avg_herd_speed  REAL,
                 isolated_cattle TEXT,
                 activity_breakdown TEXT,
@@ -113,6 +116,15 @@ def init_db(db_path: Path = DB_PATH) -> None:
         if "unique_tracked_cattle" not in existing_cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN unique_tracked_cattle INTEGER")
 
+        # Migration for DBs created before automatic panning detection
+        # (cctv/panning.py) existed. Old rows read back NULL for all three —
+        # correctly: they were never classified, unlike a row that WAS
+        # classified and happened to score not-panning.
+        if "is_panning" not in existing_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN is_panning INTEGER")
+            conn.execute("ALTER TABLE sessions ADD COLUMN panning_ratio REAL")
+            conn.execute("ALTER TABLE sessions ADD COLUMN count_method_used TEXT")
+
 
 # ── write ─────────────────────────────────────────────────────────
 
@@ -126,6 +138,18 @@ def save_session(
     """Persist a completed pipeline run + analytics to the database."""
     init_db(db_path)
 
+    # Same automatic peak-vs-tracking selection as /result (cctv/routes.py)
+    # -- kept in sync deliberately. Storing anything else here would
+    # reintroduce exactly the "/history and /trends disagree with /result
+    # for the same job" bug the comment below already describes fixing
+    # once; that fix's principle (both numbers survive, /result's headline
+    # figure and /history's must match) still holds, it's just that the
+    # headline figure itself is now clip-dependent instead of always
+    # max_cattle_in_frame.
+    final_cattle_count_value = (
+        summary.unique_tracked_cattle if summary.is_panning else summary.max_cattle_in_frame
+    )
+
     with _tx(db_path) as conn:
         conn.execute("""
             INSERT OR REPLACE INTO sessions (
@@ -135,19 +159,14 @@ def save_session(
                 avg_confidence, total_detections, throughput_fps,
                 processing_sec, source_fps, source_width, source_height,
                 total_frames, frames_processed, frames_with_cattle,
+                is_panning, panning_ratio, count_method_used,
                 avg_herd_speed, isolated_cattle, activity_breakdown,
                 frame_count_series, summary_text,
                 output_video, output_report, output_csv
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             summary.job_id, location_tag, video_filename,
-            # Peak-in-frame, matching what /result and /analytics now report
-            # (see CLAUDE.md) -- was summary.final_cattle_count (tracked-ID
-            # count), which is why /history and /trends used to disagree
-            # with /result for the same job. unique_tracked_cattle now stored
-            # separately so both honest numbers survive to /history/trends,
-            # not just the peak one (see CLAUDE.md, "show both" decision).
-            summary.max_cattle_in_frame, summary.count_method,
+            final_cattle_count_value, summary.count_method,
             summary.max_cattle_in_frame, summary.unique_tracked_cattle,
             summary.average_confidence,
             summary.total_detections, summary.throughput_fps,
@@ -155,6 +174,7 @@ def save_session(
             summary.source_width, summary.source_height,
             summary.total_frames, summary.frames_processed,
             summary.frames_with_cattle,
+            int(summary.is_panning), summary.panning_ratio, summary.count_method_used,
             analytics.avg_herd_speed,
             json.dumps(analytics.isolated_cattle),
             json.dumps(analytics.activity_breakdown),

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -25,7 +26,8 @@ import cv2
 import imageio_ffmpeg
 import numpy as np
 
-from cctv.config import CATTLE_TERMS, RUNS_DIR, PipelineConfig
+from cctv.config import CATTLE_TERMS, RUNS_DIR, PipelineConfig, Preset, make_config
+from cctv.panning import detect_panning
 from cctv.stable_id import StableIdMapper
 
 # try importing ultralytics — hard-fail if missing
@@ -76,6 +78,21 @@ class VideoSummary:
     output_video: str
     output_report: str
     output_csv: str
+    # Automatic peak-vs-tracking metric selection (see cctv/panning.py).
+    # Additive fields, computed but not yet consumed by the OLD
+    # final_cattle_count/count_method above (those keep their existing
+    # meaning -- see the comments at their computation site below). The
+    # smart selection between max_cattle_in_frame and unique_tracked_cattle
+    # happens where the response is actually built (cctv/routes.py's
+    # /result handler), using these two fields.
+    is_panning: bool = False
+    panning_ratio: float = 0.0
+    count_method_used: str = "peak_in_frame"  # "peak_in_frame" | "tracking_estimate"
+    # Set only by run_classify_and_count() below — how long the FAST-preset
+    # classification pass took, separate from processing_seconds above
+    # (which is this summary's own pass, i.e. the count pass). 0.0 for a
+    # summary produced by a plain run_pipeline() call.
+    classify_seconds: float = 0.0
 
 
 # ── helpers ───────────────────────────────────────────────────────
@@ -373,6 +390,14 @@ def process_video(
     count_method = "tracking" if cfg.use_tracking and unique_stable > 0 else "max_in_frame"
     final_count = unique_stable if count_method == "tracking" else max_in_frame
 
+    # Automatic peak-vs-tracking metric selection (cctv/panning.py). Uses
+    # the same unique_ids_so_far series already written to metrics.csv
+    # above -- one point per processed frame, in order.
+    is_panning, panning_ratio = detect_panning(
+        [row["unique_ids_so_far"] for row in csv_rows]
+    )
+    count_method_used = "tracking_estimate" if is_panning else "peak_in_frame"
+
     summary = VideoSummary(
         job_id=job_id,
         final_cattle_count=final_count,
@@ -397,6 +422,9 @@ def process_video(
         output_video=str(out_video_path),
         output_report=str(out_dir / "report.json"),
         output_csv=str(csv_path),
+        is_panning=is_panning,
+        panning_ratio=round(panning_ratio, 4),
+        count_method_used=count_method_used,
     )
 
     # write JSON report
@@ -427,4 +455,64 @@ def run_pipeline(
                 on_frame(fr)
     except StopIteration as e:
         summary = e.value
+    return summary
+
+
+# ── decoupled classification + counting ────────────────────────────
+
+def run_classify_and_count(
+    video_path: str | Path,
+    count_cfg: PipelineConfig,
+    job_id: Optional[str] = None,
+    on_frame: Optional[callable] = None,
+) -> VideoSummary:
+    """
+    Runs panning classification and cattle counting as two independent
+    pipeline passes and combines them into one VideoSummary. Classification
+    ALWAYS runs at Preset.FAST, regardless of what `count_cfg` is — counting
+    runs at whatever `count_cfg` says (normally Preset.CROWDED_HD).
+
+    Why these can't share one pass: confirmed on a real 23-clip validation
+    (see CLAUDE.md, "Classification and counting run at different
+    resolutions, on purpose") that CROWDED_HD's confidence (0.20 vs FAST's
+    0.35) and NMS (0.55 vs 0.45) settings measurably corrupt the panning
+    signal — 2 of 5 known false positives stayed wrongly classified, 2 NEW
+    false positives appeared, and the clearest real-panning reference clip
+    flipped to "static". FAST's ratios matched the original 3-clip
+    calibration; CROWDED_HD's did not. Counting, separately, is genuinely
+    better at CROWDED_HD (+41% to +207% peak-count recall measured earlier)
+    — the fix is to stop making one preset do both jobs, not to prefer one
+    preset over the other.
+
+    The classify pass's own detection/count numbers are discarded — only
+    `is_panning`/`panning_ratio` are kept — and its output directory is
+    deleted immediately after, so a real job does not silently double its
+    on-disk footprint forever. `on_frame` (progress callback) is wired only
+    to the count pass, so a job's progress reporting stays silent during
+    the classification pass — a known, accepted UX gap, not a bug: see
+    CLAUDE.md.
+    """
+    job_id = job_id or uuid.uuid4().hex[:12]
+
+    classify_out_dir = RUNS_DIR / f"_classify_{job_id}"
+    classify_cfg = make_config(
+        Preset.FAST,
+        output_dir=str(classify_out_dir),
+        enable_analytics=False,
+    )
+    t0 = time.perf_counter()
+    classify_summary = run_pipeline(video_path, classify_cfg, job_id=f"{job_id}_classify")
+    classify_seconds = round(time.perf_counter() - t0, 2)
+    shutil.rmtree(classify_out_dir, ignore_errors=True)
+
+    count_summary = run_pipeline(video_path, count_cfg, job_id=job_id, on_frame=on_frame)
+
+    count_summary.is_panning = classify_summary.is_panning
+    count_summary.panning_ratio = classify_summary.panning_ratio
+    count_summary.count_method_used = (
+        "tracking_estimate" if classify_summary.is_panning else "peak_in_frame"
+    )
+    count_summary.classify_seconds = classify_seconds
+
+    return count_summary
     return summary

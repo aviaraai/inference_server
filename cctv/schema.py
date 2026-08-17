@@ -36,9 +36,13 @@ class JobStatus(BaseModel):
 class JobResult(BaseModel):
     job_id: str
     final_cattle_count: int = Field(
-        ..., description="Same value as max_cattle_in_frame — kept for backward compatibility. Prefer reading max_cattle_in_frame/unique_tracked_cattle directly."
+        ..., description="The single best count for this clip: max_cattle_in_frame for a static/fixed camera, unique_tracked_cattle for a clip classified as panning (see count_method_used). Prefer this field when only one number can be shown."
     )
     count_method: str
+    count_method_used: str = Field(
+        "peak_in_frame",
+        description="Which figure final_cattle_count above actually is: \"peak_in_frame\" (max_cattle_in_frame) or \"tracking_estimate\" (unique_tracked_cattle), decided by automatic panning detection (cctv/panning.py). Additive/diagnostic field — not surfaced in the dashboard UI today.",
+    )
     max_cattle_in_frame: int = Field(
         ..., description="\"Cattle in view (peak)\" — highest count visible in any single frame. Accurate for a mostly-static camera; undercounts a camera panning across a large herd."
     )
@@ -49,6 +53,9 @@ class JobResult(BaseModel):
     total_detections: int
     throughput_fps: float
     processing_seconds: float
+    classify_seconds: float = Field(
+        0.0, description="How long the separate FAST-preset classification pass took (see count_method_used). 0.0 means this job predates the decoupled classify/count pipeline and used a single pass."
+    )
     frames_processed: int
     frames_with_cattle: int
     video_url: str = Field(
@@ -91,9 +98,14 @@ class SessionInfo(BaseModel):
     created_at: str
     location_tag: Optional[str]
     video_filename: Optional[str]
-    final_cattle_count: int = Field(..., description="\"Cattle in view (peak)\" for this session.")
+    final_cattle_count: int = Field(
+        ..., description="The single best count for this session — peak-in-frame for a static camera, tracked-ID count for a panning one. See count_method_used."
+    )
     unique_tracked_cattle: Optional[int] = Field(
         None, description="\"Cattle observed (tracking)\" for this session. None for sessions recorded before this field existed."
+    )
+    count_method_used: Optional[str] = Field(
+        None, description="Which figure final_cattle_count is: \"peak_in_frame\" or \"tracking_estimate\". None for sessions recorded before automatic panning detection existed."
     )
     avg_herd_speed: Optional[float]
     processing_sec: Optional[float]
