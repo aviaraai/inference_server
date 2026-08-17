@@ -9,6 +9,12 @@ import pipeline.yolo_crop as yc
 yc.load_yolo()
 
 IMAGE_DIR = r"d:\Group Projects\inference_server"
+# Sibling of the repo root, never inside it — a script re-run must not be
+# able to reintroduce tracked test-crop images (see CLAUDE.md's
+# testing-hygiene audit). Only the output side moves; IMAGE_DIR above still
+# reads the source WhatsApp images from wherever they're dropped.
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "inference_server_scratch")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 WA_IMAGES = [
     "a53ef935-b6e4-45d9-850e-8a40afd03b4b.jpeg",
     "4517254f-904d-4423-97c2-beca494c57f6.jpeg",
@@ -43,7 +49,7 @@ for i, fname in enumerate(WA_IMAGES):
 
     if ok:
         PASS += 1
-        out = os.path.join(IMAGE_DIR, f"crop_{i+1:02d}.jpg")
+        out = os.path.join(OUTPUT_DIR, f"crop_{i+1:02d}.jpg")
         cv2.imwrite(out, crop if crop is not None else img)
     else:
         FAIL += 1

@@ -99,14 +99,13 @@ def _get_localized_body_roi(img: np.ndarray) -> Optional[np.ndarray]:
 def get_muzzle_roi(img: np.ndarray) -> np.ndarray:
     """Extract the muzzle skin region for color sampling.
 
-    Prefers a detector-localized crop of the actual muzzle. This matters more
-    than it looks: main.py passes `crop_cattle()`'s output here, which is the
-    WHOLE-ANIMAL box, so the fixed center crop below was sampling the animal's
-    neck/chest and reporting coat color as muzzle color.
-
-    Falls back to the fixed center crop when the detector is unavailable
-    (model not deployed, `pipeline/` not importable) or finds no muzzle in
-    this particular photo.
+    Uses the fixed center crop below — pipeline/muzzle_detect.py's detector
+    is permanently absent by design (CTO-confirmed, 2026-08-17), so
+    `_get_localized_muzzle_roi` always returns None and this always falls
+    through to `_get_fixed_muzzle_roi`. That call is kept (rather than
+    calling the fixed crop directly) so a real detector could be dropped in
+    later without restructuring this function — but don't read its presence
+    as "the detector might be available"; today it never is.
     """
     if img is None or img.size == 0:
         return np.empty((0, 0, 3), dtype=np.uint8)

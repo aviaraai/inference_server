@@ -2,10 +2,17 @@
 test_clahe.py — Test that CLAHE enhancement helps YOLO detect
 dark/low-contrast cattle that the raw image misses.
 """
+import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from pipeline.yolo_crop import _enhance_for_detection
+
+# Sibling of the repo root, never inside it — a script re-run must not be
+# able to reintroduce tracked test images (see CLAUDE.md's testing-hygiene
+# audit; this exact filename shape was committed to history once already).
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "inference_server_scratch")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 model = YOLO("yolov8s.pt")
 
@@ -17,7 +24,7 @@ print(f"Original: {w}x{h}")
 # Simulate a low-contrast camera: darken + reduce contrast
 # This mimics what bad phone cameras produce for dark cattle
 dark = (img.astype(np.float32) * 0.35 + 15).clip(0, 255).astype(np.uint8)
-cv2.imwrite("test_dark.jpg", dark)
+cv2.imwrite(os.path.join(OUTPUT_DIR, "test_dark.jpg"), dark)
 
 print(f"\n--- Original image ---")
 r1 = model(img, conf=0.01, verbose=False)[0]
@@ -37,7 +44,7 @@ for b in r2.boxes:
 
 print(f"\n--- Darkened + CLAHE enhancement ---")
 enhanced = _enhance_for_detection(dark)
-cv2.imwrite("test_dark_clahe.jpg", enhanced)
+cv2.imwrite(os.path.join(OUTPUT_DIR, "test_dark_clahe.jpg"), enhanced)
 r3 = model(enhanced, conf=0.01, verbose=False)[0]
 print(f"  Detections: {len(r3.boxes)}")
 for b in r3.boxes:

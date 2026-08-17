@@ -199,10 +199,10 @@ async def lifespan(app: FastAPI):
     yolo_path = os.getenv("YOLO_MODEL_PATH", None)
     load_yolo(yolo_path)
 
-    # 5b. Load the muzzle detector — localizes the muzzle before its color is
-    #     read. Optional: if absent, muzzle color degrades to a fixed center
-    #     crop of the whole-animal box (i.e. reads coat, not muzzle) but the
-    #     service still serves. See pipeline/muzzle_detect.py.
+    # 5b. No-op — the dedicated muzzle detector is permanently absent by
+    #     design (CTO-confirmed, 2026-08-17), not a missing deployment step.
+    #     Muzzle color is sampled from a fixed center crop of the
+    #     whole-animal box; see pipeline/muzzle_detect.py.
     load_muzzle_detector()
 
     # 5c. Load the LightGlue /search fusion tiebreaker. Optional, same

@@ -27,17 +27,15 @@ YOLO_INTERNAL_CONF = 0.10                       # passed to YOLO inference — m
                                                 # before filtering. YOLO default (0.25) silently
                                                 # drops dark-cattle detections we need to see.
 MIN_BBOX_AREA_PCT  = 0.05                       # bbox must be ≥5% of image area
-# ── Muzzle detector (color sampling only, NOT the embedding path) ────────────
-# Single-class YOLOv8n (`cattle_muzzle_3`) exported to TFLite — the same
-# weights the Telangana Android app ships in its assets. Used to localize the
-# muzzle before reading its color; without it, muzzle color is sampled from
-# the center of the whole-animal crop, i.e. the coat. See
-# pipeline/muzzle_detect.py. `appstorage/` is gitignored, so this file must be
-# placed on the deployment volume alongside the other models.
-MUZZLE_MODEL_PATH  = os.getenv(
-    "MUZZLE_MODEL_PATH", "appstorage/Models/muzzle_detect/best_float16.tflite"
-)
-MUZZLE_DETECT_CONF = 0.30                       # measured 0.82–0.91 on real field photos
+# ── Muzzle detector: removed, permanently absent by design ───────────────────
+# A single-class YOLOv8n muzzle detector was planned here (see git history —
+# pipeline/muzzle_detect.py, before 2026-08-17), to localize the muzzle
+# before reading its color. CTO-confirmed permanently absent: the model
+# will never be deployed, so MUZZLE_MODEL_PATH/MUZZLE_DETECT_CONF and every
+# consumer of them were removed rather than left as dead config for a file
+# that will never exist. Muzzle color is sampled from a fixed center crop
+# of the whole-animal box instead — see wildlife/color/roi.py's
+# get_muzzle_roi(), which is the permanent, intended path now.
 MAX_CATTLE_PER_IMAGE = 1                        # detections above this must resolve to a
                                                 # single dominant subject (see below) or the
                                                 # image is rejected as multi-cattle

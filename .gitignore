@@ -19,6 +19,20 @@ cctv/cctv.db
 cctv/cctv.db-wal
 cctv/cctv.db-shm
 
+# CCTV test/calibration video clips — NEVER should have been trackable.
+# 23 files, ~505MB, already committed to history under 1b4a082 (2026-08-10)
+# before this rule existed — see CLAUDE.md's testing-hygiene audit. This
+# stops it from getting WORSE; it does not undo what's already committed.
+cctv/clips/
+
+# Ad hoc local test images/crops written to the repo root by one-off scripts
+# (test_clahe.py, foo.py) that predate the "tests write outside the repo"
+# rule below. Kept as a safety net for exactly this filename shape recurring,
+# not as a substitute for pointing those scripts elsewhere.
+/test_*.jpg
+/test_*.jpeg
+/crop_*.jpg
+
 # Training pipeline + dataset now live in their own repo (D:\Group Projects\model_training).
 # Never commit training code/data/artifacts here — this is a safety net in case
 # anything regenerates a cctv/training folder in this repo again.
