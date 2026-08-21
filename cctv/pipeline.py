@@ -27,6 +27,7 @@ import imageio_ffmpeg
 import numpy as np
 
 from cctv.config import CATTLE_TERMS, RUNS_DIR, PipelineConfig, Preset, make_config
+from cctv.muzzle_crop import BestSightingTracker, MuzzleCropResult, extract_muzzle_crops
 from cctv.panning import detect_panning
 from cctv.stable_id import StableIdMapper
 
@@ -93,6 +94,13 @@ class VideoSummary:
     # (which is this summary's own pass, i.e. the count pass). 0.0 for a
     # summary produced by a plain run_pipeline() call.
     classify_seconds: float = 0.0
+    # One extraction attempt per stable ID that ever qualified (see
+    # cctv/muzzle_crop.py) — infrastructure for cross-camera de-duplication,
+    # not yet consumed by anything (see CLAUDE.md, "Cross-camera
+    # de-duplication"). Keyed by stable_id, not by any registered-animal
+    # identity. Empty for the classify-only pass in run_classify_and_count()
+    # (extraction only runs on the real count pass — see there).
+    muzzle_crops: dict[int, MuzzleCropResult] = field(default_factory=dict)
 
 
 # ── helpers ───────────────────────────────────────────────────────
@@ -203,6 +211,10 @@ def process_video(
         iou_thresh=cfg.stable_id_iou_thresh,
         memory_frames=cfg.stable_id_memory_frames,
     )
+    # Only feed real crop candidates: only=True on the count pass avoids
+    # copying frames for the throwaway classify pass (run_classify_and_count
+    # below), which never reads muzzle_crops.
+    sighting_tracker = BestSightingTracker() if cfg.extract_muzzle_crops else None
 
     csv_rows: list[dict] = []
     all_confidences: list[float] = []
@@ -281,6 +293,9 @@ def process_video(
 
         for sid in stable_ids:
             frames_visible[sid] = frames_visible.get(sid, 0) + 1
+
+        if sighting_tracker is not None:
+            sighting_tracker.observe(frame_idx, frame, stable_detections, frame_confidences)
 
         cattle_count = len(stable_detections)
         total_detections += cattle_count
@@ -390,6 +405,19 @@ def process_video(
     count_method = "tracking" if cfg.use_tracking and unique_stable > 0 else "max_in_frame"
     final_count = unique_stable if count_method == "tracking" else max_in_frame
 
+    # One muzzle-crop extraction attempt per QUALIFYING stable ID — a
+    # flicker ID that never met min_frames_visible isn't a real tracked cow
+    # either, same filter the final count already applies. See
+    # cctv/muzzle_crop.py; this is infrastructure only, nothing reads
+    # muzzle_crops yet.
+    muzzle_crop_results: dict[int, MuzzleCropResult] = {}
+    if sighting_tracker is not None:
+        qualifying_sightings = {
+            sid: s for sid, s in sighting_tracker.best_sightings.items()
+            if sid in qualifying_ids
+        }
+        muzzle_crop_results = extract_muzzle_crops(qualifying_sightings, out_dir)
+
     # Automatic peak-vs-tracking metric selection (cctv/panning.py). Uses
     # the same unique_ids_so_far series already written to metrics.csv
     # above -- one point per processed frame, in order.
@@ -425,6 +453,7 @@ def process_video(
         is_panning=is_panning,
         panning_ratio=round(panning_ratio, 4),
         count_method_used=count_method_used,
+        muzzle_crops=muzzle_crop_results,
     )
 
     # write JSON report
@@ -499,6 +528,7 @@ def run_classify_and_count(
         Preset.FAST,
         output_dir=str(classify_out_dir),
         enable_analytics=False,
+        extract_muzzle_crops=False,
     )
     t0 = time.perf_counter()
     classify_summary = run_pipeline(video_path, classify_cfg, job_id=f"{job_id}_classify")

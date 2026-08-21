@@ -51,6 +51,234 @@ first `compute()` call with `enable_analytics=True` (which is the default).
 Never triggered in the prototype because whatever testing it got apparently
 didn't exercise that path end-to-end. Added the import in `cctv/analytics.py`.
 
+## Cross-camera de-duplication: muzzle-crop extraction built; comparison logic deliberately NOT built yet
+
+Every CCTV job counts cattle **per video**, independently. Two cameras
+covering the same or adjacent physical space — e.g. an entry gate and the
+shed it feeds into — have no way to know they might be looking at the same
+animal a few seconds apart, so a goshala running several cameras has no
+real "how many distinct cattle did we actually see today" number, only a
+pile of per-camera counts that may double-count animals. This section
+covers what's built (a layout-independent prerequisite, safe to ship before
+any camera's physical position is known) and what's designed but
+deliberately not built (the actual cross-camera match, which DOES need
+that layout).
+
+### Part 1 — built: one muzzle-crop extraction per tracked cow (`cctv/muzzle_crop.py`)
+
+Before two sightings can ever be compared, each one needs a crop to compare
+*with*. `StableIdMapper` (`cctv/stable_id.py`) had zero connection to the
+muzzle-biometric side of this server before this — no crop, no `faiss_id`,
+nothing. `cctv/muzzle_crop.py` adds exactly one thing: for every stable ID
+that survives the existing `min_frames_visible` flicker filter (the same
+filter `unique_tracked_cattle` already uses), extract one crop from its
+single highest-tracker-confidence sighting across the whole clip.
+
+**There is no muzzle-only detector to reuse — it doesn't exist.**
+`pipeline/muzzle_detect.py` is a permanent no-op (CTO-confirmed 2026-08-17,
+see `godhaar/config.py`'s "Muzzle detector: removed, permanently absent by
+design"). The only thing that has EVER localized a "muzzle crop" for
+either `/register` or `/search`, for the actual embedding path, is
+`crop_cattle()` (`pipeline/yolo_crop.py`) — a whole-animal COCO detector
+that reads as muzzle-filling only because the capture UI demands a 20-30cm
+close-up (see "The pipeline embeds the whole animal" above). So reusing
+"the same crop_cattle/muzzle-detection logic already used for
+registration" means, concretely, reusing `crop_cattle()` and nothing else
+— that IS the whole of what registration has.
+
+A CCTV frame is not a close-up, and a goshala frame usually has several
+cattle in it. Calling `crop_cattle()` on the full frame would re-create the
+exact multi-subject ambiguity `select_dominant_box()` exists to resolve for
+registration photos — except CCTV doesn't need that heuristic at all,
+because BoT-SORT tracking already says exactly which pixels are OUR cow.
+So `cctv/muzzle_crop.py` pre-crops the frame to the tracked box (padded by
+`CONTEXT_PADDING_FRACTION = 0.25` of the box's own width/height, minimum 20
+px, so `crop_cattle()`'s own YOLO pass has slack to re-detect the animal
+rather than clip a leg or horn off the edge it's handed) and only then
+calls `crop_cattle()` on that sub-image, unmodified. The result is the same
+KIND of crop registration produces — a whole-animal-dominated JPEG, called
+"muzzle crop" by this codebase's convention — not a true muzzle-only
+region, because that region no longer exists as a concept anywhere in this
+server. **`CONTEXT_PADDING_FRACTION` is an unvalidated starting guess**,
+same status as the Telangana app's `CONTEXT_MULTIPLIER=4` for the identical
+class of problem (see that repo's CLAUDE.md) — if extraction keeps clipping
+limbs/horns, raise it; if it keeps pulling in a neighbouring animal, lower
+it.
+
+Storage: one JPEG per qualifying stable ID, at
+`cctv/runs/<job_id>/muzzle_crops/<stable_id>.jpg` — keyed purely by
+`(job_id, stable_id)`, i.e. the CCTV session and the tracked cow, **never**
+by `faiss_id` or any registered-animal identity. This has to work for
+cattle that were never registered at all: cross-camera de-dup is "same
+physical animal across two feeds," not "same registered identity" (see
+Part 2). `VideoSummary.muzzle_crops` (new field, `cctv/pipeline.py`) carries
+the per-cow result — `status` (`crop_cattle()`'s own status string, or
+`NO_SIGHTING`/`DEGENERATE_BOX`/`WRITE_FAILED`/`ERROR`), `crop_path`,
+`source_confidence` (the TRACKER's confidence, not `crop_cattle()`'s),
+`crop_confidence`, `source_frame_idx` — through to `report.json` the same
+way every other summary field already does. `PipelineConfig.
+extract_muzzle_crops` (default `True`) gates it; `run_classify_and_count()`
+turns it off for its throwaway FAST-preset classification pass, whose
+output directory is deleted immediately after anyway (see "Classification
+and counting run at different resolutions" below).
+
+**Deliberately NOT wired into `cctv/database.py`'s `tracks` table, or any
+route/schema.** `tracks` is already exactly `(job_id, stable_id)` and would
+be the obvious place to persist a crop path long-term, but there is no
+consumer for that yet — Part 2 below is design only, not built — and
+wiring persistence for a value nothing reads yet is the kind of premature
+plumbing this file elsewhere warns against. When Part 2 actually gets
+built, adding a `muzzle_crop_path`/`muzzle_crop_status` column to `tracks`
+(populated in `db.save_session()` from `summary.muzzle_crops`, mirroring
+exactly how `analytics.per_cow` already populates that table) is the
+natural next step — not a redesign.
+
+**Tested against the real 23-clip goshala set** (`cctv/clips/`, same
+government CCTV footage the `CROWDED_HD` preset was calibrated against —
+see "Classification and counting run at different resolutions" below) via
+`scratch_cctv_muzzle_crop_test.py`, FAST preset:
+
+- **812 qualifying tracked cattle across 23 clips, 633 crops successfully
+  extracted — 78.0% overall.** Every clip produced at least one crop; no
+  clip's pipeline run failed outright. Per-clip rate ranged 58%-97%, no
+  correlation with clip length or `unique_tracked_cattle` count visible at
+  a glance (a 24-cow clip scored 58%, a 29-cow clip scored 97%).
+- **Failure breakdown: 126 `RECAPTURE_NO_DETECTION` (15.5%), 53
+  `RECAPTURE_MULTI_CATTLE` (6.5%), zero of any other status.** No
+  `DEGENERATE_BOX`/`WRITE_FAILED`/`ERROR` at all — the padding/geometry
+  code path itself never broke; every failure was `crop_cattle()` itself
+  declining, the same two rejection reasons it already gives real
+  registration photos.
+  - `RECAPTURE_NO_DETECTION` skews toward the tracker's own
+    lower-confidence sightings (spot-checked several — most sat in the
+    0.4-0.6 tracker-confidence band, well below the 0.8+ where most
+    `OK` results cluster). Reads as the honest case: a cow's single BEST
+    frame in a 30-second clip can still be small, angled away, or
+    partially occluded, and `crop_cattle()` correctly declines rather than
+    guessing.
+  - `RECAPTURE_MULTI_CATTLE` is exactly the goshala-crowding case
+    `select_dominant_box()` exists for — `CONTEXT_PADDING_FRACTION=0.25`'s
+    padding sometimes pulls a neighbour into the sub-image clearly enough
+    that no single animal dominates it.
+- Spot-checked output files directly (not just counting successes): crop
+  count on disk matched the reported success count exactly (633 files), all
+  real, non-trivial JPEGs (6-37 KB sampled, not empty/corrupt writes).
+- ~118-121s/clip end-to-end on this machine's GPU (FAST preset, ~30-45s
+  clips) — extraction adds a second YOLO pass (`crop_cattle`'s own model,
+  separate from the CCTV tracker's) per qualifying cow on top of the
+  existing tracking pass; not benchmarked in isolation against a
+  crop-extraction-disabled run, so the exact marginal cost isn't broken out
+  here.
+
+**78% is a first real measurement, not a target that's been tuned toward.**
+The two failure modes are both `crop_cattle()` correctly declining a
+genuinely hard case, not a bug in the new code — so the honest next levers,
+if this rate ever needs to be higher, are the ones already named inline
+above (`CONTEXT_PADDING_FRACTION` for the multi-cattle case) or accepting
+that ~1 in 5 tracked cattle in a 30-45s clip simply never gets a
+good-enough frame, and letting Part 2's eventual matching logic treat a
+missing crop as "nothing to compare," not an error.
+
+### Part 2 — design for the actual cross-camera match (NOT built)
+
+This is the plan for the piece Part 1 is prerequisite to, written down now
+so it doesn't need re-deriving once Raipur's (or any goshala's) real camera
+layout is known. Nothing below is implemented.
+
+**Core mechanism: reuse `pipeline/lightglue_verify.py`'s `verify()` exactly
+as it runs for `/search` today, pointed at two CCTV crops instead of a
+query-vs-FAISS-candidate pair.** `/search`'s tiebreaker calls
+`verify_with_cached_candidate(query_crop, cached_candidate_features)` — the
+"cached" half only exists because the candidate is a *registered* animal
+with a `faiss_id`-keyed cache entry (`pipeline/muzzle_crop_cache.py`).
+Neither side of a CCTV-to-CCTV comparison has that, so this would call the
+plain `verify(crop_a, crop_b)` path instead — full DISK extraction on BOTH
+sides, same function `/search`'s own cold-cache fallback and the offline
+`experiments/lightglue_poc/match_muzzles.py` already use. `classify_zone()`
+and its thresholds (`LIKELY_DIFFERENT_MAX = 140`, `LIKELY_SAME_MIN = 150`)
+are the same code too, but **their calibration is NOT known to transfer**:
+both numbers were derived from 51 real close-up-registration-photo pairs
+(`lightglue_fp_results_v2_resize_cache.csv`, see "/search fusion
+tiebreaker" below) — same visual domain as `/register`/`/search`, not the
+whole-animal-from-a-distance domain Part 1's crops actually live in. Treat
+140/150 as a starting point to re-validate against real CCTV crop pairs,
+not an assumption to build on. `LIGHTGLUE_MAX_DIM=512`'s resize cap applies
+identically either way, so per-pair latency should still land near the
+~170ms measured for `/search` — but every CCTV-to-CCTV pair pays full
+two-sided DISK extraction (no feature cache exists for either side), so
+that ~170ms is the right per-pair budget to plan N-pair costs against, not
+`/search`'s cheaper cached-candidate path.
+
+**⚠️ REQUIRED before Part 3 (the real comparison logic) starts — not
+optional, not a nice-to-have: re-calibrate `LIKELY_DIFFERENT_MAX`/
+`LIKELY_SAME_MIN` against real CCTV-style crop pairs (whole-animal + 25%
+context padding, Part 1's actual output) before writing a single line of
+cross-camera matching code against the 140/150 values as they stand.**
+Same reasoning as the `FAST`/`CROWDED_HD` confound elsewhere in this file
+(a preset's thresholds, tuned for one job, silently corrupted a different
+signal the moment it got reused for a second job at a different
+resolution/population) — a threshold is only ever validated for the
+population it was measured against, and 140/150 were measured against
+close-up registration photos, a visual domain Part 1's crops structurally
+are not. Do not assume the gap holds; measure it on real CCTV pairs the
+same way `/search`'s round-2 re-validation did (real dataset, both
+zone-boundary populations checked, not just the happy path).
+
+This isn't hypothetical caution — it's already been shown, in this exact
+codebase, on the SAME domain the 140/150 numbers came from, that this kind
+of boundary is thinner than a first pass suggests: the "Precision:
+LightGlue's actual effect" analysis below (161 real leave-one-out animals,
+same registration-photo population 140/150 were calibrated on) found the
+138 same-animal pairs currently below 140 include two genuine impostor-free
+outliers at 119/136 against an impostor ceiling of exactly **117** —
+a real, still-unshipped, config-only improvement (candidate ~118, `140` is
+still what's live in `lightglue_verify.py` today) sitting on a measured
+2-count margin, WITHIN the domain the threshold was built for. Carrying
+140/150 across to a structurally different domain (CCTV whole-body crops)
+with zero re-measurement risks a much larger, silent version of the same
+gap — possibly in either direction (too many false `likely_different`
+demotions, or too many false `likely_same` merges, both of which directly
+corrupt a de-duplication count).
+
+**Trigger conditions — explicitly UNDETERMINED, pending real camera data:**
+- Same time window across two camera feeds (a sighting on camera A and a
+  sighting on camera B are only worth comparing if they could plausibly be
+  the same physical moment, not the same cow revisiting hours apart).
+- Only for cameras that are physically adjacent or have overlapping
+  coverage — comparing every camera's every tracked cow against every
+  other camera's is both expensive (N×M DISK+LightGlue pairs, no caching
+  possible on either side per the paragraph above) and mostly pointless
+  (two cameras on opposite ends of a goshala can't be seeing the same
+  animal at the same moment).
+
+**The merge step happens AFTER each camera's own count, as a separate,
+goshala-wide de-duplication pass — not a change to per-camera counting.**
+`cctv/pipeline.py`'s `process_video()` and `unique_tracked_cattle` stay
+exactly what they are today, one number per video. Cross-camera de-dup
+would run afterward, across two or more already-completed sessions'
+`muzzle_crops` outputs, and produce a SEPARATE goshala-wide figure — it
+should never reach back into how one camera's own tracking/counting works.
+
+**Explicitly NOT YET DECIDED — both need real data, not a guess now:**
+- **How camera adjacency gets configured.** Likely a manual admin input per
+  goshala — something in the shape of `cctv/config.py`'s
+  `LOCATION_PRESET_OVERRIDES` (an explicit map keyed by the caller's
+  `location_tag`, empty by default, populated only once someone has a real
+  reason to populate a specific entry) rather than anything inferred
+  automatically. Not designed further than that shape here.
+- **What time-window tolerance counts as "plausibly the same sighting."**
+  Depends entirely on real walking speed between two specific cameras'
+  fields of view at a real goshala, which doesn't exist as data yet.
+
+**This does NOT require the animal to be registered in the muzzle
+biometric system at all.** It's tracking-level identity matching — "is the
+cow in this crop the same physical animal as the cow in that crop" —
+completely independent of whether either animal has ever been through
+`/register`/`/search`. That independence is why Part 1 keys crops by
+`(job_id, stable_id)` and never by `faiss_id`: a `faiss_id` requires
+registration, and most cattle a CCTV camera sees on any given day will not
+be registered.
+
 ## The pipeline embeds the whole animal, NOT an isolated muzzle
 
 This is the single most important thing to understand about matching quality.

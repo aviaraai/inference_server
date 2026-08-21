@@ -91,6 +91,13 @@ class PipelineConfig:
     stable_id_memory_frames: int = 90
     min_frames_visible: int = 5              # drop flicker IDs seen in fewer frames than this
 
+    # muzzle-crop extraction (cctv/muzzle_crop.py) — infrastructure for
+    # cross-camera de-duplication, see CLAUDE.md. On by default since it's
+    # cheap relative to the rest of the pipeline; run_classify_and_count()
+    # turns it off for its throwaway FAST-preset classification pass, whose
+    # output directory is deleted immediately after anyway.
+    extract_muzzle_crops: bool = True
+
     # analytics
     enable_analytics: bool = True
     density_grid_cells: int = 8              # N×N grid for density map
