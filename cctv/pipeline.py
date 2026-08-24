@@ -13,7 +13,6 @@ what to do with them.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -29,6 +28,7 @@ import numpy as np
 from cctv.config import CATTLE_TERMS, RUNS_DIR, PipelineConfig, Preset, make_config
 from cctv.muzzle_crop import BestSightingTracker, MuzzleCropResult, extract_muzzle_crops
 from cctv.panning import detect_panning
+from cctv.profiling import StageProfiler
 from cctv.stable_id import StableIdMapper
 
 # try importing ultralytics — hard-fail if missing
@@ -153,6 +153,7 @@ def process_video(
     video_path: str | Path,
     cfg: PipelineConfig,
     job_id: Optional[str] = None,
+    profile: Optional[bool] = None,
 ) -> Generator[FrameResult, None, VideoSummary]:
     """
     Process a video through the full pipeline, yielding per-frame results.
@@ -166,6 +167,15 @@ def process_video(
         pass
     summary = gen.value   # available after StopIteration
     ```
+
+    `profile`: measurement-only stage timing (cctv/profiling.py), off by
+    default. `None` (the default) reads the `CCTV_PROFILE` env var, so
+    production is zero-cost without anyone having to remember to pass
+    `profile=False`; pass `True`/`False` explicitly to override the env var
+    (e.g. from a one-off script). When enabled, prints a per-stage summary
+    table to stdout after the run — does not change any detection/tracking
+    logic or written output (annotated.mp4/metrics.csv/report.json/
+    muzzle_crops/*.jpg are byte-identical to a run with profiling off).
     """
     video_path = Path(video_path)
     if not video_path.exists():
@@ -200,11 +210,56 @@ def process_video(
             f"Unusable video file — cannot decode frames: {video_path}"
         )
 
-    # output video writer
+    # ── output video: one persistent ffmpeg process, not cv2.VideoWriter ──
+    # Previously: cv2.VideoWriter wrote mp4v/FMP4 during the loop (this
+    # machine's OpenCV/FFmpeg build can't encode H.264 directly — bundled
+    # libopenh264 fails to load), then a SEPARATE subprocess.run() batch pass
+    # re-decoded and re-encoded the ENTIRE finished file to H.264 after the
+    # loop — every frame paid for encoding twice, and the second pass
+    # couldn't start until the first was 100% done and the file closed
+    # (measured at CROWDED_HD on clip_01.mp4: encode_frame 27.2s +
+    # encode_final 24.3s = 51.5s of a 185.7s total). Fixed by opening ffmpeg
+    # itself as a persistent subprocess before the loop and piping each
+    # annotated frame's raw BGR bytes to its stdin as it's produced — ffmpeg
+    # encodes H.264 directly, once, overlapped with later frames' detection/
+    # tracking, with no intermediate mp4v file at all.
     out_video_path = out_dir / "annotated.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out_fps = src_fps / cfg.vid_stride
-    writer = cv2.VideoWriter(str(out_video_path), fourcc, out_fps, (src_w, src_h))
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    # ffmpeg writes its own diagnostic/progress text to stderr continuously
+    # while running. PIPE-ing that without draining it is a classic
+    # subprocess deadlock: the OS pipe buffer fills, ffmpeg blocks trying to
+    # write to it, we're blocked writing frames to stdin, neither side ever
+    # unblocks. Routed to a real file instead — no fixed buffer to fill —
+    # and only read back if ffmpeg actually fails, for a useful error message.
+    ffmpeg_stderr_path = out_dir / "ffmpeg_stderr.log"
+    ffmpeg_stderr_file = open(ffmpeg_stderr_path, "wb")
+    ffmpeg_proc = subprocess.Popen(
+        [
+            ffmpeg_path, "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{src_w}x{src_h}",
+            "-r", f"{out_fps:.6f}",
+            "-i", "pipe:0",
+            "-vcodec", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            # Explicit, not left to ffmpeg's default: raw BGR input carries no
+            # chroma-subsampling hint, and without this libx264 can pick a
+            # pixel format (e.g. yuv444p) that isn't universally
+            # browser-decodable. yuv420p is what the old mp4v-source path
+            # produced and is what this codebase's earlier browser-
+            # playability fix (see CLAUDE.md) was built around — this keeps
+            # that same compatibility guarantee under the new encode path.
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(out_video_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=ffmpeg_stderr_file,
+    )
 
     # ── stable-ID mapper & accumulators ───────────────────────────
     mapper = StableIdMapper(
@@ -225,12 +280,34 @@ def process_video(
     all_raw_ids: set[int] = set()
     frames_visible: dict[int, int] = {}   # stable_id -> count of frames it appeared in
 
+    # Measurement-only (cctv/profiling.py): off unless CCTV_PROFILE=1 or
+    # `profile=True` is passed explicitly. A disabled profiler's stage()
+    # calls are true no-ops, so this instruments the pipeline unconditionally
+    # without changing behaviour when profiling is off.
+    #
+    # There is no separate "preprocessing" stage below — checked, there
+    # isn't one in this file to time. `model.track()`/`model.predict()`
+    # with `stream=True` returns a generator; the actual resize/normalize/
+    # to-tensor preprocessing, the forward pass, AND (when a tracker is
+    # attached) BoT-SORT's own update all run lazily, fused together,
+    # inside the `for r in results:` loop below, not at the call site — so
+    # "yolo_track" below is preprocess+inference+BoT-SORT as one
+    # inseparable unit, not "inference" alone. Splitting them would mean
+    # patching ultralytics' internal Predictor, which is exactly the kind
+    # of pipeline-logic change this instrumentation is not supposed to
+    # make. Only that stage touches CUDA (confirmed by reading
+    # cctv/stable_id.py, this file's cv2 calls, and cv2.VideoWriter — none
+    # import torch) — cctv/profiling.py's `gpu=True` synchronize() calls
+    # are scoped to it alone.
+    profiler = StageProfiler(enabled=profile)
+
     t_start = time.perf_counter()
     frame_idx = -1
 
     # ── frame loop ────────────────────────────────────────────────
     while True:
-        ret, frame = cap.read()
+        with profiler.stage("decode"):
+            ret, frame = cap.read()
         if not ret:
             break
         frame_idx += 1
@@ -242,139 +319,168 @@ def process_video(
         processed_count += 1
         elapsed = time.perf_counter() - t_start
 
-        # ── detect / track ────────────────────────────────────────
-        if cfg.use_tracking:
-            results = model.track(
-                frame,
-                imgsz=cfg.img_size,
-                conf=cfg.confidence,
-                iou=cfg.nms_iou,
-                half=cfg.half,
-                stream=True,
-                tracker=cfg.tracker_yaml,
-                persist=True,
-                verbose=False,
-                classes=list(cattle_ids) if cattle_ids else None,
+        # Wraps everything from here to the yield — used only to compute
+        # the "other" row in the profile report (CSV-row bookkeeping,
+        # muzzle-crop sighting tracking, FrameResult construction): whatever
+        # this stage's total doesn't attribute to yolo_track/stable_id/
+        # encode. Deliberately does NOT wrap the yield itself (the
+        # `with` closes before it) -- the caller's own time between pulling
+        # frames from this generator (e.g. routes.py's on_frame analytics
+        # callback) is the caller's cost, not this pipeline's.
+        with profiler.stage("frame_total_processed"):
+            # ── detect / track ────────────────────────────────────────
+            with profiler.stage("yolo_track", gpu=True):
+                if cfg.use_tracking:
+                    results = model.track(
+                        frame,
+                        imgsz=cfg.img_size,
+                        conf=cfg.confidence,
+                        iou=cfg.nms_iou,
+                        half=cfg.half,
+                        stream=True,
+                        tracker=cfg.tracker_yaml,
+                        persist=True,
+                        verbose=False,
+                        classes=list(cattle_ids) if cattle_ids else None,
+                    )
+                else:
+                    results = model.predict(
+                        frame,
+                        imgsz=cfg.img_size,
+                        conf=cfg.confidence,
+                        iou=cfg.nms_iou,
+                        half=cfg.half,
+                        stream=True,
+                        verbose=False,
+                        classes=list(cattle_ids) if cattle_ids else None,
+                    )
+
+                # collect detections from results
+                raw_detections: list[tuple[int, tuple[float, float, float, float]]] = []
+                frame_confidences: list[float] = []
+
+                for r in results:
+                    boxes = r.boxes
+                    if boxes is None or len(boxes) == 0:
+                        continue
+                    for i in range(len(boxes)):
+                        xyxy = boxes.xyxy[i].cpu().numpy().tolist()
+                        conf_val = float(boxes.conf[i].cpu())
+                        raw_id = int(boxes.id[i].cpu()) if boxes.id is not None else i
+                        raw_detections.append((raw_id, tuple(xyxy)))
+                        frame_confidences.append(conf_val)
+                        all_raw_ids.add(raw_id)
+
+            # ── stable-ID remap ──────────────────────────────────────
+            with profiler.stage("stable_id"):
+                stable_detections = mapper.update(frame_idx, raw_detections)
+
+                stable_ids = [sid for sid, _ in stable_detections]
+                bboxes = [bb for _, bb in stable_detections]
+                raw_ids_frame = [rid for rid, _ in raw_detections]
+
+                for sid in stable_ids:
+                    frames_visible[sid] = frames_visible.get(sid, 0) + 1
+
+            # Muzzle-crop bookkeeping (cctv/muzzle_crop.py) is a separate
+            # feature from BoT-SORT/StableIdMapper tracking, so it's left
+            # out of the "stable_id" stage above — it lands in "other"
+            # rather than inflating the tracking number with an unrelated
+            # cost.
+            if sighting_tracker is not None:
+                sighting_tracker.observe(frame_idx, frame, stable_detections, frame_confidences)
+
+            cattle_count = len(stable_detections)
+            total_detections += cattle_count
+            if cattle_count > max_in_frame:
+                max_in_frame = cattle_count
+            if cattle_count > 0:
+                frames_with_cattle += 1
+            all_confidences.extend(frame_confidences)
+
+            # ── annotate + stream to ffmpeg ────────────────────────────
+            with profiler.stage("encode"):
+                annotated = _draw_stable_tracks(frame, stable_detections, frame_confidences)
+                try:
+                    ffmpeg_proc.stdin.write(annotated.tobytes())
+                except BrokenPipeError:
+                    # ffmpeg exited early (bad input, codec error, etc.) —
+                    # surface ITS reason rather than a bare pipe error.
+                    ffmpeg_proc.wait()
+                    ffmpeg_stderr_file.close()
+                    stderr_text = ffmpeg_stderr_path.read_text(errors="replace")
+                    raise RuntimeError(
+                        f"ffmpeg exited early (code {ffmpeg_proc.returncode}) "
+                        f"while encoding frame {frame_idx}:\n{stderr_text}"
+                    )
+
+            # ── CSV row ───────────────────────────────────────────────
+            csv_rows.append({
+                "frame": frame_idx,
+                "cattle_in_frame": cattle_count,
+                "stable_ids": stable_ids,
+                "raw_tracker_ids": raw_ids_frame,
+                "unique_ids_so_far": mapper.total_minted,
+                "avg_confidence": (
+                    round(sum(frame_confidences) / len(frame_confidences), 4)
+                    if frame_confidences else 0
+                ),
+                "elapsed_sec": round(elapsed, 3),
+            })
+
+            frame_result = FrameResult(
+                frame_idx=frame_idx,
+                processed_frame_idx=processed_count,
+                annotated_frame=annotated,
+                stable_ids=stable_ids,
+                bboxes=bboxes,
+                confidences=frame_confidences,
+                raw_tracker_ids=raw_ids_frame,
+                cattle_in_frame=cattle_count,
+                elapsed_sec=elapsed,
             )
-        else:
-            results = model.predict(
-                frame,
-                imgsz=cfg.img_size,
-                conf=cfg.confidence,
-                iou=cfg.nms_iou,
-                half=cfg.half,
-                stream=True,
-                verbose=False,
-                classes=list(cattle_ids) if cattle_ids else None,
-            )
-
-        # collect detections from results
-        raw_detections: list[tuple[int, tuple[float, float, float, float]]] = []
-        frame_confidences: list[float] = []
-
-        for r in results:
-            boxes = r.boxes
-            if boxes is None or len(boxes) == 0:
-                continue
-            for i in range(len(boxes)):
-                xyxy = boxes.xyxy[i].cpu().numpy().tolist()
-                conf_val = float(boxes.conf[i].cpu())
-                raw_id = int(boxes.id[i].cpu()) if boxes.id is not None else i
-                raw_detections.append((raw_id, tuple(xyxy)))
-                frame_confidences.append(conf_val)
-                all_raw_ids.add(raw_id)
-
-        # ── stable-ID remap ──────────────────────────────────────
-        stable_detections = mapper.update(frame_idx, raw_detections)
-
-        stable_ids = [sid for sid, _ in stable_detections]
-        bboxes = [bb for _, bb in stable_detections]
-        raw_ids_frame = [rid for rid, _ in raw_detections]
-
-        for sid in stable_ids:
-            frames_visible[sid] = frames_visible.get(sid, 0) + 1
-
-        if sighting_tracker is not None:
-            sighting_tracker.observe(frame_idx, frame, stable_detections, frame_confidences)
-
-        cattle_count = len(stable_detections)
-        total_detections += cattle_count
-        if cattle_count > max_in_frame:
-            max_in_frame = cattle_count
-        if cattle_count > 0:
-            frames_with_cattle += 1
-        all_confidences.extend(frame_confidences)
-
-        # ── annotate frame ────────────────────────────────────────
-        annotated = _draw_stable_tracks(frame, stable_detections, frame_confidences)
-        writer.write(annotated)
-
-        # ── CSV row ───────────────────────────────────────────────
-        csv_rows.append({
-            "frame": frame_idx,
-            "cattle_in_frame": cattle_count,
-            "stable_ids": stable_ids,
-            "raw_tracker_ids": raw_ids_frame,
-            "unique_ids_so_far": mapper.total_minted,
-            "avg_confidence": (
-                round(sum(frame_confidences) / len(frame_confidences), 4)
-                if frame_confidences else 0
-            ),
-            "elapsed_sec": round(elapsed, 3),
-        })
 
         # ── yield to caller ───────────────────────────────────────
-        yield FrameResult(
-            frame_idx=frame_idx,
-            processed_frame_idx=processed_count,
-            annotated_frame=annotated,
-            stable_ids=stable_ids,
-            bboxes=bboxes,
-            confidences=frame_confidences,
-            raw_tracker_ids=raw_ids_frame,
-            cattle_in_frame=cattle_count,
-            elapsed_sec=elapsed,
-        )
+        yield frame_result
 
     # ── cleanup ───────────────────────────────────────────────────
     cap.release()
-    writer.release()
 
     # A positive CAP_PROP_FRAME_COUNT doesn't guarantee any frame actually
     # decoded successfully (some corrupt/truncated files misreport a frame
     # count but fail every cap.read()) — belt-and-suspenders on top of the
     # total_frames check above.
     if processed_count == 0:
+        # No frames ever reached ffmpeg's stdin — stop it rather than leak
+        # a subprocess still waiting on input that will never arrive.
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.kill()
+        ffmpeg_proc.wait()
+        ffmpeg_stderr_file.close()
         raise RuntimeError(
             f"Unusable video file — no frames could be read: {video_path}"
         )
 
-    # ── re-encode to real H.264 ──────────────────────────────────────
-    # cv2.VideoWriter's mp4v/FMP4 output (MPEG-4 Part 2) is not decodable by
-    # any mainstream browser's <video> tag. This machine's OpenCV/FFmpeg build
-    # also can't encode H.264 directly (bundled libopenh264 fails to load) —
-    # confirmed by testing avc1/h264/H264/x264 fourcc values directly in
-    # Chrome, all produced files stuck at readyState 0 forever. imageio-ffmpeg
-    # bundles a real, self-contained ffmpeg binary with genuine libx264
-    # support, independent of whatever codecs happen to be on the host.
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    raw_path = str(out_video_path)
-    h264_path = raw_path.replace(".mp4", "_h264.mp4")
+    # ── finish encoding ───────────────────────────────────────────────
+    # Closing stdin tells ffmpeg no more frames are coming; it then flushes
+    # whatever it still has buffered (encoder lookahead, muxer finalization
+    # — the moov atom/faststart index) and exits on its own. This replaces
+    # the old separate batch re-encode pass entirely: there is no second
+    # file, no second full-video decode — the frames piped in during the
+    # loop above ARE the H.264 encode, this is just its tail.
+    with profiler.stage("encode_finalize"):
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.wait()
+    ffmpeg_stderr_file.close()
 
-    subprocess.run([
-        ffmpeg_path, "-y",
-        "-i", raw_path,
-        "-vcodec", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-movflags", "+faststart",
-        h264_path,
-    ], check=True, capture_output=True)
-
-    # replace original with H.264 version
-    os.replace(h264_path, raw_path)
+    if ffmpeg_proc.returncode != 0:
+        stderr_text = ffmpeg_stderr_path.read_text(errors="replace")
+        raise RuntimeError(
+            f"ffmpeg exited with code {ffmpeg_proc.returncode}:\n{stderr_text}"
+        )
 
     total_time = time.perf_counter() - t_start
+    profiler.report(total_time)
 
     # ── write CSV ─────────────────────────────────────────────────
     csv_path = out_dir / "metrics.csv"
@@ -470,12 +576,15 @@ def run_pipeline(
     cfg: PipelineConfig,
     job_id: Optional[str] = None,
     on_frame: Optional[callable] = None,
+    profile: Optional[bool] = None,
 ) -> VideoSummary:
     """
     Run the full pipeline, optionally calling `on_frame(FrameResult)`
     for each processed frame. Returns the final VideoSummary.
+
+    `profile`: forwarded to process_video() — see its docstring.
     """
-    gen = process_video(video_path, cfg, job_id)
+    gen = process_video(video_path, cfg, job_id, profile=profile)
     summary = None
     try:
         while True:

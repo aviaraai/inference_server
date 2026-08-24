@@ -42,5 +42,15 @@ cctv/training/
 # copies -- those live under appstorage/, already ignored above)
 *.pt
 
+# Exported model artifacts from ad hoc export/benchmark experiments
+# (model.export(format="engine"/"onnx"), e.g. the TensorRT feasibility test
+# — see CLAUDE.md's "FP16/TensorRT rejected on dev hardware" note). An
+# .engine file in particular is GPU-architecture-specific (won't even run on
+# different hardware) and can be 1GB+ — same "never should have been
+# trackable" reasoning as cctv/clips/ above, applied before any of these
+# actually get committed rather than after.
+*.engine
+*.onnx
+
 # Scratch experiments/validation scripts (not part of the shipped service)
 experiments/
