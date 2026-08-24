@@ -279,6 +279,101 @@ completely independent of whether either animal has ever been through
 registration, and most cattle a CCTV camera sees on any given day will not
 be registered.
 
+## CCTV real-time performance: encode fix shipped, FP16 and TensorRT FP32 both rejected on dev hardware
+
+Real-time factor at `CROWDED_HD` (production's preset) on `clip_01.mp4`
+started at **0.323** — the pipeline took 3.09× the clip's own duration to
+process. `cctv/profiling.py` (env-var-gated `CCTV_PROFILE=1`, zero-cost off
+— see its own docstring) was built specifically to find out where that time
+actually went before guessing at fixes. It found one real, shipped win and
+ruled out two real candidates, in that order:
+
+**Shipped: streaming ffmpeg encode, not two-pass mp4v+batch-H264.**
+`cctv/pipeline.py` used to write annotated frames via `cv2.VideoWriter`
+(mp4v — this machine's OpenCV/FFmpeg build can't encode H.264 directly),
+then re-decode and re-encode the *entire finished video* to H.264 in a
+separate batch pass after the loop. Every frame was encoded twice, and the
+second pass couldn't start until the first was 100% done. Replaced with one
+persistent `ffmpeg` subprocess opened before the loop; each frame's raw BGR
+bytes are piped to its stdin as produced, so ffmpeg encodes once,
+overlapped with later frames' detection/tracking. **185.7s → 166.7s
+(-10.2%), real-time factor 0.323 → 0.360.** Verified measurement-only:
+`metrics.csv` (750/750 rows) and `report.json` tracking fields identical
+against the old two-pass run; `annotated.mp4` same frame count/resolution,
+fully decodable (not byte-identical — expected, the encode path itself
+changed).
+
+**Rejected: `half=True` (FP16).** Tested on the same clip/preset —
+**slower**, not faster: `yolo_track` 124.2s → 133.8s (+7.7%), total
+166.7s → 174.3s (+4.5%), real-time factor 0.360 → 0.344 (worse). Also cost
+real recall: `unique_tracked_cattle` 58 → 56, 59/750 frames (7.9%) had a
+different per-frame detection count, small ±1 flips roughly balanced in
+both directions — consistent with individual detections' confidence
+scores shifting slightly under reduced precision and crossing
+`CROWDED_HD`'s permissive `confidence=0.20` threshold either way, not a
+one-directional collapse. Losing detections here specifically matters
+because `confidence=0.20` and `CROWDED_HD` as a whole exist precisely to
+protect recall on small/far/occluded animals a tighter setting would miss
+(see the CROWDED_HD calibration history above) — FP16 quietly gives some of
+that back. **Don't enable `half=True` on `CROWDED_HD` (or any CCTV preset)
+based on these numbers.**
+
+**Rejected: TensorRT FP32 engine export.** Built via ultralytics'
+`model.export(format="engine", half=False, imgsz=1920)` — succeeded (engine
+build itself took ~3m48s wall clock; TensorRT's own self-reported figure
+was 213.9s, close enough that the gap is just script/nvidia-smi overhead,
+not a real discrepancy). But the benchmark was **worse on both axes**:
+- **Speed**: raw `yolo_track` 124.2s (PyTorch) → 210.8s (TensorRT) — but
+  that raw number is contaminated by a genuine one-time anomaly, not a
+  per-frame cost (see below). Corrected for it: still **124.2s → ~179.5s
+  (+44.6%)**, total **166.7s → ~209.4s (+25.6%)**, real-time factor
+  0.360 → ~0.287. **Slower than plain PyTorch either way you count it.**
+- **Accuracy**: `unique_tracked_cattle` 58 → 59, `total_detections` 18131
+  → 18623 (+2.7%), but **484/750 frames (64.5%) differ** — vs FP16's 7.9%
+  — and it's **one-directional** (387 frames gained detections, 97 lost),
+  visible from frame 0, i.e. before the anomaly below even happens. Since
+  both runs are FP32 (no precision change), this isn't the FP16
+  threshold-jitter story — TensorRT's graph fusion/kernel reordering is
+  changing the actual floating-point computation path enough to shift
+  detection outcomes broadly, not at the margins. **Whether the extra ~500
+  detections are real recovered animals or false positives is unverified**
+  — no ground truth was checked for this clip. Do not treat "more
+  detections" as automatically better without checking.
+
+**Gotcha, worth knowing before touching `.engine` export again: raw
+`.engine` files carry no embedded task/class metadata the way `.pt` files
+do.** The exported engine triggered `WARNING Unable to automatically guess
+model task, assuming 'task=detect'` on first real use, followed by
+ultralytics downloading and running a **completely unrelated model**
+(`yolo26n-cls.pt`) against its own bundled sample images — nothing to do
+with this pipeline's code or data. Confirmed via `metrics.csv`'s per-frame
+`elapsed_sec`: frame 0 finished in a normal 0.179s, then a **31.258-second
+gap** before frame 2, exactly where that download+run happens in the log;
+every other frame-to-frame gap tops out around 0.4-0.45s. One-time cost,
+not per-frame — but real, and something a production deployment would want
+to avoid outright (an inference server silently reaching out to GitHub on
+first load is its own problem regardless of timing). Likely avoidable by
+passing proper task/metadata at export time (e.g. `data=` pointing at the
+right dataset config) — not attempted here.
+
+**⚠️ Both negative results are dev-hardware-indicative, not proof the same
+holds on production.** Every number above was measured on this dev
+machine's **RTX 3050 Laptop (Ampere, 4GB VRAM)**. Production is an **RTX
+2080 (Turing, 8GB VRAM, shared 20-core/40-thread server)** — a different
+architecture the exported `.engine` file cannot even run on (TensorRT
+engines are hardware-specific; a Turing engine would need its own separate
+build there). A small, VRAM-constrained laptop GPU is a genuinely less
+favorable environment for both FP16 tensor-core throughput and TensorRT's
+kernel-fusion advantages than a desktop-class card with more headroom, so
+these results don't rule out either technique working on the 2080 — they
+just provide **zero positive evidence** to justify spending the effort of
+rebuilding and re-testing there blind. If FP16/TensorRT are revisited: fix
+the `yolo26n-cls.pt` metadata gotcha and get real ground truth on the
+detection-count shift *first*, on whatever hardware is actually being
+tested — both findings would need re-verifying on the 2080 either way, and
+neither is cheap to re-run (the TensorRT engine build alone took minutes;
+the shift needs hand-counted ground truth this pass didn't do).
+
 ## The pipeline embeds the whole animal, NOT an isolated muzzle
 
 This is the single most important thing to understand about matching quality.
