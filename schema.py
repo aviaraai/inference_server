@@ -202,6 +202,67 @@ class MatchCandidate(BaseModel):
     )
 
 
+# ── Face geometry (pose model) ───────────────────────────────────────────────
+
+class FaceGeometry(BaseModel):
+    """Inter-eye-normalised face proportions from the 8-keypoint cattle-face
+    pose model (pipeline/pose.py → pipeline/geometry.py), combined across the
+    2 front photos.
+
+    SUPPLEMENTARY, return-only, demote-only. Returned so the API server can
+    persist it against the animal and (in a later, separate step) feed it into
+    a comparison signal. Nothing in this server reads it or decides on it.
+
+    `status`:
+      * OK       — both front photos gave a full reading (ruler + ratios)
+      * PARTIAL  — one did, the other didn't
+      * NO_RULER — a face was found but an eye keypoint was too weak for the
+                   inter-eye scale ruler, so every *_ratio is null
+      * NO_FACE  — no usable face in either photo, OR the pose model isn't
+                   loaded (POSE_MODEL_PATH unset / file missing). `reason` says
+                   which.
+
+    Every *_ratio is null unless `status` is OK or PARTIAL. `horn_present_*` is
+    True or null, NEVER False: a missing horn-base keypoint means "could not
+    tell from a front photo", not "polled/dehorned animal".
+
+    `comparison_tolerance` carries the per-field match band the eventual
+    comparison MUST use (fraction of inter-eye distance). `horn_base_distance_ratio`
+    is 0.20 — deliberately wider than the 0.10 for eye-anchored measurements —
+    because horn-base keypoint localization is far noisier (holdout PCK@0.1
+    ~0.50–0.65 vs ~0.97 for eyes); comparing it as tightly as an eye-anchored
+    ratio would reject genuine matches on localization noise alone.
+    """
+
+    status: str = Field(..., description="OK | PARTIAL | NO_RULER | NO_FACE — see class docstring")
+    inter_eye_distance_px: Optional[float] = Field(
+        None, description="Mean inter-eye pixel distance across the front photos that had it (absolute scale ruler, not itself a comparison feature)."
+    )
+    horn_base_distance_ratio: Optional[float] = Field(
+        None, description="right/left horn-base distance ÷ inter-eye distance. Compare at comparison_tolerance['horn_base_distance_ratio'] (0.20), not tighter."
+    )
+    ear_base_span_ratio: Optional[float] = Field(
+        None, description="right/left ear-base distance ÷ inter-eye distance."
+    )
+    horn_present_right: Optional[bool] = Field(
+        None, description="True if the right horn-base keypoint was confidently detected in any front photo; null = could not tell (NOT False)."
+    )
+    horn_present_left: Optional[bool] = Field(
+        None, description="True if the left horn-base keypoint was confidently detected in any front photo; null = could not tell (NOT False)."
+    )
+    keypoints_present: dict[str, bool] = Field(
+        default_factory=dict,
+        description="Per-keypoint: was it confidently detected in any contributing front photo. Keys are geometry.KPT_NAMES.",
+    )
+    sources_ok: int = Field(0, description="How many of the 2 front photos produced a full (ruler + ratios) reading.")
+    sources_with_face: int = Field(0, description="How many of the 2 front photos produced at least a face (OK or NO_RULER).")
+    reason: Optional[str] = Field(None, description="Why status isn't OK, when it isn't. Null when status is OK.")
+    comparison_tolerance: dict[str, float] = Field(
+        default_factory=dict,
+        description="Per-field match tolerance (fraction of inter-eye distance) the future comparison step must use. Horn-derived fields get a wider band — see class docstring.",
+    )
+
+
 # ── Register ──────────────────────────────────────────────────────────────────
 class RegisterResponse(BaseModel):
     status: str = Field("success", description="Registration status")
@@ -210,6 +271,13 @@ class RegisterResponse(BaseModel):
     )
     extracted_colors: ExtractedColors
     horn_shape: Optional[str] = Field(None, description=HORN_SHAPE_DESCRIPTION)
+    face_geometry: Optional[FaceGeometry] = Field(
+        None,
+        description="8-keypoint pose-model face geometry, combined across the 2 front photos. "
+                    "None only if the pipeline never got far enough to produce the struct; a "
+                    "loaded-but-unhelpful run still returns a struct with status=NO_FACE. "
+                    "Supplementary/demote-only — see FaceGeometry.",
+    )
     potential_matches: list[MatchCandidate] = Field(
         default_factory=list,
         description="Top matches against candidate_ids (empty if no candidates provided)",
@@ -259,4 +327,7 @@ class HealthResponse(BaseModel):
     color_extractor_available: bool
     morphology_extractor_available: bool = Field(
         True, description="Always true — the rule-based morphology extractor has no external dependency to fail."
+    )
+    pose_model_loaded: bool = Field(
+        False, description="Whether the optional cattle-face pose model (POSE_MODEL_PATH) loaded. False just means face_geometry readings come back NO_FACE — it is not an error."
     )

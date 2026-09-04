@@ -38,6 +38,13 @@ services:
       MODEL_PATH: /appstorage/Models/embedding_model/model.pt
       FAISS_INDEX_PATH: /appstorage/indexes/faiss.index
       YOLO_MODEL_PATH: /appstorage/Models/detection_crop/yolov8s.pt
+      # Cattle-face pose model (pipeline/pose.py) — optional, no bundled
+      # default (see pipeline/pose.py's load_pose_model docstring). Missing
+      # path/file is a warning, not a startup failure: /register just returns
+      # face_geometry with status=NO_FACE. Placed on /appstorage per the same
+      # manual-deploy convention as the other *_MODEL_PATH files above — a
+      # git pull/deploy will NOT carry the .pt itself.
+      POSE_MODEL_PATH: /appstorage/Models/pose_model/best.pt
 
     restart: unless-stopped
 

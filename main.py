@@ -59,6 +59,13 @@ from helpers import _decode_image, _ms_since
 from pipeline.color import RuleBasedColorExtractor
 from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
+from pipeline.pose import (
+    combine_geometry,
+    extract_face_geometry,
+    load_pose_model,
+    pose_available,
+    warmup_pose_model,
+)
 from pipeline.quality import quality_check, quality_check_cv2
 from pipeline.muzzle_detect import load_muzzle_detector, warmup_muzzle_detector
 from pipeline.muzzle_crop_cache import (
@@ -83,6 +90,7 @@ from schema import (
     ColorResult,
     ErrorCode,
     ExtractedColors,
+    FaceGeometry,
     HealthResponse,
     ImageFailure,
     MatchCandidate,
@@ -211,6 +219,14 @@ async def lifespan(app: FastAPI):
     #     never runs the tiebreaker — lightglue_checked stays False.
     load_lightglue()
 
+    # 5d. Load the cattle-face pose model (8 keypoints → face geometry, see
+    #     pipeline/pose.py). OPTIONAL, env-var-driven exactly like
+    #     YOLO_MODEL_PATH above — no bundled default. This is a supplementary
+    #     demote-only signal, NOT the primary match, so a missing/unloadable
+    #     model is a warning, never a startup failure (unlike MODEL_PATH):
+    #     /register then just returns face_geometry with status=NO_FACE.
+    load_pose_model(os.getenv("POSE_MODEL_PATH", None))
+
     # 6. Warmup — run dummy inference through both models
     log.info("Running warmup inference...")
     dummy = torch.randn(1, 3, 518, 518, device=device)
@@ -219,6 +235,7 @@ async def lifespan(app: FastAPI):
     warmup_yolo()
     warmup_muzzle_detector()
     warmup_lightglue()
+    warmup_pose_model()
     log.info("Warmup complete.")
 
     # 7. Init CCTV model's session DB (third model — video analytics)
@@ -344,7 +361,7 @@ async def register(
     )
 
     # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
-    embeddings_np, body_color, muzzle_color, morphology, cropped_images = await asyncio.to_thread(
+    embeddings_np, body_color, muzzle_color, morphology, face_geometry, cropped_images = await asyncio.to_thread(
         _run_registration_pipeline,
         muzzle_bytes,
         front_bytes,
@@ -505,6 +522,7 @@ async def register(
             muzzle=ColorResult(**muzzle_color),
         ),
         horn_shape=morphology["horn_shape"],
+        face_geometry=FaceGeometry(**face_geometry),
         potential_matches=potential_matches,
         versions=VersionInfo(
             model=MODEL_VERSION,
@@ -606,12 +624,15 @@ def _run_registration_pipeline(
     device: torch.device,
     color_extractor: Any,
     morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict, list[np.ndarray]]:
+) -> tuple[np.ndarray, dict, dict, dict, dict, list[np.ndarray]]:
     """
     Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
-    embedding, and color extraction. Executed entirely inside a single
-    worker thread via asyncio.to_thread — nothing in here should ever
-    need to be async itself.
+    embedding, color extraction, morphology, and pose-model face geometry.
+    Executed entirely inside a single worker thread via asyncio.to_thread —
+    nothing in here should ever need to be async itself.
+
+    Returns (embeddings, body_color, muzzle_color, morphology, face_geometry,
+    cropped_images).
 
     Raises HTTPException on any validation/quality failure; it's safe to
     raise HTTPException from inside a thread because asyncio.to_thread
@@ -762,8 +783,37 @@ def _run_registration_pipeline(
     log.info(f"morphology extraction (2 images): {_ms_since(t_morphology)}ms")
     morphology = average_readings(morphology_readings)
 
+    # ── Face geometry (pose keypoints → inter-eye-normalised proportions) ──
+    # Same return-only contract as morphology above: never a gate, never
+    # raises. For each front photo: crop_cattle → 8-keypoint pose model →
+    # geometry.py, then combine the 2 readings. If POSE_MODEL_PATH wasn't set
+    # / didn't load, every reading is NO_FACE and the combined struct just
+    # says so — nothing downstream changes. extract_face_geometry does its
+    # own crop_cattle internally (like RuleBasedMorphologyExtractor.extract).
+    t_pose = time.monotonic()
+    geometry_readings = [
+        extract_face_geometry(_decode_image(fb, f"front_{i}"))
+        for i, fb in enumerate(front_bytes, 1)
+    ]
+    log.info(f"face geometry extraction (2 images): {_ms_since(t_pose)}ms")
+    face_geometry = combine_geometry(geometry_readings)
+    # Coverage line, ships WITH the feature rather than as a follow-up: the
+    # only way to know how often this signal is even usable in the field is
+    # to watch it from the first production registration onward — there is
+    # nowhere else this is recorded (not persisted downstream as of this
+    # commit; see the go-apiserver /register response). grep on
+    # "face_geometry status=" for the OK/PARTIAL/NO_RULER/NO_FACE split, and
+    # on "horn_base_ratio=" for how often that specific field is usable.
+    log.info(
+        f"face_geometry status={face_geometry['status']} "
+        f"reason={face_geometry.get('reason')} "
+        f"sources_ok={face_geometry['sources_ok']}/{face_geometry['sources_with_face']} "
+        f"horn_base_ratio={'present' if face_geometry.get('horn_base_distance_ratio') is not None else 'UNKNOWN'} "
+        f"ear_base_ratio={'present' if face_geometry.get('ear_base_span_ratio') is not None else 'UNKNOWN'}"
+    )
+
     log.info(f"_run_registration_pipeline total: {_ms_since(t_muzzle_gate)}ms")
-    return embeddings.numpy(), body_color, muzzle_color, morphology, cropped_images
+    return embeddings.numpy(), body_color, muzzle_color, morphology, face_geometry, cropped_images
 
 
 async def _run_lightglue_tiebreaker(
@@ -1068,4 +1118,5 @@ async def health(
         gpu_available=torch.cuda.is_available(),
         model_version=MODEL_VERSION,
         color_extractor_available=color_extractor.available,
+        pose_model_loaded=pose_available(),
     )
