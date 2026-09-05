@@ -57,6 +57,7 @@ from godhaar.config import (
 from godhaar.model import GodhaarModel
 from helpers import _decode_image, _ms_since
 from pipeline.color import RuleBasedColorExtractor
+from pipeline.keypoint_color import combine_keypoint_color, extract_keypoint_forehead_color
 from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
 from pipeline.pose import (
@@ -93,6 +94,7 @@ from schema import (
     FaceGeometry,
     HealthResponse,
     ImageFailure,
+    KeypointForeheadColor,
     MatchCandidate,
     RegisterResponse,
     SearchResponse,
@@ -361,7 +363,10 @@ async def register(
     )
 
     # ── Everything CPU/GPU-bound runs in a single thread-offloaded call ───
-    embeddings_np, body_color, muzzle_color, morphology, face_geometry, cropped_images = await asyncio.to_thread(
+    (
+        embeddings_np, body_color, muzzle_color, morphology, face_geometry,
+        keypoint_forehead_color, cropped_images,
+    ) = await asyncio.to_thread(
         _run_registration_pipeline,
         muzzle_bytes,
         front_bytes,
@@ -523,6 +528,7 @@ async def register(
         ),
         horn_shape=morphology["horn_shape"],
         face_geometry=FaceGeometry(**face_geometry),
+        keypoint_forehead_color=KeypointForeheadColor(**keypoint_forehead_color),
         potential_matches=potential_matches,
         versions=VersionInfo(
             model=MODEL_VERSION,
@@ -624,15 +630,16 @@ def _run_registration_pipeline(
     device: torch.device,
     color_extractor: Any,
     morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict, dict, list[np.ndarray]]:
+) -> tuple[np.ndarray, dict, dict, dict, dict, dict, list[np.ndarray]]:
     """
     Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
-    embedding, color extraction, morphology, and pose-model face geometry.
-    Executed entirely inside a single worker thread via asyncio.to_thread —
-    nothing in here should ever need to be async itself.
+    embedding, color extraction, morphology, pose-model face geometry, and
+    keypoint-anchored forehead color. Executed entirely inside a single
+    worker thread via asyncio.to_thread — nothing in here should ever need
+    to be async itself.
 
     Returns (embeddings, body_color, muzzle_color, morphology, face_geometry,
-    cropped_images).
+    keypoint_forehead_color, cropped_images).
 
     Raises HTTPException on any validation/quality failure; it's safe to
     raise HTTPException from inside a thread because asyncio.to_thread
@@ -812,8 +819,28 @@ def _run_registration_pipeline(
         f"ear_base_ratio={'present' if face_geometry.get('ear_base_span_ratio') is not None else 'UNKNOWN'}"
     )
 
+    # ── Keypoint-anchored forehead color — additive, independent of body_color
+    # above. Same return-only, never-a-gate contract as morphology/face_geometry:
+    # a second reading anchored to the pose model's eye keypoints instead of
+    # body_color.py's whole-bbox sample. See pipeline/keypoint_color.py.
+    t_kp_color = time.monotonic()
+    kp_color_readings = [
+        extract_keypoint_forehead_color(_decode_image(fb, f"front_{i}"))
+        for i, fb in enumerate(front_bytes, 1)
+    ]
+    log.info(f"keypoint forehead color extraction (2 images): {_ms_since(t_kp_color)}ms")
+    keypoint_forehead_color = combine_keypoint_color(kp_color_readings)
+    log.info(
+        f"keypoint_forehead_color status={keypoint_forehead_color['status']} "
+        f"label={keypoint_forehead_color['label']} "
+        f"sources_usable={keypoint_forehead_color['sources_usable']}/{len(kp_color_readings)}"
+    )
+
     log.info(f"_run_registration_pipeline total: {_ms_since(t_muzzle_gate)}ms")
-    return embeddings.numpy(), body_color, muzzle_color, morphology, face_geometry, cropped_images
+    return (
+        embeddings.numpy(), body_color, muzzle_color, morphology, face_geometry,
+        keypoint_forehead_color, cropped_images,
+    )
 
 
 async def _run_lightglue_tiebreaker(

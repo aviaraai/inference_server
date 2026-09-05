@@ -263,6 +263,59 @@ class FaceGeometry(BaseModel):
     )
 
 
+# ── Keypoint-anchored forehead color (additive, not consumed anywhere) ──────
+
+class KeypointColorPatch(BaseModel):
+    label: str = Field(..., description="Color enum label (e.g. BLACK, BROWN, UNKNOWN) for this one small patch.")
+    confidence: float = Field(..., description="Classifier confidence 0.0-1.0 for this patch alone.")
+    median_lab: list[float] = Field(..., description="[L*, a*, b*] median of the patch, standard CIE scale.")
+    center_px: list[float] = Field(..., description="[x, y] patch center, in the pixel coordinates of the crop_cattle head crop (same space as face_geometry's keypoints).")
+    size_px: int = Field(..., description="Patch side length in pixels, after clipping to the crop's bounds.")
+
+
+class KeypointForeheadColor(BaseModel):
+    """A second, independent body-color reading anchored to the pose model's
+    eye keypoints, instead of body_color.py's whole-animal bounding-box
+    sample (see pipeline/keypoint_color.py's module docstring for why the
+    two can disagree).
+
+    ADDITIVE ONLY. Computed and returned for the API server to store
+    alongside extracted_colors.body — nothing in this server or in
+    go-apiserver's decision.go reads or decides on it. Do not wire this into
+    any accept/reject or match/no-match logic without the comparison data
+    referenced in CLAUDE.md first.
+
+    `status`:
+      * OK      — eye keypoints confident; the primary (forehead_low) patch
+                  sampled, plus at least one of forehead_high/crest
+      * PARTIAL — eye keypoints confident; only forehead_low sampled
+      * UNKNOWN — eye keypoints missing/low-confidence (no inter-eye ruler
+                  to anchor or scale any patch), OR even forehead_low
+                  failed (out of frame / bad quality), OR the pose model
+                  isn't loaded. `reason` says which.
+
+    `label`/`confidence` mirror extracted_colors.body's flat shape and
+    reflect the PRIMARY (forehead_low) patch only, for an at-a-glance
+    comparison; `patches` carries all 2-3 anchored readings for a future
+    solid-vs-patterned-coat check.
+    """
+
+    status: str = Field(..., description="OK | PARTIAL | UNKNOWN — see class docstring")
+    conf_threshold: float = Field(..., description="Keypoint confidence floor used to gate the eye/muzzle/crest anchors (pipeline.pose.KEYPOINT_CONF_THRESHOLD).")
+    inter_eye_distance_px: Optional[float] = Field(
+        None, description="Mean inter-eye pixel distance across the front photos that had it — the ruler every patch offset/size is scaled by. None when status is UNKNOWN."
+    )
+    label: str = Field(..., description="Primary (forehead_low) patch's color label, or UNKNOWN.")
+    confidence: float = Field(..., description="Primary (forehead_low) patch's confidence, or 0.0 if UNKNOWN.")
+    patches: dict[str, Optional[KeypointColorPatch]] = Field(
+        default_factory=dict,
+        description="forehead_low (primary) / forehead_high / crest — each null if that specific patch wasn't sampled (out of frame, low quality, or its anchor keypoint wasn't confident).",
+    )
+    sources_ok: int = Field(0, description="How many of the 2 front photos reached OK (not just PARTIAL).")
+    sources_usable: int = Field(0, description="How many of the 2 front photos produced any usable (OK or PARTIAL) reading.")
+    reason: Optional[str] = Field(None, description="Why status isn't OK, when it isn't. Null when status is OK.")
+
+
 # ── Register ──────────────────────────────────────────────────────────────────
 class RegisterResponse(BaseModel):
     status: str = Field("success", description="Registration status")
@@ -277,6 +330,12 @@ class RegisterResponse(BaseModel):
                     "None only if the pipeline never got far enough to produce the struct; a "
                     "loaded-but-unhelpful run still returns a struct with status=NO_FACE. "
                     "Supplementary/demote-only — see FaceGeometry.",
+    )
+    keypoint_forehead_color: Optional[KeypointForeheadColor] = Field(
+        None,
+        description="Keypoint-anchored forehead color, combined across the 2 front photos. "
+                    "A second, independent reading alongside extracted_colors.body — see "
+                    "KeypointForeheadColor. Additive only, not consumed anywhere.",
     )
     potential_matches: list[MatchCandidate] = Field(
         default_factory=list,
