@@ -817,7 +817,10 @@ def _run_registration_pipeline(
 
 
 async def _run_lightglue_tiebreaker(
-    matches: list[dict], query_crop: np.ndarray, request_id: str
+    matches: list[dict],
+    query_crop: np.ndarray,
+    request_id: str,
+    candidate_tags: Optional[dict[int, Optional[str]]] = None,
 ) -> tuple[bool, Optional[int], Optional[str]]:
     """The /search fusion tiebreaker: additive only, computed only when the
     top-1 embedding score is ambiguous. Never touches `matches` itself or any
@@ -838,6 +841,26 @@ async def _run_lightglue_tiebreaker(
     real data before this shipped, see CLAUDE.md, "/search fusion
     tiebreaker, round 2"). Kept as an env-var kill switch for a fast disable
     without a redeploy, not as a "not ready yet" gate.
+
+    TEMPORARY (2026-09-05): `candidate_tags` maps faiss_id -> tag_no, passed
+    in so this function can log which registered animal each of the raw
+    top-2 embedding matches actually belongs to at the moment ambiguity is
+    decided. This is the go/no-go check for a suspected root cause: the
+    ambiguity gate below compares the top-2 EMBEDDINGS, which can be two
+    muzzle photos of the SAME correctly-matched animal (each animal has up
+    to 3 registered embeddings) rather than two different animals — in which
+    case running LightGlue at all is answering a question nobody asked, and
+    a low keypoint count against a mediocre cached crop can demote a verdict
+    that was never actually ambiguous at the animal level. go-apiserver's own
+    `gap` in decision.go is measured post-aggregation (one score per animal)
+    and would NOT show this; this raw-level log is the only way to see it.
+    No godhaar_id is available here — inference_server is never sent one
+    (see client.go's Candidate struct) — tag_no is the closest identifier
+    that's actually on the wire, and is unique per animal (`animals.tag_id`
+    is a UNIQUE column), so it's sufficient to tell "same animal" apart from
+    "different animal". Remove this parameter and the log line below once
+    the hypothesis is confirmed or refuted and the real fix (or a decision
+    not to change anything) lands.
     """
     if not LIGHTGLUE_TIEBREAKER_ENABLED:
         return False, None, None
@@ -850,6 +873,25 @@ async def _run_lightglue_tiebreaker(
         _SEARCH_REVIEW_THRESHOLD_MIRROR <= top1["score"] <= _SEARCH_MATCH_THRESHOLD_MIRROR
         or top1["gap"] < _SEARCH_GAP_THRESHOLD_MIRROR
     )
+
+    # TEMPORARY (2026-09-05, remove with the rest of the candidate_tags
+    # plumbing above): log what the top-2 raw embeddings actually are the
+    # moment ambiguity is decided, regardless of whether LightGlue itself
+    # goes on to run. tag2/faiss_id2 are None when there's only one candidate
+    # at all (nothing to be ambiguous against).
+    if ambiguous:
+        tags = candidate_tags or {}
+        top2 = matches[1] if len(matches) > 1 else None
+        tag1 = tags.get(top1["faiss_id"])
+        tag2 = tags.get(top2["faiss_id"]) if top2 else None
+        log.info(
+            f"[{request_id}] lightglue ambiguity check | "
+            f"top1 faiss_id={top1['faiss_id']} tag_no={tag1!r} score={top1['score']:.4f} | "
+            f"top2 faiss_id={top2['faiss_id'] if top2 else None} tag_no={tag2!r} "
+            f"score={top2['score'] if top2 else None} | "
+            f"gap={top1['gap']:.4f} | "
+            f"SAME_ANIMAL={bool(tag1 and top2 and tag1 == tag2)}"
+        )
     if not (ambiguous and lightglue_available()):
         return False, None, None
 
@@ -1002,7 +1044,8 @@ async def search(
     # ── LightGlue fusion tiebreaker — additive only; see _run_lightglue_tiebreaker.
     t_lightglue_start = time.monotonic()
     lightglue_checked, lightglue_num_matches, lightglue_zone = await _run_lightglue_tiebreaker(
-        matches, query_crop, request_id
+        matches, query_crop, request_id,
+        candidate_tags={fid: c.tag_no for fid, c in candidate_lookup.items()},
     )
     t_lightglue = _ms_since(t_lightglue_start)
 
