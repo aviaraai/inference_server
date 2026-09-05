@@ -493,28 +493,49 @@ async def register(
     #    the FAISS write succeeds, and a cache-write failure is fail-open
     #    (logged, not raised) — registration must not fail over an optional
     #    signal for a feature that isn't the embedding index itself.
-    try:
-        await asyncio.to_thread(
-            lambda: [save_muzzle_crop(fid, crop) for fid, crop in zip(faiss_ids, cropped_images)]
-        )
-    except Exception as e:
-        log.warning(f"muzzle crop cache write failed (non-fatal): {e}")
+    #
+    #    Success is logged (not just failure) so a write that never happened —
+    #    which silently disables the /search tiebreaker for this animal forever
+    #    — is observable at registration time, not only as a later cache miss.
+    crops_written = await asyncio.to_thread(
+        lambda: [save_muzzle_crop(fid, crop) for fid, crop in zip(faiss_ids, cropped_images)]
+    )
+    log.info(
+        f"muzzle crop cache: wrote {sum(crops_written)}/{len(faiss_ids)} crops "
+        f"for faiss_ids={faiss_ids}"
+    )
 
     # ── Also pre-extract and cache DISK features for the same crops, so
     #    /search's tiebreaker can skip live extraction on the candidate side
     #    entirely (see pipeline/lightglue_verify.py's "latency optimization,
     #    round 2" note and CLAUDE.md). Same fail-open contract; skipped
     #    outright if the verifier never loaded.
+    #
+    #    Each crop is extracted + saved inside its own try/except: a single
+    #    crop that fails DISK extraction must not abort feature caching for the
+    #    other two (a bare list comprehension would, because
+    #    lightglue_extract_features_np runs before save_muzzle_features sees it,
+    #    and one exception kills the whole comprehension).
     if lightglue_available():
-        try:
-            await asyncio.to_thread(
-                lambda: [
-                    save_muzzle_features(fid, **lightglue_extract_features_np(crop))
-                    for fid, crop in zip(faiss_ids, cropped_images)
-                ]
-            )
-        except Exception as e:
-            log.warning(f"muzzle feature cache write failed (non-fatal): {e}")
+        def _cache_features_for_all() -> list[bool]:
+            written: list[bool] = []
+            for fid, crop in zip(faiss_ids, cropped_images):
+                try:
+                    written.append(
+                        save_muzzle_features(fid, **lightglue_extract_features_np(crop))
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"muzzle feature cache: failed to extract/save faiss_id={fid}: {e}"
+                    )
+                    written.append(False)
+            return written
+
+        features_written = await asyncio.to_thread(_cache_features_for_all)
+        log.info(
+            f"muzzle feature cache: wrote {sum(features_written)}/{len(faiss_ids)} features "
+            f"for faiss_ids={faiss_ids}"
+        )
 
     t_total = _ms_since(t_start)
     log.info(f"/register 201 | faiss_ids={faiss_ids} | {t_total}ms")

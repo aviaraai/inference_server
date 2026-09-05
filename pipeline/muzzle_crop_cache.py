@@ -51,13 +51,18 @@ def _features_path_for(faiss_id: int) -> Path:
     return Path(MUZZLE_CROP_CACHE_DIR) / f"{faiss_id}.features.npz"
 
 
-def save_crop(faiss_id: int, crop_bgr: np.ndarray) -> None:
+def save_crop(faiss_id: int, crop_bgr: np.ndarray) -> bool:
     """Persist one registered muzzle crop, keyed by its faiss_id.
 
     Called once per accepted muzzle image at registration time. Never raises:
     a cache-write failure (disk full, permissions, missing mount) must not
     fail the registration itself, since FAISS has already committed the
     embedding by the time this runs.
+
+    Returns True on a successful write so the caller can log a summary count —
+    without that, a write that never happened (which silently disables the
+    /search tiebreaker for this animal forever) is indistinguishable from one
+    that succeeded.
     """
     try:
         os.makedirs(MUZZLE_CROP_CACHE_DIR, exist_ok=True)
@@ -65,10 +70,13 @@ def save_crop(faiss_id: int, crop_bgr: np.ndarray) -> None:
         ok, buf = cv2.imencode(".jpg", crop_bgr)
         if not ok:
             log.warning(f"muzzle_crop_cache: failed to encode crop for faiss_id={faiss_id}")
-            return
+            return False
         path.write_bytes(buf.tobytes())
+        log.info(f"muzzle_crop_cache: saved crop for faiss_id={faiss_id} ({len(buf)} bytes)")
+        return True
     except Exception as e:
         log.warning(f"muzzle_crop_cache: failed to save faiss_id={faiss_id}: {e}")
+        return False
 
 
 def load_crop(faiss_id: int) -> Optional[np.ndarray]:
@@ -90,7 +98,7 @@ def load_crop(faiss_id: int) -> Optional[np.ndarray]:
         return None
 
 
-def save_features(faiss_id: int, keypoints: np.ndarray, descriptors: np.ndarray, image_size: np.ndarray) -> None:
+def save_features(faiss_id: int, keypoints: np.ndarray, descriptors: np.ndarray, image_size: np.ndarray) -> bool:
     """Persist one registered muzzle's DISK features, keyed by faiss_id.
 
     Called once per accepted muzzle image at registration time, right after
@@ -98,14 +106,17 @@ def save_features(faiss_id: int, keypoints: np.ndarray, descriptors: np.ndarray,
     `image_size` are exactly pipeline.lightglue_verify.extract_features_np()'s
     output; this function doesn't know or care what DISK's output shape is
     beyond "three numpy arrays to persist together." Never raises, same
-    fail-open contract as save_crop.
+    fail-open contract as save_crop. Returns True on a successful write.
     """
     try:
         os.makedirs(MUZZLE_CROP_CACHE_DIR, exist_ok=True)
         path = _features_path_for(faiss_id)
         np.savez(path, keypoints=keypoints, descriptors=descriptors, image_size=image_size)
+        log.info(f"muzzle_crop_cache: saved features for faiss_id={faiss_id}")
+        return True
     except Exception as e:
         log.warning(f"muzzle_crop_cache: failed to save features for faiss_id={faiss_id}: {e}")
+        return False
 
 
 def load_features(faiss_id: int) -> Optional[dict]:
