@@ -159,7 +159,8 @@ class FaissIndex:
         candidate_ids: list[int],
         top_k: int = 5,
     ) -> list[dict]:
-        """Rank only the given candidates against a query embedding.
+        """Rank only the given candidates against one or more query
+        embeddings.
 
         Normalization contract
         ----------------------
@@ -168,9 +169,35 @@ class FaissIndex:
         Only the query is normalized here. Re-normalizing candidates on every
         search would be wasted CPU.
 
-        Flow: reconstruct candidates (unit-norm) → normalize query →
-        query @ candidates.T → sort → return top-k.
-        No FAISS search() call is made.
+        Multi-photo query (query_embedding shape (N, D), N > 1)
+        ---------------------------------------------------------
+        Per-candidate scores are the MEDIAN across the N query embeddings,
+        not the max. Verified offline (scratch_multiphoto_search_eval.py,
+        leave-one-out over 189 real animals, N=3): plain max-aggregation
+        widens the true-positive score but ALSO inflates the best impostor's
+        score via the same multiple-comparisons effect (each impostor gets a
+        full N-vs-3 max, not a fair single comparison), which measurably
+        REDUCED real-MATCH recall (21.5% -> 16.4%). Median rescued 84/567
+        single-photo failures against only 5 regressions, and WIDENED the
+        gap on average (0.062 -> 0.078) instead of narrowing it. See
+        CLAUDE.md's multi-photo search investigation for the full numbers.
+
+        median_query_idx (only meaningful for N > 1)
+        ----------------------------------------------
+        For each returned candidate, also records which query embedding's
+        individual score against it equals the reported median. For an ODD
+        N this is exact, not a heuristic: the median of an odd-sized set is
+        always one of its actual members (the middle-ranked one after
+        sorting), never an interpolation. This is what lets the /search
+        route hand LightGlue ONE specific query crop — the one that
+        actually produced the reported score — instead of running LightGlue
+        N times or picking an arbitrary photo. (For an even N this would be
+        an approximation — nearest sample to the interpolated median — but
+        this service only ever sends N=3.)
+
+        Flow: reconstruct candidates (unit-norm) → normalize query/queries →
+        queries @ candidates.T → per-candidate median across queries → sort
+        → return top-k. No FAISS search() call is made.
         """
         return await asyncio.to_thread(
             self._restricted_search_sync,
@@ -188,16 +215,27 @@ class FaissIndex:
         if not candidate_ids:
             return []
 
-        # Normalize query
-        query = self._prepare_embeddings(query_embedding)  # (1, D)
+        # Normalize query/queries. _prepare_embeddings already accepts (D,)
+        # or (N, D) -- reshapes/validates either way, nothing to add here.
+        query = self._prepare_embeddings(query_embedding)  # (N, D), N>=1
 
         with self._lock:
             # Reconstruct candidate vectors — already unit-norm from registration.
-            candidate_matrix = self._reconstruct_batch_inner(candidate_ids)  # (N, D)
+            candidate_matrix = self._reconstruct_batch_inner(candidate_ids)  # (C, D)
 
-        # Dot-product similarity: (1, D) @ (D, N) → (1, N)
         # Both sides are unit-norm, so dot product == cosine similarity.
-        scores = np.dot(query, candidate_matrix.T)[0]
+        scores_matrix = np.dot(query, candidate_matrix.T)  # (N, C)
+
+        # Per-candidate median across the N query embeddings. For N=1 this
+        # is just that one score, unchanged from before -- median of a
+        # single value is itself.
+        scores = np.median(scores_matrix, axis=0)  # (C,)
+
+        # Which query embedding produced each candidate's median score --
+        # see median_query_idx in the docstring above. argmin over |score -
+        # median| is the general form; for odd N one entry is an exact
+        # zero-distance match, not merely the closest.
+        median_query_idx = np.argmin(np.abs(scores_matrix - scores[np.newaxis, :]), axis=0)  # (C,)
 
         # Sort descending, take top-k
         top_k = min(top_k, len(scores))
@@ -217,6 +255,7 @@ class FaissIndex:
                 "score": float(current),
                 "rank": idx + 1,
                 "gap": float(current - next_score),
+                "median_query_idx": int(median_query_idx[i]),
             })
         return results
 

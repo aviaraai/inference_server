@@ -644,35 +644,21 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
     return winner
 
 
-def _run_registration_pipeline(
-    muzzle_bytes: tuple[bytes, ...],
-    front_bytes: tuple[bytes, ...],
-    model: Any,
-    device: torch.device,
-    color_extractor: Any,
-    morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict, dict, dict, list[np.ndarray]]:
-    """
-    Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
-    embedding, color extraction, morphology, pose-model face geometry, and
-    keypoint-anchored forehead color. Executed entirely inside a single
-    worker thread via asyncio.to_thread — nothing in here should ever need
-    to be async itself.
+def _muzzle_quality_crop_gate(muzzle_bytes: tuple[bytes, ...]) -> list[np.ndarray]:
+    """Quality gate + YOLO crop + crop-quality for N muzzle images (N=3 for
+    /register, N=2-3 for /search's multi-photo query). Every image is
+    checked before any failure is raised, so a single 422 names every bad
+    slot at once instead of the caller discovering them one retake at a
+    time (each retake is a full network round trip). Each image still stops
+    at its OWN first failure (quality, then detection, then crop-quality) --
+    only the across-images fail-fast was removed. Extracted from
+    /register's original inline loop so /search's multi-photo path shares
+    the exact same gate rather than a second copy that could drift.
 
-    Returns (embeddings, body_color, muzzle_color, morphology, face_geometry,
-    keypoint_forehead_color, cropped_images).
-
-    Raises HTTPException on any validation/quality failure; it's safe to
-    raise HTTPException from inside a thread because asyncio.to_thread
-    re-raises it on the awaiting coroutine, where FastAPI's normal
-    exception handling picks it up.
+    Raises image_quality_error (aggregating every failed slot) if any image
+    fails and BYPASS_QUALITY_GATES is not set. Returns one crop per input
+    image, same order, on success.
     """
-    # ── Quality gate + YOLO crop + crop-quality, evaluated for ALL 3 images ──
-    # Every muzzle image is checked before any failure is raised, so a single
-    # 422 names every bad slot at once instead of the caller discovering them
-    # one retake at a time (each retake is a full network round trip). Each
-    # image still stops at its OWN first failure (quality, then detection,
-    # then crop-quality) — only the across-images fail-fast was removed.
     failures: list[ImageFailure] = []
     cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     t_muzzle_gate = time.monotonic()
@@ -730,10 +716,88 @@ def _run_registration_pipeline(
 
         cropped_images[i - 1] = crop
 
-    log.info(f"muzzle quality/crop gate (3 images): {_ms_since(t_muzzle_gate)}ms")
+    log.info(f"muzzle quality/crop gate ({len(muzzle_bytes)} images): {_ms_since(t_muzzle_gate)}ms")
 
     if failures:
         raise image_quality_error(failures)
+
+    return cropped_images
+
+
+def _aggregate_muzzle_color(muzzle_colors: list[dict], *, allow_reject: bool) -> dict:
+    """Majority vote (>=2 of N agree) -> mean confidence of the agreeing
+    readings. Extracted verbatim from /register's original inline logic so
+    /search's multi-photo query shares the exact same policy -- see
+    CLAUDE.md's muzzle color aggregation note for why this can't just be
+    copy-pasted with the reject branch intact.
+
+    allow_reject=True (/register): no majority -> 422
+    MUZZLE_COLOR_INCONSISTENT, unless BYPASS_QUALITY_GATES is set, in which
+    case (same as always) it falls through to the best-confidence/halved
+    reading below. This is /register's untouched original behavior.
+
+    allow_reject=False (/search): no majority -> ALWAYS takes that same
+    best-confidence/halved fallback, unconditionally. /search must never
+    hard-fail a search over a supplementary color disagreement -- there is
+    no equivalent BYPASS_QUALITY_GATES escape hatch needed because there is
+    no reject to escape from.
+    """
+    labels = [c["label"] for c in muzzle_colors]
+    vote_counts = Counter(labels)
+    majority_label, majority_count = vote_counts.most_common(1)[0]
+
+    if majority_count < 2:
+        # No majority -- all readings different (or, for N=2, disagreeing).
+        if allow_reject and not BYPASS_QUALITY_GATES:
+            raise color_inconsistency_error(
+                ErrorCode.MUZZLE_COLOR_INCONSISTENT,
+                readings=color_readings("muzzle", muzzle_colors),
+                summary=(
+                    f"muzzle_color_inconsistent: no majority among crops "
+                    f"({', '.join(labels)})"
+                ),
+            )
+        best = max(muzzle_colors, key=lambda c: c["confidence"])
+        if allow_reject:
+            log.warning(
+                f"muzzle_color: bypassing no-majority ({', '.join(labels)}), "
+                f"accepting best-guess reading {best['label']}({best['confidence']:.2f})"
+            )
+        return {"label": best["label"], "confidence": round(best["confidence"] / 2.0, 4)}
+
+    # Majority found — use avg confidence of agreeing images
+    agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
+    avg_conf = sum(c["confidence"] for c in agreeing) / len(agreeing)
+    return {"label": majority_label, "confidence": avg_conf}
+
+
+def _run_registration_pipeline(
+    muzzle_bytes: tuple[bytes, ...],
+    front_bytes: tuple[bytes, ...],
+    model: Any,
+    device: torch.device,
+    color_extractor: Any,
+    morphology_extractor: Any,
+) -> tuple[np.ndarray, dict, dict, dict, dict, dict, list[np.ndarray]]:
+    """
+    Runs the full synchronous CPU/GPU pipeline: quality gates, YOLO crop,
+    embedding, color extraction, morphology, pose-model face geometry, and
+    keypoint-anchored forehead color. Executed entirely inside a single
+    worker thread via asyncio.to_thread — nothing in here should ever need
+    to be async itself.
+
+    Returns (embeddings, body_color, muzzle_color, morphology, face_geometry,
+    keypoint_forehead_color, cropped_images).
+
+    Raises HTTPException on any validation/quality failure; it's safe to
+    raise HTTPException from inside a thread because asyncio.to_thread
+    re-raises it on the awaiting coroutine, where FastAPI's normal
+    exception handling picks it up.
+    """
+    # ── Quality gate + YOLO crop + crop-quality, evaluated for ALL 3 images ──
+    # Shared with /search's multi-photo query path — see
+    # _muzzle_quality_crop_gate's docstring.
+    cropped_images = _muzzle_quality_crop_gate(muzzle_bytes)
 
     # ── Embed (batched forward pass) ─────────────────────────────────────
     t_embed = time.monotonic()
@@ -767,35 +831,11 @@ def _run_registration_pipeline(
     t_muzzle_color = time.monotonic()
     muzzle_colors = [color_extractor.extract_muzzle(crop) for crop in cropped_images]
     log.info(f"muzzle_color extraction (3 images): {_ms_since(t_muzzle_color)}ms")
-    muzzle_labels = [c["label"] for c in muzzle_colors]
 
-    # Count votes per label
-    vote_counts = Counter(muzzle_labels)
-    majority_label, majority_count = vote_counts.most_common(1)[0]
-
-    if majority_count < 2:
-        # All 3 different — no majority
-        if BYPASS_QUALITY_GATES:
-            best = max(muzzle_colors, key=lambda c: c["confidence"])
-            log.warning(
-                f"muzzle_color: bypassing no-majority ({', '.join(muzzle_labels)}), "
-                f"accepting best-guess reading {best['label']}({best['confidence']:.2f})"
-            )
-            muzzle_color = {"label": best["label"], "confidence": round(best["confidence"] / 2.0, 4)}
-        else:
-            raise color_inconsistency_error(
-                ErrorCode.MUZZLE_COLOR_INCONSISTENT,
-                readings=color_readings("muzzle", muzzle_colors),
-                summary=(
-                    f"muzzle_color_inconsistent: no majority among crops "
-                    f"({', '.join(muzzle_labels)})"
-                ),
-            )
-    else:
-        # Majority found — use avg confidence of agreeing images
-        agreeing = [c for c in muzzle_colors if c["label"] == majority_label]
-        avg_conf  = sum(c["confidence"] for c in agreeing) / len(agreeing)
-        muzzle_color = {"label": majority_label, "confidence": avg_conf}
+    # Shared with /search's multi-photo query path — see
+    # _aggregate_muzzle_color's docstring. allow_reject=True preserves
+    # /register's original behavior exactly (422 unless BYPASS_QUALITY_GATES).
+    muzzle_color = _aggregate_muzzle_color(muzzle_colors, allow_reject=True)
 
     # ── Morphology (horn/e ar proportions) — return-only, not a gate ───────
     # Unlike color, there's no majority/consistency check here: this is a
@@ -982,7 +1022,7 @@ async def _run_lightglue_tiebreaker(
 
 @app.post("/search", response_model=SearchResponse)
 async def search(
-    muzzle: UploadFile = File(...),
+    muzzle_images: list[UploadFile] = File(...),
     front: UploadFile = File(...),
     top_k: int = Form(5),
     candidate_json: str = Form(..., alias="candidates"),
@@ -996,7 +1036,7 @@ async def search(
     """
     Search endpoint: receives candidates from the API server (same shape as
     /register's `candidates`, faiss_id + whatever stored color/morphology
-    the caller has), embeds the query muzzle, then ranks only those
+    the caller has), embeds the query muzzle photo(s), then ranks only those
     candidates via restricted_search (reconstruct → dot product → sort).
 
     Each stored candidate's color/horn_shape is echoed back on its
@@ -1009,10 +1049,20 @@ async def search(
     No index-wide FAISS search is performed. The API server decides
     which candidates to send based on GPS / Supabase filtering.
 
-    ⚠️ Contract change: this used to accept a bare repeated `candidate_ids`
-    form field. It now expects a `candidates` field carrying the same JSON
-    shape /register already uses (list of CandidateInfo). Callers built
-    against the old bare-ID contract will get a 422 until updated.
+    ⚠️ Contract change: this used to accept a single `muzzle` file. It now
+    accepts 1-3 repeated `muzzle_images` parts (same field-name-repeated
+    shape /register already uses for its 3 muzzle images), aggregated via
+    MEDIAN across whichever N were sent — see faiss_index.py's
+    restricted_search docstring and CLAUDE.md's multi-photo search
+    investigation for why median, not max or mean. N=1 still works
+    unchanged (median of one value is that value). Callers sending the old
+    bare `muzzle` field will get a 422 until updated.
+
+    ⚠️ Earlier contract change, unrelated: this used to accept a bare
+    repeated `candidate_ids` form field. It now expects a `candidates` field
+    carrying the same JSON shape /register already uses (list of
+    CandidateInfo). Callers built against the old bare-ID contract will get
+    a 422 until updated.
     """
     request_id = uuid.uuid4().hex
     t_start = time.monotonic()
@@ -1025,20 +1075,27 @@ async def search(
     if not candidate_list:
         raise HTTPException(status_code=422, detail="candidates must contain at least one entry")
 
+    if not (1 <= len(muzzle_images) <= 3):
+        raise HTTPException(status_code=422, detail=f"muzzle_images must contain 1-3 images, got {len(muzzle_images)}")
+
     candidate_lookup = {c.faiss_id: c for c in candidate_list}
     candidate_ids = [c.faiss_id for c in candidate_list]
 
-    log.info(f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)} tag_no={tag_no!r}")
+    log.info(
+        f"[{request_id}] /search top_k={top_k} candidates={len(candidate_ids)} "
+        f"muzzle_photos={len(muzzle_images)} tag_no={tag_no!r}"
+    )
 
     # ── Real async I/O: read uploads concurrently ──────────────────────────
-    muzzle_bytes, front_bytes = await asyncio.gather(
-        muzzle.read(),
-        front.read()
+    *muzzle_bytes_list, front_bytes = await asyncio.gather(
+        *(m.read() for m in muzzle_images),
+        front.read(),
     )
+    muzzle_bytes = tuple(muzzle_bytes_list)
 
     # ── CPU/GPU pipeline: one thread-offload seam ───────────────────────────
     t_embed_start = time.monotonic()
-    emb_np, muzzle_color, body_color, morphology, query_crop = await asyncio.to_thread(
+    emb_np, muzzle_color, body_color, morphology, query_crops = await asyncio.to_thread(
         _run_search_pipeline,
         muzzle_bytes,
         front_bytes,
@@ -1090,6 +1147,12 @@ async def search(
             )
 
     # ── LightGlue fusion tiebreaker — additive only; see _run_lightglue_tiebreaker.
+    # With N>1 query photos there's no single "the" query crop -- feed the
+    # ONE whose own score against the winning candidate equals the reported
+    # median (faiss_index.py's median_query_idx; exact for odd N, see its
+    # docstring), not an arbitrary photo and not all N (which would triple
+    # LightGlue's cost on every ambiguous search).
+    query_crop = query_crops[matches[0]["median_query_idx"]] if matches else query_crops[0]
     t_lightglue_start = time.monotonic()
     lightglue_checked, lightglue_num_matches, lightglue_zone = await _run_lightglue_tiebreaker(
         matches, query_crop, request_id,
@@ -1134,63 +1197,51 @@ async def search(
 
 
 def _run_search_pipeline(
-    muzzle_bytes: bytes,
+    muzzle_bytes: tuple[bytes, ...],
     front_bytes: bytes,
     model: Any,
     device: torch.device,
     color_extractor: Any,
     morphology_extractor: Any,
-) -> tuple[np.ndarray, dict, dict, dict, np.ndarray]:
+) -> tuple[np.ndarray, dict, dict, dict, list[np.ndarray]]:
     """
     Synchronous CPU/GPU pipeline for /search: quality gate, crop, embed,
     color extraction. Runs entirely inside asyncio.to_thread.
 
-    Also returns the query's own muzzle `crop` (not just its embedding) —
-    needed by the /search route handler for the LightGlue fusion tiebreaker,
-    which compares raw pixels, not embeddings.
+    muzzle_bytes carries 1-3 query muzzle photos (see CLAUDE.md's multi-photo
+    search investigation for why: sending 2-3 and aggregating via MEDIAN
+    across them, not the current single photo, measurably improves real
+    MATCH recall on the same real-photo leave-one-out harness that first
+    surfaced this). Quality gate, crop, and embedding all batch cleanly over
+    N photos via _muzzle_quality_crop_gate/embed_batch, identical in spirit
+    to /register's own 3-muzzle-photo handling -- shared with it via
+    _muzzle_quality_crop_gate so there is one gate, not two copies.
+
+    Front stays a single photo -- only the muzzle side is multi-photo, per
+    the original scoping (body_color/morphology run on that one front photo
+    unchanged).
+
+    Returns embeddings (N, 256) instead of (256,) previously, and crops (a
+    list of N, not one) -- the /search route handler picks exactly ONE of
+    these N crops for the LightGlue tiebreaker (the one whose own score
+    against the winning candidate equals the reported median -- see
+    faiss_index.py's median_query_idx), never all N (that would triple
+    LightGlue's cost on every ambiguous search for no benefit).
     """
-    q_status, q_reason = quality_check(muzzle_bytes)
-    if q_status != "GOOD":
-        log.error(f"Quality status: {q_status}")
-        log.error(f"Quality reason: {q_reason}")
-        raise image_quality_error([ImageFailure(
-            slot="muzzle",
-            stage="quality",
-            error_code=classify_quality_reason(q_reason),
-            reason=q_reason,
-        )])
+    crops = _muzzle_quality_crop_gate(muzzle_bytes)
 
-    img_bgr = _decode_image(muzzle_bytes, "muzzle")
-    crop, det_status, _det_conf = crop_cattle(img_bgr)
-    if crop is None:
-        log.error(f"Crop: {crop} | Det Status: {det_status} | Det conf: {_det_conf}")
-        raise image_quality_error([ImageFailure(
-            slot="muzzle",
-            stage="detection",
-            error_code=classify_detection_status(det_status),
-            reason=det_status,
-        )])
+    jpg_bytes = [cv2.imencode(".jpg", c)[1].tobytes() for c in crops]
+    embeddings = embed_batch(jpg_bytes, model, device)  # (N, 256), one batched forward pass
+    emb_np = embeddings.numpy()
 
-    crop_status, crop_reason = quality_check_cv2(crop)
-    if crop_status != "GOOD":
-        log.error(f"Crop Status: {crop_status} | Crop reason: {crop_reason}")
-        raise image_quality_error([ImageFailure(
-            slot="muzzle",
-            stage="crop_quality",
-            error_code=classify_quality_reason(crop_reason),
-            reason=crop_reason,
-        )])
+    muzzle_colors = [color_extractor.extract_muzzle(c) for c in crops]
+    muzzle_color = _aggregate_muzzle_color(muzzle_colors, allow_reject=False)
 
-    crop_bytes = cv2.imencode(".jpg", crop)[1].tobytes()
-    embedding = embed_batch([crop_bytes], model, device)  # (1, 256)
-    emb_np = embedding.squeeze(0).numpy()  # (256,)
-
-    muzzle_color = color_extractor.extract_muzzle(crop)
     front_img = _decode_image(front_bytes, "front")
     body_color = color_extractor.extract_body(front_img)
     morphology = morphology_extractor.extract(front_img)
 
-    return emb_np, muzzle_color, body_color, morphology, crop
+    return emb_np, muzzle_color, body_color, morphology, crops
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────
