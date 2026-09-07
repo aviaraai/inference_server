@@ -90,6 +90,22 @@ MIN_EXPOSURE_STD   = 15.0                       # pixel-intensity std-dev floor,
 # photos agree.
 BODY_COLOR_MAJORITY_CONFIDENCE = 0.50
 
+# The only bar that may BLOCK a registration on body color. Two front photos
+# that disagree while BOTH read at least this confidently is the one reading of
+# the evidence a retake genuinely serves — most plausibly the two photos are of
+# different animals — so it stays a 422. Anything weaker resolves and proceeds:
+# see main.py::_resolve_disagreeing_body_colors.
+#
+# ⚠️ Unlike BODY_COLOR_MAJORITY_CONFIDENCE above, this IS a judgment call, not a
+# structural property of the metric. The anchor is the midpoint between a bare
+# majority of the coat (0.50) and certainty (1.00) — a claim that far past "most
+# of the animal" is strong enough to be worth contradicting. Calibrated against
+# real field failures from 2026-09-07, where a single black buffalo produced
+# readings of GREY 0.85, SPOTTED 0.51, GREY 0.47 and SPOTTED 0.42 across two
+# handsets: only one clears this bar, so none of those registrations is blocked,
+# which is the intended outcome — no retake could have fixed any of them.
+BODY_COLOR_CONTRADICTION_CONFIDENCE = 0.75
+
 # ── Duplicate Detection ──────────────────────────────────────────────────────
 DUPLICATE_THRESHOLD = 0.80                      # cosine similarity above which
                                                 # embeddings are considered the

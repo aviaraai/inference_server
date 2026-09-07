@@ -48,6 +48,7 @@ from errors import (
 )
 from faiss_index import FaissIndex
 from godhaar.config import (
+    BODY_COLOR_CONTRADICTION_CONFIDENCE,
     BODY_COLOR_MAJORITY_CONFIDENCE,
     DUPLICATE_HIGH_CONFIDENCE_THRESHOLD,
     DUPLICATE_THRESHOLD,
@@ -56,7 +57,7 @@ from godhaar.config import (
 )
 from godhaar.model import GodhaarModel
 from helpers import _decode_image, _ms_since
-from pipeline.color import RuleBasedColorExtractor
+from pipeline.color import BodyColor, RuleBasedColorExtractor
 from pipeline.keypoint_color import combine_keypoint_color, extract_keypoint_forehead_color
 from pipeline.morphology import RuleBasedMorphologyExtractor, average_readings
 from pipeline.muzzle import embed_batch
@@ -599,23 +600,47 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
 
       - Exactly one reading claims a majority of the coat → take it. The other
         photo saw no color clearly enough to outvote it.
-      - Both claim a majority, and disagree → still 422. Two confident,
-        contradictory readings is the case a retake genuinely serves (e.g.
-        the two front photos are of different animals).
-      - Neither claims a majority → still 422. Nothing here is trustworthy
-        enough to store.
+      - Both claim a majority, but only one is CONTRADICTION-confident → take
+        the stronger. A bare majority is a coin flip about where a boundary
+        fell, not a rival claim; it must not veto a dominant reading.
+      - Both claim a majority AND both clear
+        BODY_COLOR_CONTRADICTION_CONFIDENCE → still 422. Two strong,
+        contradictory readings is the one case a retake genuinely serves (most
+        plausibly the two front photos are of different animals). This is the
+        ONLY path that still blocks a registration on body color.
+      - Neither claims a majority → UNKNOWN at 0.0, and the registration
+        PROCEEDS. This used to be a 422 on the grounds that nothing here was
+        trustworthy enough to store, which had the rule backwards: UNKNOWN/0.0
+        is what extract_body itself returns when it cannot read a coat at all
+        (body_color.py's LOW_QUALITY and NO_COLOR_CLUSTERS paths), and when
+        BOTH photos come back that way they agree and the registration sails
+        through. So "we don't know this animal's color" was already an accepted
+        outcome — it was only ever punished when the two photos failed to not
+        know it in the same direction. Storing UNKNOWN says exactly what
+        happened and costs nothing downstream: attributeWeight is 0.005 and
+        demote-only.
 
     Confidence of an accepted reading is HALVED, following the same
     convention average_readings() uses for morphology's PARTIAL status: one of
     two photos failed to support this label, so the result must read as less
     certain than two agreeing photos would.
-    """
-    confident = [c for c in body_colors if c["confidence"] >= BODY_COLOR_MAJORITY_CONFIDENCE]
 
-    if len(confident) != 1:
-        labels = " vs ".join(
-            f"{c['label']}({c['confidence']:.2f})" for c in body_colors
-        )
+    Calibrated against real field data (2026-09-07): one black buffalo,
+    photographed on two handsets, produced GREY 0.85 vs SPOTTED 0.51 on one
+    attempt and GREY 0.47 vs SPOTTED 0.42 on another — hitting BOTH of the old
+    422 branches for the same animal, seven times in 35 minutes, with no retake
+    able to fix either. The classifier simply has no stable opinion on a
+    dark coat (CLAUDE.md's dark-coated-breed note). Under this rule the first
+    resolves to GREY and the second to UNKNOWN; neither blocks.
+    """
+    labels = " vs ".join(f"{c['label']}({c['confidence']:.2f})" for c in body_colors)
+    confident = [c for c in body_colors if c["confidence"] >= BODY_COLOR_MAJORITY_CONFIDENCE]
+    contradicting = [
+        c for c in body_colors if c["confidence"] >= BODY_COLOR_CONTRADICTION_CONFIDENCE
+    ]
+
+    # The only remaining block: two strong readings that genuinely contradict.
+    if len(contradicting) > 1:
         if BYPASS_QUALITY_GATES:
             best = max(body_colors, key=lambda c: c["confidence"])
             log.warning(
@@ -625,21 +650,30 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
             result = dict(best)
             result["confidence"] = round(result["confidence"] / 2.0, 4)
             return result
-        detail = (
-            "body_color_inconsistent: front images disagree and neither is "
-            "decisive"
-            if not confident
-            else "body_color_inconsistent: front images give conflicting "
-                 "confident readings"
-        )
         raise color_inconsistency_error(
             ErrorCode.BODY_COLOR_INCONSISTENT,
             readings=color_readings("front", body_colors),
-            summary=f"{detail} ({labels})",
+            summary=(
+                "body_color_inconsistent: front images give conflicting "
+                f"confident readings ({labels})"
+            ),
         )
 
-    winner = dict(confident[0])
-    loser = next(c for c in body_colors if c is not confident[0])
+    # Nothing claimed a majority of the coat: record that, don't reject it.
+    if not confident:
+        log.warning(
+            f"body_color: front photos disagree and neither claims a majority "
+            f"({labels}) — storing UNKNOWN"
+        )
+        return {
+            "label": BodyColor.UNKNOWN.value,
+            "confidence": 0.0,
+            "reason": f"UNRESOLVED_DISAGREEMENT: front photos read {labels}",
+        }
+
+    best = max(confident, key=lambda c: c["confidence"])
+    loser = next(c for c in body_colors if c is not best)
+    winner = dict(best)
     log.warning(
         f"body_color: front photos disagree ({winner['label']} "
         f"{winner['confidence']:.2f} vs {loser['label']} "
