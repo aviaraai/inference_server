@@ -859,11 +859,21 @@ def _run_registration_pipeline(
     #   Majority found → accept majority label (avg confidence of agreeing images).
     #   All 3 different → 422, ask user to retake.
 
+    # Decode each front photo ONCE and share it across all four extractors
+    # below (body color, morphology, face geometry, keypoint forehead color).
+    # Each used to decode the same JPEGs itself, so a 2-photo registration paid
+    # for 8 full-resolution decodes to look at 2 distinct images — pure
+    # duplicated work on the critical path of a request an officer is waiting
+    # on. Safe to share: every one of these treats the frame as read-only (cv2
+    # crops/color conversions all allocate their own output), verified before
+    # this change; if a future extractor needs to draw on the frame, it must
+    # copy it rather than reintroduce a per-extractor decode.
+    t_front_decode = time.monotonic()
+    front_images_bgr = [_decode_image(fb, f"front_{i}") for i, fb in enumerate(front_bytes, 1)]
+    log.info(f"front decode ({len(front_images_bgr)} images): {_ms_since(t_front_decode)}ms")
+
     t_body_color = time.monotonic()
-    body_colors = [
-        color_extractor.extract_body(_decode_image(fb, f"front_{i}"))
-        for i, fb in enumerate(front_bytes, 1)
-    ]
+    body_colors = [color_extractor.extract_body(img) for img in front_images_bgr]
     log.info(f"body_color extraction (2 images): {_ms_since(t_body_color)}ms")
     body_labels = [c["label"] for c in body_colors]
 
@@ -889,10 +899,7 @@ def _run_registration_pipeline(
     # error the way a color mismatch is. Both readings are combined via a
     # confidence-weighted average instead.
     t_morphology = time.monotonic()
-    morphology_readings = [
-        morphology_extractor.extract(_decode_image(fb, f"front_{i}"))
-        for i, fb in enumerate(front_bytes, 1)
-    ]
+    morphology_readings = [morphology_extractor.extract(img) for img in front_images_bgr]
     log.info(f"morphology extraction (2 images): {_ms_since(t_morphology)}ms")
     morphology = average_readings(morphology_readings)
 
@@ -904,10 +911,7 @@ def _run_registration_pipeline(
     # says so — nothing downstream changes. extract_face_geometry does its
     # own crop_cattle internally (like RuleBasedMorphologyExtractor.extract).
     t_pose = time.monotonic()
-    geometry_readings = [
-        extract_face_geometry(_decode_image(fb, f"front_{i}"))
-        for i, fb in enumerate(front_bytes, 1)
-    ]
+    geometry_readings = [extract_face_geometry(img) for img in front_images_bgr]
     log.info(f"face geometry extraction (2 images): {_ms_since(t_pose)}ms")
     face_geometry = combine_geometry(geometry_readings)
     # Coverage line, ships WITH the feature rather than as a follow-up: the
@@ -930,10 +934,7 @@ def _run_registration_pipeline(
     # a second reading anchored to the pose model's eye keypoints instead of
     # body_color.py's whole-bbox sample. See pipeline/keypoint_color.py.
     t_kp_color = time.monotonic()
-    kp_color_readings = [
-        extract_keypoint_forehead_color(_decode_image(fb, f"front_{i}"))
-        for i, fb in enumerate(front_bytes, 1)
-    ]
+    kp_color_readings = [extract_keypoint_forehead_color(img) for img in front_images_bgr]
     log.info(f"keypoint forehead color extraction (2 images): {_ms_since(t_kp_color)}ms")
     keypoint_forehead_color = combine_keypoint_color(kp_color_readings)
     log.info(
