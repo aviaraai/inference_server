@@ -145,8 +145,8 @@ BYPASS_QUALITY_GATES = False
 BYPASS_DUPLICATE_CHECK = False
 
 # ── /search fusion tiebreaker: LightGlue as an additive, inert signal ────────
-# These mirror go-apiserver's decision.go thresholds (matchThreshold=0.82,
-# reviewThreshold=0.72, gapThreshold=0.08) — NOT a copy of business logic
+# These mirror go-apiserver's decision.go thresholds (matchThreshold=0.86,
+# reviewThreshold=0.72, gapThreshold=0.02) — NOT a copy of business logic
 # living here (godhaar/config.py's docstring rule against that still holds).
 # inference_server never decides MATCH/REVIEW/UNKNOWN; this is used only to
 # decide whether it's worth spending the extra GPU time to compute an optional
@@ -157,9 +157,18 @@ BYPASS_DUPLICATE_CHECK = False
 # go-apiserver will ultimately decide, not identical to it. There is no
 # shared source between the two repos: if decision.go's thresholds change,
 # these need updating by hand. See CLAUDE.md.
-_SEARCH_MATCH_THRESHOLD_MIRROR = 0.82
+#
+# Last synced 2026-09-07 against go-apiserver decision.go (a27b1b6's
+# recalibration for median-aggregated multi-photo search): match 0.82 -> 0.86,
+# gap 0.08 -> 0.02, review unchanged. That commit updated decision.go alone and
+# left this mirror on the single-photo numbers, so for a day the tiebreaker was
+# reading a definition of "borderline" the decider no longer used — skipping
+# scores in 0.82-0.86 that go-apiserver had stopped calling MATCH, while
+# treating gaps in 0.02-0.08 as too close when go-apiserver was satisfied by
+# them. Both errors are now corrected in the same direction as decision.go.
+_SEARCH_MATCH_THRESHOLD_MIRROR = 0.86
 _SEARCH_REVIEW_THRESHOLD_MIRROR = 0.72
-_SEARCH_GAP_THRESHOLD_MIRROR = 0.08
+_SEARCH_GAP_THRESHOLD_MIRROR = 0.02
 
 
 @asynccontextmanager
