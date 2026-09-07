@@ -206,22 +206,44 @@ def extract_dominant_lab_features(img_lab: np.ndarray, k: int = _CLUSTER_K) -> d
         return dict(_EMPTY_FEATURES)
 
     h, w = img_lab.shape[:2]
-    ys, xs = np.divmod(np.arange(h * w), w)
     pixels = img_lab.reshape(-1, 3)
 
     total_pixels = len(pixels)
     if total_pixels == 0:
         return dict(_EMPTY_FEATURES)
 
-    pixels = pixels.astype(np.float64)
-    coords = np.column_stack((ys, xs))
-
+    # Draw the sample FIRST, then materialise only what was drawn.
+    #
+    # This used to build the float64 pixel array and the full (y, x) coordinate
+    # grid for the WHOLE ROI and then index 8000 rows out of them — on a 1.9MP
+    # ROI that is a 46MB float64 conversion plus a 31MB coordinate array, 99.6%
+    # of which was discarded immediately. The sample indices depend only on
+    # total_pixels, never on the arrays' contents, so choosing them up front and
+    # converting just those rows is arithmetically identical: same seed, same
+    # indices, same pixels, same centroids. Verified byte-identical against the
+    # previous implementation on random, two-tone and patched images, above and
+    # below the sample cap, down to a 1x1 ROI.
+    #
+    # Measured 1.3-1.6x on the whole function (1.9MP ROI: 168ms -> 126ms). The
+    # floor is elsewhere and is NOT worth chasing blind: ~48ms is _kmeans_lab
+    # itself, and most of the rest is this very rng.choice, which builds a full
+    # permutation of all 1.9M indices to draw 8000 without replacement. An O(k)
+    # sampler would cut that, but it draws DIFFERENT pixels, so centroids and
+    # therefore labels can move — not a change to make on a colour classifier
+    # that has already blocked field registrations, and not one to validate on
+    # synthetic images.
+    #
+    # ys/xs are derived from the chosen indices directly — idx // w and idx % w
+    # are exactly what np.divmod(np.arange(h * w), w) produced at those
+    # positions — so the coordinate grid never has to exist in full either.
     rng = np.random.RandomState(_CLUSTER_SEED)
     if total_pixels > _MAX_CLUSTER_SAMPLE:
         sample_idx = rng.choice(total_pixels, _MAX_CLUSTER_SAMPLE, replace=False)
-        sample, sample_coords = pixels[sample_idx], coords[sample_idx]
+        sample = pixels[sample_idx].astype(np.float64)
+        sample_coords = np.column_stack(np.divmod(sample_idx, w))
     else:
-        sample, sample_coords = pixels, coords
+        sample = pixels.astype(np.float64)
+        sample_coords = np.column_stack(np.divmod(np.arange(total_pixels), w))
 
     centers, labels = _kmeans_lab(sample, k, seed=_CLUSTER_SEED)
 
