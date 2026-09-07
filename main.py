@@ -794,6 +794,8 @@ def _run_registration_pipeline(
     re-raises it on the awaiting coroutine, where FastAPI's normal
     exception handling picks it up.
     """
+    t_pipeline = time.monotonic()
+
     # ── Quality gate + YOLO crop + crop-quality, evaluated for ALL 3 images ──
     # Shared with /search's multi-photo query path — see
     # _muzzle_quality_crop_gate's docstring.
@@ -897,7 +899,7 @@ def _run_registration_pipeline(
         f"sources_usable={keypoint_forehead_color['sources_usable']}/{len(kp_color_readings)}"
     )
 
-    log.info(f"_run_registration_pipeline total: {_ms_since(t_muzzle_gate)}ms")
+    log.info(f"_run_registration_pipeline total: {_ms_since(t_pipeline)}ms")
     return (
         embeddings.numpy(), body_color, muzzle_color, morphology, face_geometry,
         keypoint_forehead_color, cropped_images,
