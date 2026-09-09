@@ -94,6 +94,24 @@ class FaissIndex:
         with self._lock:
             self.index.add_with_ids(all_vecs, all_ids)
 
+    async def add_batch_with_ids(self, embeddings: np.ndarray, ids: list[int]) -> None:
+        """Insert vectors under CALLER-SUPPLIED faiss_ids, instead of minting
+        new random ones. Only used by scripts/reindex_gallery.py: a
+        migration must preserve each embedding's existing faiss_id, since
+        go-apiserver's own DB rows reference it -- generating fresh ids
+        here would silently break every stored (faiss_id -> animal)
+        mapping on the API-server side. Never used by /register.
+        """
+        vectors = self._prepare_embeddings(embeddings)
+        if vectors.shape[0] == 0:
+            return
+        id_arr = np.array(ids, dtype=np.int64)
+        if id_arr.shape[0] != vectors.shape[0]:
+            raise ValueError(
+                f"ids length {id_arr.shape[0]} != embeddings rows {vectors.shape[0]}"
+            )
+        await asyncio.to_thread(self._add_batch_sync, vectors, id_arr)
+
     # ── Read operations ──────────────────────────────────────────────────────
     # NOTE: reads now take the same lock as writes. FAISS gives no guarantee
     # that a read is safe concurrently with a write on the same index, so
