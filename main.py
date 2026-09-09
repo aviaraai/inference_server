@@ -165,17 +165,24 @@ BYPASS_DUPLICATE_CHECK = False
 # shared source between the two repos: if decision.go's thresholds change,
 # these need updating by hand. See CLAUDE.md.
 #
-# Last synced 2026-09-07 against go-apiserver decision.go (a27b1b6's
-# recalibration for median-aggregated multi-photo search): match 0.82 -> 0.86,
-# gap 0.08 -> 0.02, review unchanged. That commit updated decision.go alone and
-# left this mirror on the single-photo numbers, so for a day the tiebreaker was
-# reading a definition of "borderline" the decider no longer used — skipping
-# scores in 0.82-0.86 that go-apiserver had stopped calling MATCH, while
-# treating gaps in 0.02-0.08 as too close when go-apiserver was satisfied by
-# them. Both errors are now corrected in the same direction as decision.go.
-_SEARCH_MATCH_THRESHOLD_MIRROR = 0.86
-_SEARCH_REVIEW_THRESHOLD_MIRROR = 0.72
-_SEARCH_GAP_THRESHOLD_MIRROR = 0.02
+# Last synced 2026-09-10 against go-apiserver decision.go's fusion-encoder
+# recalibration (scripts/calibrate_decision_thresholds.py, Stage 6 of the
+# fusion+PCA-whitening upgrade): match 0.86 -> 0.22, gap 0.02 -> 0.08, review
+# 0.72 -> 0.16. This is a much bigger jump than the 2026-09-07 sync below --
+# the embedding SPACE itself changed (DINOv2+ResNet50x2+PCA-whitening, not
+# plain DINOv2), not just a re-tune of the same distribution, so the OLD
+# mirror values would have made this tiebreaker fire on almost every search
+# (0.86 was comfortably above nearly every genuine score in the old space;
+# it is now far above nearly every score, genuine or not, in the new one).
+#
+# Prior sync (2026-09-07, against a27b1b6's recalibration for median-
+# aggregated multi-photo search): match 0.82 -> 0.86, gap 0.08 -> 0.02,
+# review unchanged. That commit updated decision.go alone and left this
+# mirror on the single-photo numbers for a day -- see git history if that
+# failure mode needs re-reading.
+_SEARCH_MATCH_THRESHOLD_MIRROR = 0.22
+_SEARCH_REVIEW_THRESHOLD_MIRROR = 0.16
+_SEARCH_GAP_THRESHOLD_MIRROR = 0.08
 
 
 @asynccontextmanager
