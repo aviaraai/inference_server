@@ -12,6 +12,7 @@ color classifications, and gap calculations.
 """
 
 import asyncio
+import io
 import json
 from collections import Counter
 import logging
@@ -25,6 +26,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 
 from cctv.database import init_db as init_cctv_db
@@ -54,8 +56,12 @@ from godhaar.config import (
     DUPLICATE_THRESHOLD,
     EMB_DIM,
     MODEL_VERSION,
+    RESNET_MODEL_PATH,
+    WHITENING_MODEL_PATH,
 )
 from godhaar.model import GodhaarModel
+from pipeline.fusion_encoder import FusionEncoder, load_resnet50
+from pipeline.whitening import WhiteningTransform
 from helpers import _decode_image, _ms_since
 from pipeline.color import BodyColor, RuleBasedColorExtractor
 from pipeline.keypoint_color import combine_keypoint_color, extract_keypoint_forehead_color
@@ -68,7 +74,7 @@ from pipeline.pose import (
     pose_available,
     warmup_pose_model,
 )
-from pipeline.quality import quality_check, quality_check_cv2
+from pipeline.quality import quality_check
 from pipeline.muzzle_detect import load_muzzle_detector, warmup_muzzle_detector
 from pipeline.muzzle_crop_cache import (
     load_crop as load_cached_muzzle_crop,
@@ -192,10 +198,36 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(f"Model checkpoint not found: {model_path}")
 
     log.info(f"Loading GodhaarModel from {model_path}...")
-    model, ckpt = GodhaarModel.load_checkpoint(model_path, device=device)
+    dino_model, ckpt = GodhaarModel.load_checkpoint(model_path, device=device)
+    dino_model.eval()
+    log.info(f"GodhaarModel loaded (epoch={ckpt.get('epoch', '?')})")
+
+    # 2b. Load the ImageNet ResNet50 fusion branch (LOCAL weights only -- see
+    #     RESNET_MODEL_PATH's comment in godhaar/config.py) and the frozen
+    #     PCA-whitening artifact, then assemble the FusionEncoder that
+    #     pipeline/muzzle.py::embed_batch actually dispatches to. This
+    #     REPLACES app.state.model (the plain DINOv2 GodhaarModel is no
+    #     longer what /register and /search embed with) -- see
+    #     scratch_fusion_validation.py for the Stage 1 proof this reproduces
+    #     the measured retrieval numbers, and CLAUDE.md for why the fusion
+    #     upgrade shipped at all.
+    resnet_path = os.getenv("RESNET_MODEL_PATH", RESNET_MODEL_PATH)
+    if not os.path.exists(resnet_path):
+        log.error(f"ResNet50 fusion weights not found: {resnet_path}")
+        raise RuntimeError(f"ResNet50 fusion weights not found: {resnet_path}")
+    resnet_model = load_resnet50(resnet_path, device)
+    log.info(f"ResNet50 fusion branch loaded from {resnet_path}")
+
+    whitening_path = os.getenv("WHITENING_MODEL_PATH", WHITENING_MODEL_PATH)
+    whitening = WhiteningTransform.load(whitening_path)
+    log.info(
+        f"Whitening artifact loaded: {whitening.n_components} components, "
+        f"hash={whitening.content_hash[:12]}..."
+    )
+
+    model = FusionEncoder(dino_model, resnet_model, whitening, device)
     model.eval()
     app.state.model = model
-    log.info(f"GodhaarModel loaded (epoch={ckpt.get('epoch', '?')})")
 
     # 3. Load FAISS index (hybrid: load existing, allow online additions)
     faiss_index_path = os.getenv("FAISS_INDEX_PATH")
@@ -239,11 +271,14 @@ async def lifespan(app: FastAPI):
     #     /register then just returns face_geometry with status=NO_FACE.
     load_pose_model(os.getenv("POSE_MODEL_PATH", None))
 
-    # 6. Warmup — run dummy inference through both models
+    # 6. Warmup — run a dummy image through the full fusion encoder (DINOv2 +
+    #    both ResNet50 resolutions + whitening), not a raw tensor forward --
+    #    FusionEncoder has no bare forward(); embed_images() is its contract.
     log.info("Running warmup inference...")
-    dummy = torch.randn(1, 3, 518, 518, device=device)
-    with torch.inference_mode():
-        model(dummy)
+    dummy_pil = Image.new("RGB", (600, 600), color=(128, 128, 128))
+    dummy_buf = io.BytesIO()
+    dummy_pil.save(dummy_buf, format="JPEG")
+    model.embed_images([dummy_buf.getvalue()])
     warmup_yolo()
     warmup_muzzle_detector()
     warmup_lightglue()
@@ -687,38 +722,57 @@ def _resolve_disagreeing_body_colors(body_colors: list[dict]) -> dict:
     return winner
 
 
-def _muzzle_quality_crop_gate(muzzle_bytes: tuple[bytes, ...]) -> list[np.ndarray]:
-    """Quality gate + YOLO crop + crop-quality for N muzzle images (N=3 for
-    /register, N=2-3 for /search's multi-photo query). Every image is
-    checked before any failure is raised, so a single 422 names every bad
-    slot at once instead of the caller discovering them one retake at a
-    time (each retake is a full network round trip). Each image still stops
-    at its OWN first failure (quality, then detection, then crop-quality) --
-    only the across-images fail-fast was removed. Extracted from
-    /register's original inline loop so /search's multi-photo path shares
-    the exact same gate rather than a second copy that could drift.
+def _muzzle_quality_crop_gate(
+    muzzle_bytes: tuple[bytes, ...],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Quality gate for N muzzle images (N=3 for /register, N=2-3 for
+    /search's multi-photo query). Every image is checked before any failure
+    is raised, so a single 422 names every bad slot at once instead of the
+    caller discovering them one retake at a time (each retake is a full
+    network round trip). Extracted from /register's original inline loop so
+    /search's multi-photo path shares the exact same gate rather than a
+    second copy that could drift.
 
-    Raises image_quality_error (aggregating every failed slot) if any image
-    fails and BYPASS_QUALITY_GATES is not set. Returns one crop per input
-    image, same order, on success.
+    Fusion-encoder change (see pipeline/fusion_encoder.py / CLAUDE.md): the
+    embedding no longer needs a YOLO crop at all -- DINOv2+ResNet50 are fed
+    the FULL photo now. So this gate has two, deliberately different,
+    outputs:
+
+    - `raw_images`: the full decoded photo for every slot. This is what
+      goes to embed_batch(). Gated ONLY on quality_check (blur/exposure/
+      size) -- unchanged from before.
+    - `crops`: crop_cattle()'s output where it succeeds, else the raw
+      image as a fallback. Used ONLY for muzzle color extraction, the
+      LightGlue crop/feature cache, and detection telemetry -- NOT for
+      embedding. crop_cattle() STILL RUNS (for the cache + telemetry) but
+      its failure (RECAPTURE_NO_DETECTION / RECAPTURE_MULTI_CATTLE) is now
+      a WARNING, never a 422 -- this is what recovers registrations that
+      were being rejected purely because YOLO couldn't localize the
+      animal, even though the photo itself was perfectly good for
+      embedding. quality_check_cv2 (the old crop-quality gate) existed
+      solely to protect the embedding input and is removed along with
+      that dependency.
+
+    Raises image_quality_error (aggregating every failed slot) only for
+    quality_check failures now, unless BYPASS_QUALITY_GATES is set.
+    Returns (raw_images, crops), same order as muzzle_bytes, on success.
     """
     failures: list[ImageFailure] = []
-    cropped_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
+    raw_images: list[np.ndarray | None] = [None] * len(muzzle_bytes)
+    crops: list[np.ndarray | None] = [None] * len(muzzle_bytes)
     t_muzzle_gate = time.monotonic()
     for i, mb in enumerate(muzzle_bytes, 1):
         slot = f"muzzle_{i}"
         t_slot = time.monotonic()
 
-        # Decoded unconditionally (not just after quality_check passes) so a
-        # BYPASS_QUALITY_GATES fallback always has raw pixels to fall back to,
-        # regardless of which check below is the one that would have failed.
         img_bgr = _decode_image(mb, slot)
 
         status, reason = quality_check(mb)
         if status != "GOOD":
             if BYPASS_QUALITY_GATES:
                 log.warning(f"{slot}: bypassing quality failure ({reason}), using raw frame")
-                cropped_images[i - 1] = img_bgr
+                raw_images[i - 1] = img_bgr
+                crops[i - 1] = img_bgr
                 continue
             failures.append(ImageFailure(
                 slot=slot,
@@ -728,43 +782,30 @@ def _muzzle_quality_crop_gate(muzzle_bytes: tuple[bytes, ...]) -> list[np.ndarra
             ))
             continue
 
+        # Embedding input: always the full photo, regardless of detection.
+        raw_images[i - 1] = img_bgr
+
+        # crop_cattle still runs -- for the LightGlue crop cache and
+        # detection telemetry only. Its failure is a warning, never a
+        # gate: the embedding above does not depend on it.
         crop, det_status, _det_conf = crop_cattle(img_bgr)
         log.info(f"{slot}: crop_cattle took {_ms_since(t_slot)}ms (status={det_status})")
         if crop is None:
-            if BYPASS_QUALITY_GATES:
-                log.warning(f"{slot}: bypassing detection failure ({det_status}), using raw frame")
-                cropped_images[i - 1] = img_bgr
-                continue
-            failures.append(ImageFailure(
-                slot=slot,
-                stage="detection",
-                error_code=classify_detection_status(det_status),
-                reason=det_status,
-            ))
-            continue
+            log.warning(
+                f"{slot}: crop_cattle failed ({det_status}) -- no crop for "
+                f"muzzle-color/LightGlue cache, embedding proceeds on the "
+                f"full photo regardless"
+            )
+            crops[i - 1] = img_bgr
+        else:
+            crops[i - 1] = crop
 
-        crop_status, crop_reason = quality_check_cv2(crop)
-        if crop_status != "GOOD":
-            if BYPASS_QUALITY_GATES:
-                log.warning(f"{slot}_crop: bypassing crop-quality failure ({crop_reason})")
-                cropped_images[i - 1] = crop
-                continue
-            failures.append(ImageFailure(
-                slot=slot,
-                stage="crop_quality",
-                error_code=classify_quality_reason(crop_reason),
-                reason=crop_reason,
-            ))
-            continue
-
-        cropped_images[i - 1] = crop
-
-    log.info(f"muzzle quality/crop gate ({len(muzzle_bytes)} images): {_ms_since(t_muzzle_gate)}ms")
+    log.info(f"muzzle quality gate ({len(muzzle_bytes)} images): {_ms_since(t_muzzle_gate)}ms")
 
     if failures:
         raise image_quality_error(failures)
 
-    return cropped_images
+    return raw_images, crops
 
 
 def _aggregate_muzzle_color(muzzle_colors: list[dict], *, allow_reject: bool) -> dict:
@@ -839,14 +880,16 @@ def _run_registration_pipeline(
     """
     t_pipeline = time.monotonic()
 
-    # ── Quality gate + YOLO crop + crop-quality, evaluated for ALL 3 images ──
-    # Shared with /search's multi-photo query path — see
-    # _muzzle_quality_crop_gate's docstring.
-    cropped_images = _muzzle_quality_crop_gate(muzzle_bytes)
+    # ── Quality gate, evaluated for ALL 3 images. crop_cattle still runs
+    # (inside the gate) for the LightGlue cache + telemetry, but no longer
+    # gates registration or feeds the embedding -- see
+    # _muzzle_quality_crop_gate's docstring. Shared with /search's
+    # multi-photo query path.
+    raw_images, cropped_images = _muzzle_quality_crop_gate(muzzle_bytes)
 
-    # ── Embed (batched forward pass) ─────────────────────────────────────
+    # ── Embed (batched forward pass) — FULL photo, no crop ────────────────
     t_embed = time.monotonic()
-    jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in cropped_images]
+    jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in raw_images]
     embeddings = embed_batch(jpg_bytes, model, device)
     log.info(f"embed_batch (3 images): {_ms_since(t_embed)}ms")
 
@@ -1274,10 +1317,10 @@ def _run_search_pipeline(
     faiss_index.py's median_query_idx), never all N (that would triple
     LightGlue's cost on every ambiguous search for no benefit).
     """
-    crops = _muzzle_quality_crop_gate(muzzle_bytes)
+    raw_images, crops = _muzzle_quality_crop_gate(muzzle_bytes)
 
-    jpg_bytes = [cv2.imencode(".jpg", c)[1].tobytes() for c in crops]
-    embeddings = embed_batch(jpg_bytes, model, device)  # (N, 256), one batched forward pass
+    jpg_bytes = [cv2.imencode(".jpg", img)[1].tobytes() for img in raw_images]
+    embeddings = embed_batch(jpg_bytes, model, device)  # (N, 256), one batched forward pass — full photo, no crop
     emb_np = embeddings.numpy()
 
     muzzle_colors = [color_extractor.extract_muzzle(c) for c in crops]

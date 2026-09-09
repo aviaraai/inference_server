@@ -148,5 +148,27 @@ MUZZLE_CROP_CACHE_DIR = os.getenv("MUZZLE_CROP_CACHE_DIR", "/appstorage/muzzle_c
 
 IMAGE_EXTENSIONS   = {".jpg", ".jpeg", ".png", ".webp"}
 
+# ── Fusion encoder (DINOv2 + ResNet50@384 + ResNet50@448 + PCA-whitening) ────
+# See pipeline/fusion_encoder.py and pipeline/whitening.py. RESNET_MODEL_PATH
+# must point at a LOCAL ImageNet ResNet50 (IMAGENET1K_V2) state_dict .pth --
+# never let torchvision download weights at runtime, the deploy container has
+# no reliable egress (same reasoning as every other model file living under
+# /appstorage). WHITENING_MODEL_PATH is the frozen, versioned PCA artifact
+# fit by scripts/fit_whitening.py -- see pipeline/whitening.py's module
+# docstring for the hard "fit once, then frozen" requirement.
+RESNET_MODEL_PATH = os.getenv(
+    "RESNET_MODEL_PATH", "/appstorage/Models/resnet50/resnet50_imagenet1k_v2.pth"
+)
+WHITENING_MODEL_PATH = os.getenv(
+    "WHITENING_MODEL_PATH", "/appstorage/Models/whitening/whitening_v1.npz"
+)
+
 # ── Versioning ────────────────────────────────────────────────────────────────
-MODEL_VERSION      = "dinov2_arcface_v1"
+# Bumped from "dinov2_arcface_v1" when the fusion+PCA-whitening encoder
+# shipped -- EMB_DIM is unchanged (still 256) but the embedding SPACE is
+# completely different, so every vector in the old FAISS index is stale.
+# This is what makes faiss_index.py's load()-time version-mismatch warning
+# fire against an un-migrated index -- see scripts/reindex_gallery.py, which
+# must run (and its own meta.json write this string) before this server is
+# pointed at a FAISS_INDEX_PATH built under the old version.
+MODEL_VERSION      = "fusion_dinov2_resnet50x2_pcawhiten_v1"
