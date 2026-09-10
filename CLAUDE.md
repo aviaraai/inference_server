@@ -2823,3 +2823,112 @@ large-sample, wide-margin result — a different or larger dataset could
 plausibly shift it. Worth taking (it's free and reversible, a one-line
 constant), not worth treating as a fully validated new threshold the way
 `matchThreshold`/`reviewThreshold` are.
+
+## LightGlue promoted from a demote-only veto to a top-K re-ranker — real but modest gain, most of the oracle ceiling still uncaptured
+
+The gap that motivated this: the fused+whitened embedding's top-10 recall is
+95.5% but top-1 is only 72-89% depending on population (`scratch_ablation_
+fusion.py`), and LightGlue separates same-from-different at AUC 0.961
+(`scratch_lightglue_frequency_probe.py`) — a signal that was, until now, only
+ever used to VETO the single top-1 candidate `applyLightglueDisagreement`
+already picked, never to help pick a *better* one out of the top-K embedding
+candidates.
+
+**Stage 1 — measured the ceiling first, before writing any production code**
+(`scratch_rerank_eval.py`, 619 leave-one-out queries / 216 Uttarakhand
+animals, real crop_cattle + DISK features, real fused+whitened embedding —
+no shortcuts):
+
+| K | (b) re-ranked top-1 | (c) oracle (top-K recall) | gain vs (a) 72.2% | median latency/search |
+|---|---|---|---|---|
+| 3 | 73.8% | 86.1% | +1.6pp | 167ms |
+| 5 | 75.0% | 88.7% | +2.7pp | 276ms |
+| 10 | 76.9% | 93.5% | +4.7pp | 552ms |
+| 20 | 78.7% | 95.5% | +6.5pp | 1099ms |
+
+**Real, positive, monotonically increasing gain at every K — not a wash, and
+not the "does nothing" case that would have stopped this here.** But equally
+honest: the combination rule (reciprocal rank fusion, not a raw-score sum —
+the two scores live on unrelated scales) captures only a fraction of the
+theoretical headroom. At K=10 it recovers 4.7 of a possible 21.3 points
+(72.2%→93.5% oracle) — most of what a *perfect* re-ranker could do is still
+on the table. Latency also scales badly past K=10: K=20 nearly doubles cost
+(1.1s median) for only +1.8pp more. **Shipped K=10** — ~17% relative top-1
+error reduction (27.8%→23.1%) at a bounded, real latency cost — see
+`pipeline/lightglue_verify.py`'s `LIGHTGLUE_RERANK_TOP_K` for the full
+table and reasoning. Closing more of the oracle gap needs a smarter combiner
+than plain RRF; flagged as a follow-up, not attempted here.
+
+**Stage 2 — combination rule.** `pipeline/rerank.py`'s `rrf_combine`:
+reciprocal rank fusion (`1/(60+embedding_rank) + 1/(60+lightglue_rank)`,
+standard RRF constant), not a weighted score sum — a 0.02 embedding-cosine
+gap and a 0.02 LightGlue `match_ratio` gap mean nothing comparable, so
+combining RANKS sidesteps having to invent a scale conversion between them.
+`match_ratio` (already computed by `lightglue_verify.py`'s
+`_match_feature_sets`, `num_matches / min(query_keypoints,
+candidate_keypoints)`) is the normalized signal, not raw `num_matches`,
+specifically because match count scales with crop size/texture density/
+keypoint yield and isn't comparable across candidate pairs on its own.
+A candidate with no cached crop (pre-`MUZZLE_CROP_CACHE_DIR` registration)
+contributes NO lightglue term rather than the worst possible rank — it
+keeps its embedding-only position relative to other crop-less candidates,
+per `rrf_combine`'s graceful-degradation contract (`pipeline/tests/
+test_rerank.py` pins this).
+
+**Stage 3 — the safety invariant, thought through explicitly, not assumed.**
+Re-ranking is different from promoting a verdict (the property
+`attributeWeight`/`applyLightglueDisagreement` both protect), but it does
+mean a candidate LightGlue favors can now reach MATCH on a DIFFERENT
+candidate's embedding score than the one decide() originally picked. Chose
+to STACK both options the task posed rather than pick one
+(`go-apiserver/internal/server/mobile/handlers/animal/decision.go`'s
+`applyLightglueRerank`):
+1. An already-MATCH verdict is NEVER revisited — re-ranking only runs when
+   `decide()`'s own verdict was REVIEW or UNKNOWN. This alone guarantees the
+   auto-MATCH false-accept rate cannot rise from this change.
+2. A promoted candidate can only reach a decision as confident as
+   `classify()` grants ITS OWN raw embedding score/gap — the exact same
+   `matchThreshold`/`gapThreshold` bar every other MATCH clears. LightGlue
+   evidence changes WHICH candidate is measured against that bar; it never
+   lowers the bar, and contributes no score of its own to `Adjusted`/`Score`.
+
+`TestLightglueRerankSafety` (decision_test.go) sweeps 5000 randomized inputs
+and proves both properties hold, the same style `TestAttributesCannotConfidentlyReorder`/
+`TestLightglueCanOnlyDemote` already use for their own safety proofs.
+
+**Stage 4 — implementation, both repos:**
+- `main.py`'s `/search` now runs `_run_lightglue_rerank` (distinct from the
+  pre-existing `_run_lightglue_tiebreaker`, kept UNCHANGED — an older
+  go-apiserver's `applyLightglueDisagreement` must see exactly the same
+  ambiguity-gated behavior it always has) unconditionally for up to
+  `LIGHTGLUE_RERANK_TOP_K` of `top_matches`, regardless of whether the top-1
+  score looks ambiguous — Stage 1's measured benefit is not confined to
+  near-threshold cases. Query DISK features are extracted ONCE per search
+  and reused across all K candidates (`pipeline/lightglue_verify.py`'s new
+  `match_precomputed`/`match_features`), unlike the single-candidate
+  tiebreaker's per-call re-extraction — this is what keeps per-search cost
+  close to what Stage 1 actually measured. `top_matches`' ORDER is never
+  changed by this — `MatchCandidate` gained `lightglue_num_matches`/
+  `lightglue_match_ratio` (distinct from the existing top-level
+  `lightglue_checked`/`lightglue_num_matches`/`lightglue_zone`, which still
+  describe query vs. top_matches[0] specifically) so go-apiserver does the
+  actual re-ranking — this server still returns raw scores only.
+- `searchTopK` (`routes.go`) raised 5→10: 5 was a hard ceiling on
+  achievable recall, not just a FAISS-load knob — even a PERFECT re-ranker
+  could only reach 88.7% oracle recall capped at 5, vs 93.5% at 10.
+- `animal_search_records` gained a `lightglue_candidates` JSONB column
+  (migration `20260910120000_...`) — every top-K candidate's embedding
+  rank, its own LightGlue evidence, and its rank under both orderings, not
+  just the decided top-1. Before this, a past search's re-rank behavior
+  couldn't be reconstructed at all, which is what makes the next
+  recalibration (the score distribution of the top-1 changes once a
+  different candidate can occupy that slot) possible.
+- Re-calibrating `matchThreshold`/`gapThreshold`/`reviewThreshold` against
+  the NEW (re-ranked) score distribution was NOT done in this pass — the
+  numbers above are the re-ranker's OWN effect on top-1 accuracy, measured
+  independently of go-apiserver's decision thresholds (same separation of
+  concerns as every other embedding-space change in this file). Needs
+  `scripts/calibrate_decision_thresholds.py` re-run against searches that
+  actually went through the shipped re-ranker before those constants move
+  again — flagged, not attempted here, since no such search history exists
+  yet post-deploy.

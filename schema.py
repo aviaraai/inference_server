@@ -201,6 +201,29 @@ class MatchCandidate(BaseModel):
         None, description="This candidate's stored horn shape, echoed back so it can be compared against the query's own `horn_shape` field. " + HORN_SHAPE_DESCRIPTION
     )
 
+    # ── Top-K LightGlue re-ranking (additive) ────────────────────────────────
+    # Distinct from SearchResponse's top-level lightglue_checked/
+    # lightglue_num_matches/lightglue_zone, which still describe query vs.
+    # top_matches[0] specifically (the original demote-only tiebreaker,
+    # unchanged). These describe THIS candidate's own LightGlue evidence,
+    # populated for every entry in top_matches the reranker was able to run
+    # against (see pipeline/rerank.py and CLAUDE.md's Stage 1 gate for the
+    # numbers this shipped on). Both None when this candidate had no cached
+    # crop to compare against (MUZZLE_CROP_CACHE_DIR only covers animals
+    # registered after that cache shipped) or the reranker didn't run at
+    # all — callers must treat that as "no opinion" for this candidate, not
+    # as evidence of any kind. `top_matches`'s ORDER is never changed by
+    # this data — it stays sorted by raw embedding score, exactly as
+    # before; go-apiserver is what re-ranks and decides, this server only
+    # supplies the evidence (see CLAUDE.md, "Decision thresholds live in
+    # the API SERVER, not here").
+    lightglue_num_matches: Optional[int] = Field(
+        None, description="Raw LightGlue match count between the query crop and THIS candidate's cached crop. None if not computed for this candidate."
+    )
+    lightglue_match_ratio: Optional[float] = Field(
+        None, description="lightglue_num_matches normalised by min(query_keypoints, candidate_keypoints) — comparable across candidates with different keypoint counts, unlike the raw count. None if not computed for this candidate."
+    )
+
 
 # ── Face geometry (pose model) ───────────────────────────────────────────────
 

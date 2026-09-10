@@ -83,11 +83,15 @@ from pipeline.muzzle_crop_cache import (
     save_features as save_muzzle_features,
 )
 from pipeline.lightglue_verify import (
+    LIGHTGLUE_RERANK_TOP_K,
     LIGHTGLUE_TIEBREAKER_ENABLED,
     available as lightglue_available,
     classify_zone as lightglue_classify_zone,
+    extract_features as lightglue_extract_features,
     extract_features_np as lightglue_extract_features_np,
     load_lightglue,
+    match_features as lightglue_match_features,
+    match_precomputed as lightglue_match_precomputed,
     verify as lightglue_verify,
     verify_with_cached_candidate as lightglue_verify_with_cached_candidate,
     warmup_lightglue,
@@ -1116,6 +1120,78 @@ async def _run_lightglue_tiebreaker(
         return False, None, None
 
 
+async def _run_lightglue_rerank(
+    matches: list[dict],
+    query_crop: np.ndarray,
+    request_id: str,
+) -> dict[int, dict]:
+    """Top-K re-ranking evidence: LightGlue-match the query crop against up
+    to LIGHTGLUE_RERANK_TOP_K of `matches` (already sorted by embedding
+    score -- this function NEVER reorders or drops entries from `matches`
+    itself, it only returns supplementary evidence for the caller to attach
+    per-candidate). See pipeline/rerank.py and scratch_rerank_eval.py's
+    Stage 1 gate for the numbers this shipped on.
+
+    Distinct from _run_lightglue_tiebreaker above (kept unchanged, still the
+    sole source of SearchResponse's top-level lightglue_checked/
+    lightglue_num_matches/lightglue_zone fields, still gated on ambiguity —
+    an older go-apiserver's applyLightglueDisagreement must see EXACTLY the
+    same behavior it always has). This function always runs (subject to the
+    same LIGHTGLUE_TIEBREAKER_ENABLED master switch and availability check)
+    regardless of whether the top-1 embedding score looks ambiguous, because
+    Stage 1's measured benefit is NOT confined to near-threshold cases -- the
+    correct animal is often outside rank 1 with a perfectly confident-looking
+    score attached to the wrong one.
+
+    Query features are extracted ONCE and reused across all K candidates
+    (unlike verify_with_cached_candidate, built for the single-candidate
+    tiebreaker, which re-extracts every call) -- this is what keeps
+    per-search cost close to what Stage 1 actually measured, not K times a
+    single-pair extraction.
+
+    Returns {faiss_id: {"num_matches": int, "match_ratio": float}} — only
+    for candidates a comparison was actually run for. A missing faiss_id
+    means "no evidence" (no cached crop/features, reranker disabled, or an
+    internal failure for that one candidate) -- callers must degrade
+    gracefully (see pipeline/rerank.py's rrf_combine), never treat a miss as
+    a negative signal.
+    """
+    if not LIGHTGLUE_TIEBREAKER_ENABLED or not lightglue_available() or not matches:
+        return {}
+
+    top = matches[:LIGHTGLUE_RERANK_TOP_K]
+    try:
+        query_feats = await asyncio.to_thread(lightglue_extract_features, query_crop)
+    except Exception as e:
+        log.warning(f"[{request_id}] lightglue rerank: query feature extraction failed (non-fatal): {e}")
+        return {}
+
+    evidence: dict[int, dict] = {}
+    for m in top:
+        fid = m["faiss_id"]
+        try:
+            candidate_features = await asyncio.to_thread(load_cached_muzzle_features, fid)
+            if candidate_features is not None:
+                lg_result = await asyncio.to_thread(lightglue_match_precomputed, query_feats, candidate_features)
+            else:
+                candidate_crop = await asyncio.to_thread(load_cached_muzzle_crop, fid)
+                if candidate_crop is None:
+                    continue  # no cached crop OR features -- no evidence for this candidate, skip it
+                candidate_feats = await asyncio.to_thread(lightglue_extract_features, candidate_crop)
+                lg_result = await asyncio.to_thread(lightglue_match_features, query_feats, candidate_feats)
+            evidence[fid] = {
+                "num_matches": lg_result["num_matches"],
+                "match_ratio": lg_result["match_ratio"],
+            }
+        except Exception as e:
+            # Fail-open per-candidate: one bad crop must not cost the whole
+            # rerank's evidence for every OTHER candidate.
+            log.warning(f"[{request_id}] lightglue rerank failed for faiss_id={fid} (non-fatal): {e}")
+            continue
+
+    return evidence
+
+
 @app.post("/search", response_model=SearchResponse)
 async def search(
     muzzle_images: list[UploadFile] = File(...),
@@ -1256,13 +1332,21 @@ async def search(
     )
     t_lightglue = _ms_since(t_lightglue_start)
 
+    # ── Top-K LightGlue re-ranking evidence — additive, per-candidate; see
+    # _run_lightglue_rerank. `matches`' order/contents are NOT changed by
+    # this -- only used below to annotate each MatchCandidate.
+    t_rerank_start = time.monotonic()
+    lightglue_rerank_evidence = await _run_lightglue_rerank(matches, query_crop, request_id)
+    t_rerank = _ms_since(t_rerank_start)
+
     t_total = _ms_since(t_start)
     log.info(
         f"[{request_id}] /search done | matches={len(matches)} | "
-        f"{t_total}ms (embed={t_embed} faiss={t_faiss} lightglue={t_lightglue}) | "
+        f"{t_total}ms (embed={t_embed} faiss={t_faiss} lightglue={t_lightglue} rerank={t_rerank}) | "
         f"top1_faiss_id={matches[0]['faiss_id'] if matches else 'none'} "
         f"score={matches[0]['score'] if matches else 0} | "
-        f"lightglue_checked={lightglue_checked} lightglue_zone={lightglue_zone}"
+        f"lightglue_checked={lightglue_checked} lightglue_zone={lightglue_zone} | "
+        f"rerank_evidence_count={len(lightglue_rerank_evidence)}"
     )
 
     return SearchResponse(
@@ -1278,6 +1362,8 @@ async def search(
                 body_color=candidate_lookup[m["faiss_id"]].body_color,
                 muzzle_color=candidate_lookup[m["faiss_id"]].muzzle_color,
                 horn_shape=candidate_lookup[m["faiss_id"]].horn_shape,
+                lightglue_num_matches=lightglue_rerank_evidence.get(m["faiss_id"], {}).get("num_matches"),
+                lightglue_match_ratio=lightglue_rerank_evidence.get(m["faiss_id"], {}).get("match_ratio"),
             )
             for m in matches
         ],

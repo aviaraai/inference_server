@@ -53,6 +53,33 @@ NUM_FEATURES = 1024
 # guess since it already cleared both bars — no reason to search further.
 LIGHTGLUE_MAX_DIM = int(os.getenv("LIGHTGLUE_MAX_DIM", "512"))
 
+# Top-K re-ranking (promotes LightGlue from a demote-only veto on the single
+# top-1 candidate to a signal across all embedding candidates — see
+# pipeline/rerank.py and scratch_rerank_eval.py's Stage 1 gate for the
+# measured numbers this shipped on). Bounds how many of /search's top_matches
+# get a LightGlue comparison per request — cost scales linearly with this,
+# so it is not simply "as many as possible".
+#
+# scratch_rerank_eval.py, 619 leave-one-out queries / 216 Uttarakhand
+# animals, baseline top-1 (fused+whitened embedding alone) = 72.2%:
+#
+#   K    re-ranked top-1   oracle (top-K recall)   gain     median latency
+#   3    73.8%             86.1%                   +1.6pp   167ms
+#   5    75.0%             88.7%                    +2.7pp   276ms
+#   10   76.9%             93.5%                   +4.7pp   552ms
+#   20   78.7%             95.5%                   +6.5pp  1099ms
+#
+# Real, positive, monotonic gain at every K -- this is not a wash. But the
+# RRF combination (pipeline/rerank.py) captures only a fraction of the
+# available headroom: at K=10 it recovers 4.7 of a possible 21.3 points
+# (72.2% -> 93.5%). Picked K=10: ~17% relative top-1 error reduction
+# (27.8%->23.1%) for a bounded, real latency cost; K=20 nearly doubles that
+# cost (1.1s median) for only +1.8pp more -- clearly diminishing returns
+# past 10. Closing more of the oracle gap needs a smarter combiner than
+# plain RRF (e.g. weighting LightGlue's contribution by its own within-K
+# confidence spread) -- flagged as a follow-up, not attempted here.
+LIGHTGLUE_RERANK_TOP_K = int(os.getenv("LIGHTGLUE_RERANK_TOP_K", "10"))
+
 # Master switch — defaults ON. Both re-validation gates passed (see CLAUDE.md,
 # "/search fusion tiebreaker, round 2"): worst-case latency 172ms (budget was
 # ~1s) and zone separation on the clean population went from an exact tie
@@ -246,6 +273,28 @@ def verify(img_a: np.ndarray, img_b: np.ndarray) -> dict:
     features on either side — the offline experiment script, warmup, and the
     fallback path when a candidate's features were never cached."""
     return _match_feature_sets(extract_features(img_a), extract_features(img_b))
+
+
+def match_features(query_feats: dict, candidate_feats: dict) -> dict:
+    """Public wrapper over _match_feature_sets, for callers that already
+    hold on-device feature dicts from extract_features() on BOTH sides
+    (e.g. the top-K reranker matching one query extraction against a
+    freshly-extracted, uncached candidate crop) and don't need this
+    module's other cache-handling conveniences.
+    """
+    return _match_feature_sets(query_feats, candidate_feats)
+
+
+def match_precomputed(query_feats: dict, candidate_features_np: dict) -> dict:
+    """Match an already-extracted (on-device) query feature set against a
+    CACHED (numpy, off-device) candidate feature set. Used by the top-K
+    reranker (main.py) to extract the query ONCE per search and reuse it
+    across every candidate, instead of verify_with_cached_candidate's
+    per-call re-extraction — the same query image never changes across a
+    single search's K candidates.
+    """
+    candidate_feats = _features_from_numpy(candidate_features_np)
+    return _match_feature_sets(query_feats, candidate_feats)
 
 
 def verify_with_cached_candidate(query_img_bgr: np.ndarray, candidate_features_np: dict) -> dict:

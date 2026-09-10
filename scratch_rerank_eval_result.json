@@ -1,0 +1,31 @@
+{
+  "n_queries": 619,
+  "n_animals": 216,
+  "baseline_top1_pct": 72.21324717285945,
+  "by_k": {
+    "3": {
+      "rerank_top1_pct": 73.82875605815832,
+      "oracle_topk_recall_pct": 86.10662358642972,
+      "median_latency_ms": 166.9519000024593,
+      "p95_latency_ms": 214.47415000184264
+    },
+    "5": {
+      "rerank_top1_pct": 74.95961227786754,
+      "oracle_topk_recall_pct": 88.69143780290791,
+      "median_latency_ms": 276.39540000018314,
+      "p95_latency_ms": 331.333989999257
+    },
+    "10": {
+      "rerank_top1_pct": 76.89822294022618,
+      "oracle_topk_recall_pct": 93.53796445880452,
+      "median_latency_ms": 551.7236000014236,
+      "p95_latency_ms": 660.3785600022093
+    },
+    "20": {
+      "rerank_top1_pct": 78.67528271405493,
+      "oracle_topk_recall_pct": 95.47657512116317,
+      "median_latency_ms": 1099.1684000000532,
+      "p95_latency_ms": 1270.964960000856
+    }
+  }
+}
