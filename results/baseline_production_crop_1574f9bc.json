@@ -1,0 +1,22 @@
+{
+  "experiment_name": "baseline_production_crop",
+  "split_hash": "1574f9bc96497e002209c475a9aea631ed89010a63a0cf29521de7cbe8a81dc0",
+  "split_version": "v1",
+  "timestamp": "2026-09-10T20:31:54Z",
+  "n_queries": 210,
+  "n_animals": 70,
+  "top1": 0.7095238095238096,
+  "top5": 0.8714285714285714,
+  "top10": 0.9,
+  "genuine_mean": 0.848366251973277,
+  "impostor_mean": 0.6248148803781384,
+  "separation": 0.2235513715951386,
+  "dprime": 1.9413036573188083,
+  "embedding_dim": 256,
+  "result_path": "D:\\Group Projects\\inference_server\\results\\baseline_production_crop_1574f9bc.json",
+  "status": "OK",
+  "wall_clock_sec": 53.3,
+  "device": "cuda",
+  "notes": "Same checkpoint/transform as run 1, but crop_cattle(img) first, cv2.imencode('.jpg', crop), then the same 518 transform. Full-image fallback on crop failure.",
+  "contaminated": false
+}

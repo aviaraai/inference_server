@@ -1,0 +1,22 @@
+{
+  "experiment_name": "baseline_resnet50_imagenet",
+  "split_hash": "1574f9bc96497e002209c475a9aea631ed89010a63a0cf29521de7cbe8a81dc0",
+  "split_version": "v1",
+  "timestamp": "2026-09-10T20:32:35Z",
+  "n_queries": 210,
+  "n_animals": 70,
+  "top1": 0.861904761904762,
+  "top5": 0.9666666666666667,
+  "top10": 0.9761904761904762,
+  "genuine_mean": 0.8566813836313563,
+  "impostor_mean": 0.6595250878393661,
+  "separation": 0.19715629579199012,
+  "dprime": 2.588305707799143,
+  "embedding_dim": 2048,
+  "result_path": "D:\\Group Projects\\inference_server\\results\\baseline_resnet50_imagenet_1574f9bc.json",
+  "status": "OK",
+  "wall_clock_sec": 7.7,
+  "device": "cuda",
+  "notes": "Stock IMAGENET1K_V2 ResNet50 via pipeline/fusion_encoder.load_resnet50 (fc=Identity -> 2048-d global-pooled), L2-normalized, no whitening. Input 384 = the fusion's first ResNet branch size (_RESNET_SIZES[0]).",
+  "contaminated": false
+}

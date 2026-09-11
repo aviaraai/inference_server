@@ -1,0 +1,30 @@
+{
+  "experiment_name": "baseline_finetuned_nocrop",
+  "split_hash": "1574f9bc96497e002209c475a9aea631ed89010a63a0cf29521de7cbe8a81dc0",
+  "split_version": "v1",
+  "timestamp": "2026-09-10T20:32:26Z",
+  "n_queries": 210,
+  "n_animals": 70,
+  "top1": 0.8904761904761904,
+  "top5": 0.9619047619047619,
+  "top10": 0.9809523809523809,
+  "genuine_mean": 0.8270903255611828,
+  "impostor_mean": 0.10352978660019233,
+  "separation": 0.7235605389609905,
+  "dprime": 3.40509750907201,
+  "embedding_dim": 256,
+  "result_path": "D:\\Group Projects\\inference_server\\results\\baseline_finetuned_nocrop_1574f9bc.json",
+  "status": "OK",
+  "wall_clock_sec": 29.3,
+  "device": "cuda",
+  "notes": "Muzzle_ReID_training/checkpoints/best_gap.pt (epoch 17). Same transform as run 1.",
+  "contaminated": true,
+  "contamination_detail": {
+    "reason": "fine-tune training manifest overlaps the benchmark",
+    "training_images": 388,
+    "training_images_byte_identical_to_benchmark": 111,
+    "training_images_within_dhash_4_of_benchmark": 111,
+    "benchmark_animals_seen_in_training": 38,
+    "benchmark_animals_total": 70
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "experiment_name": "baseline_production_nocrop",
+  "split_hash": "1574f9bc96497e002209c475a9aea631ed89010a63a0cf29521de7cbe8a81dc0",
+  "split_version": "v1",
+  "timestamp": "2026-09-10T20:30:57Z",
+  "n_queries": 210,
+  "n_animals": 70,
+  "top1": 0.8380952380952381,
+  "top5": 0.9238095238095239,
+  "top10": 0.9571428571428572,
+  "genuine_mean": 0.885047174863808,
+  "impostor_mean": 0.6636258915272305,
+  "separation": 0.2214212833365775,
+  "dprime": 2.2836066002110633,
+  "embedding_dim": 256,
+  "result_path": "D:\\Group Projects\\inference_server\\results\\baseline_production_nocrop_1574f9bc.json",
+  "status": "OK",
+  "wall_clock_sec": 29.2,
+  "device": "cuda",
+  "notes": "appstorage/Models/model.pt (GodhaarModel, DINOv2 branch, 256-d). Transform: _build_transform(518) = Resize((518,518)) + ToTensor + Normalize(ImageNet). No YOLO crop.",
+  "contaminated": false
+}

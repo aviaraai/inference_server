@@ -1,0 +1,27 @@
+{
+  "experiment_name": "baseline_fusion_whitening_v1",
+  "split_hash": "1574f9bc96497e002209c475a9aea631ed89010a63a0cf29521de7cbe8a81dc0",
+  "split_version": "v1",
+  "timestamp": "2026-09-10T20:33:17Z",
+  "n_queries": 210,
+  "n_animals": 70,
+  "top1": 0.8666666666666667,
+  "top5": 0.9666666666666667,
+  "top10": 0.9857142857142858,
+  "genuine_mean": 0.4154478804767606,
+  "impostor_mean": 0.03934763589802847,
+  "separation": 0.37610024457873215,
+  "dprime": 2.499710086730764,
+  "embedding_dim": 256,
+  "result_path": "D:\\Group Projects\\inference_server\\results\\baseline_fusion_whitening_v1_1574f9bc.json",
+  "status": "OK",
+  "wall_clock_sec": 39.7,
+  "device": "cuda",
+  "notes": "Full FusionEncoder.embed_images: DINOv2@518 + ResNet50@384 + ResNet50@448 -> concat 4352 -> whitening_v1.npz -> 256-d. Its own internal transforms.",
+  "contaminated": true,
+  "contamination_detail": {
+    "reason": "PCA/whitening basis was fit on a corpus containing benchmark images",
+    "whitening_fit_images": 488,
+    "fit_images_byte_identical_to_benchmark": 145
+  }
+}
